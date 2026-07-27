@@ -140,7 +140,7 @@ jobs:
           pushd "$PACKAGE_DIR" >/dev/null
           PACK_JSON="$(npm pack --json --ignore-scripts)"
           echo "$PACK_JSON"
-          PACK_PATH="$(printf '%s\n' "$PACK_JSON" | node --input-type=module -e 'const chunks=[]; process.stdin.on("data", (chunk) => chunks.push(chunk)); process.stdin.on("end", () => { const parsed = JSON.parse(Buffer.concat(chunks).toString("utf8")); const first = Array.isArray(parsed) ? parsed[0] : null; if (!first || typeof first.filename !== "string" || !first.filename) process.exit(1); process.stdout.write(first.filename); });')"
+          PACK_PATH="$(printf '%s\n' "$PACK_JSON" | node --input-type=module -e 'const chunks=[]; process.stdin.on("data", (chunk) => chunks.push(chunk)); process.stdin.on("end", () => { const parsed = JSON.parse(Buffer.concat(chunks).toString("utf8")); const first = Array.isArray(parsed) ? parsed[0] : (parsed && typeof parsed === "object" ? Object.values(parsed)[0] : null); if (!first || typeof first.filename !== "string" || !first.filename) process.exit(1); process.stdout.write(first.filename); });')"
           popd >/dev/null
           if [[ -z "${PACK_PATH}" || ! -f "${PACKAGE_DIR}/${PACK_PATH}" ]]; then
             echo "npm pack did not produce a tarball file." >&2
