@@ -61,7 +61,7 @@ describe("fetchPluginOgMeta", () => {
     vi.useFakeTimers();
     let usedSignal: AbortSignal | undefined;
     const fetchMock = vi.fn((input: unknown, init?: RequestInit) => {
-      usedSignal = init?.signal;
+      usedSignal = init?.signal ?? undefined;
       return hangUntilAborted(input, init);
     });
     vi.stubGlobal("fetch", fetchMock);
