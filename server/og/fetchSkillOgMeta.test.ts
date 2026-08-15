@@ -2,9 +2,29 @@
 
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { fetchSkillOgMeta } from "./fetchSkillOgMeta";
+import { OG_FETCH_TIMEOUT_MS } from "./ogFetchTimeout";
+
+function hangUntilAborted(_input: unknown, init?: RequestInit) {
+  return new Promise<Response>((_resolve, reject) => {
+    const signal = init?.signal;
+    if (!signal) return;
+    signal.addEventListener(
+      "abort",
+      () => {
+        reject(
+          signal.reason instanceof Error
+            ? signal.reason
+            : new DOMException("The operation was aborted.", "AbortError"),
+        );
+      },
+      { once: true },
+    );
+  });
+}
 
 describe("fetchSkillOgMeta", () => {
   afterEach(() => {
+    vi.useRealTimers();
     vi.unstubAllGlobals();
   });
 
@@ -32,9 +52,32 @@ describe("fetchSkillOgMeta", () => {
       "https://clawhub.ai/api/v1/skills/gifgrep?ownerHandle=steipete",
       {
         headers: { Accept: "application/json" },
+        signal: expect.any(AbortSignal),
       },
     );
     expect(meta?.stats.downloads).toBe(1200);
     expect(meta?.icon).toBe(`https://clawhub.ai/api/v1/skill-icons/${"a".repeat(64)}`);
+  });
+
+  it("aborts a hanging public skill API fetch after the OG timeout", async () => {
+    vi.useFakeTimers();
+    let usedSignal: AbortSignal | undefined;
+    const fetchMock = vi.fn((input: unknown, init?: RequestInit) => {
+      usedSignal = init?.signal;
+      return hangUntilAborted(input, init);
+    });
+    vi.stubGlobal("fetch", fetchMock);
+
+    const pending = fetchSkillOgMeta("gifgrep", "https://clawhub.ai");
+    await Promise.resolve();
+    expect(usedSignal).toBeInstanceOf(AbortSignal);
+    expect(usedSignal?.aborted).toBe(false);
+
+    await vi.advanceTimersByTimeAsync(OG_FETCH_TIMEOUT_MS - 1);
+    expect(usedSignal?.aborted).toBe(false);
+
+    await vi.advanceTimersByTimeAsync(1);
+    await expect(pending).resolves.toBeNull();
+    expect(usedSignal?.aborted).toBe(true);
   });
 });

@@ -1,3 +1,5 @@
+import { withOgFetchTimeout } from "./ogFetchTimeout";
+
 export type PluginOgMeta = {
   name: string | null;
   displayName: string | null;
@@ -19,7 +21,9 @@ export async function fetchPluginOgMeta(
 ): Promise<PluginOgMeta | null> {
   try {
     const url = new URL(`/api/v1/packages/${encodeURIComponent(packageName)}`, apiBase);
-    const response = await fetch(url.toString(), { headers: { Accept: "application/json" } });
+    const response = await withOgFetchTimeout((signal) =>
+      fetch(url.toString(), { headers: { Accept: "application/json" }, signal }),
+    );
     if (!response.ok) return null;
     const payload = (await response.json()) as {
       package?: {

@@ -2,9 +2,29 @@
 
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { fetchPluginOgMeta } from "./fetchPluginOgMeta";
+import { OG_FETCH_TIMEOUT_MS } from "./ogFetchTimeout";
+
+function hangUntilAborted(_input: unknown, init?: RequestInit) {
+  return new Promise<Response>((_resolve, reject) => {
+    const signal = init?.signal;
+    if (!signal) return;
+    signal.addEventListener(
+      "abort",
+      () => {
+        reject(
+          signal.reason instanceof Error
+            ? signal.reason
+            : new DOMException("The operation was aborted.", "AbortError"),
+        );
+      },
+      { once: true },
+    );
+  });
+}
 
 describe("fetchPluginOgMeta", () => {
   afterEach(() => {
+    vi.useRealTimers();
     vi.unstubAllGlobals();
   });
 
@@ -29,8 +49,33 @@ describe("fetchPluginOgMeta", () => {
 
     expect(fetchMock).toHaveBeenCalledWith(
       "https://clawhub.ai/api/v1/packages/%40openclaw%2Fcodex",
-      { headers: { Accept: "application/json" } },
+      {
+        headers: { Accept: "application/json" },
+        signal: expect.any(AbortSignal),
+      },
     );
     expect(meta?.stats.downloads).toBe(99);
+  });
+
+  it("aborts a hanging public package API fetch after the OG timeout", async () => {
+    vi.useFakeTimers();
+    let usedSignal: AbortSignal | undefined;
+    const fetchMock = vi.fn((input: unknown, init?: RequestInit) => {
+      usedSignal = init?.signal;
+      return hangUntilAborted(input, init);
+    });
+    vi.stubGlobal("fetch", fetchMock);
+
+    const pending = fetchPluginOgMeta("@openclaw/codex", "https://clawhub.ai");
+    await Promise.resolve();
+    expect(usedSignal).toBeInstanceOf(AbortSignal);
+    expect(usedSignal?.aborted).toBe(false);
+
+    await vi.advanceTimersByTimeAsync(OG_FETCH_TIMEOUT_MS - 1);
+    expect(usedSignal?.aborted).toBe(false);
+
+    await vi.advanceTimersByTimeAsync(1);
+    await expect(pending).resolves.toBeNull();
+    expect(usedSignal?.aborted).toBe(true);
   });
 });

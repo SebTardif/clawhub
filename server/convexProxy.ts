@@ -27,6 +27,7 @@ const MAX_ARCHIVE_MANIFEST_ENTRIES = 8_192;
 const MAX_ARCHIVE_ENTRY_URL_LENGTH = 4_096;
 const MAX_ARCHIVE_MANIFEST_BYTES = 4 * 1024 * 1024;
 const ARCHIVE_FILENAME_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._+-]{0,499}\.zip$/;
+const ARCHIVE_METRIC_FETCH_TIMEOUT_MS = 1_500;
 const ARCHIVE_REPRESENTATION_HEADERS = [
   "accept-ranges",
   "content-digest",
@@ -217,18 +218,23 @@ async function streamSkillArchive(
   }
 
   let metricRecorded = false;
-  const recordMetric = async () => {
+  const recordMetric = () => {
     if (metricRecorded || !manifest.metricToken) return;
     metricRecorded = true;
-    try {
-      await fetch(new URL("/api/internal/archive-download-metric", target), {
-        method: "POST",
-        headers: { "content-type": "application/jose" },
-        body: manifest.metricToken,
+    const controller = new AbortController();
+    const timeout = setTimeout(() => controller.abort(), ARCHIVE_METRIC_FETCH_TIMEOUT_MS);
+    void fetch(new URL("/api/internal/archive-download-metric", target), {
+      method: "POST",
+      headers: { "content-type": "application/jose" },
+      body: manifest.metricToken,
+      signal: controller.signal,
+    })
+      .catch(() => {
+        // Download metrics remain best-effort and never interrupt archive bytes.
+      })
+      .finally(() => {
+        clearTimeout(timeout);
       });
-    } catch {
-      // Download metrics remain best-effort and never interrupt archive bytes.
-    }
   };
 
   const stream = buildDeterministicZipStream(
@@ -240,7 +246,7 @@ async function streamSkillArchive(
         if (!response.ok || !response.body) {
           throw new Error(`Failed to fetch archive entry: ${response.status}`);
         }
-        await recordMetric();
+        recordMetric();
         return response.body;
       },
     })),

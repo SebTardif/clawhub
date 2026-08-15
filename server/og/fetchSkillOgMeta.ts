@@ -1,4 +1,5 @@
 import { readCanonicalStat, type SkillStatReadable } from "../../convex/lib/skillStats";
+import { withOgFetchTimeout } from "./ogFetchTimeout";
 
 type SkillApiPayload = SkillStatReadable & {
   displayName?: string;
@@ -43,7 +44,9 @@ export async function fetchSkillOgMeta(
     const url = new URL(`/api/v1/skills/${encodeURIComponent(slug)}`, apiBase);
     const owner = ownerHandle?.trim().replace(/^@+/, "");
     if (owner) url.searchParams.set("ownerHandle", owner);
-    const response = await fetch(url.toString(), { headers: { Accept: "application/json" } });
+    const response = await withOgFetchTimeout((signal) =>
+      fetch(url.toString(), { headers: { Accept: "application/json" }, signal }),
+    );
     if (!response.ok) return null;
     const payload = (await response.json()) as {
       skill?: SkillApiPayload | null;

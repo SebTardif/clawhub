@@ -26,6 +26,7 @@ describe("fetchPublisherOgMeta", () => {
   });
 
   afterEach(() => {
+    vi.useRealTimers();
     vi.resetModules();
   });
 
@@ -61,5 +62,25 @@ describe("fetchPublisherOgMeta", () => {
     expect(meta?.affiliations).toEqual([
       { handle: "github", displayName: "GitHub", image: "https://example.com/github.png" },
     ]);
+  });
+
+  it("returns null when the Convex publisher query hangs past the OG timeout", async () => {
+    vi.useFakeTimers();
+    queryMock.mockImplementation(() => new Promise(() => {}));
+
+    const { fetchPublisherOgMeta } = await import("./fetchPublisherOgMeta");
+    const { OG_FETCH_TIMEOUT_MS } = await import("./ogFetchTimeout");
+    const pending = fetchPublisherOgMeta("openclaw", "https://example.convex.cloud");
+
+    await vi.advanceTimersByTimeAsync(OG_FETCH_TIMEOUT_MS - 1);
+    let settled = false;
+    void pending.then(() => {
+      settled = true;
+    });
+    await Promise.resolve();
+    expect(settled).toBe(false);
+
+    await vi.advanceTimersByTimeAsync(1);
+    await expect(pending).resolves.toBeNull();
   });
 });

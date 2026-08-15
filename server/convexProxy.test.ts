@@ -228,6 +228,7 @@ describe("Convex HTTP proxy", () => {
     expect(metricCall?.[1]).toMatchObject({
       method: "POST",
       body: "signed-metric-capability",
+      signal: expect.any(AbortSignal),
     });
     const fetchedUrls = fetchMock.mock.calls.map(([input]) => input.toString());
     expect(
@@ -643,5 +644,77 @@ describe("Convex HTTP proxy", () => {
 
     expect(response.status).toBe(405);
     expect(fetchMock).not.toHaveBeenCalled();
+  });
+
+  it("does not wait for download metrics before emitting zip bytes", async () => {
+    const storedBody = new TextEncoder().encode("# streamed skill\n");
+    const fetchMock = vi.fn(async (input: string | URL | Request) => {
+      const url = input.toString();
+      if (url.startsWith("https://preview-branch-123.convex.site/api/v1/download")) {
+        return Response.json(
+          {
+            schema: "clawhub.skill-archive-manifest.v1",
+            issuedAt: 1_000,
+            expiresAt: 31_000,
+            filename: "demo-1.0.0.zip",
+            meta: {
+              ownerId: "users:1",
+              slug: "demo",
+              version: "1.0.0",
+              publishedAt: 3,
+            },
+            entries: [
+              {
+                path: "SKILL.md",
+                url: "https://preview-branch-123.convex.cloud/api/storage/storage-1",
+              },
+            ],
+            metricToken: "signed-metric-capability",
+          },
+          { headers: { "content-type": ARCHIVE_MANIFEST_CONTENT_TYPE } },
+        );
+      }
+      if (url === "https://preview-branch-123.convex.cloud/api/storage/storage-1") {
+        return new Response(storedBody, { status: 200 });
+      }
+      if (url === "https://preview-branch-123.convex.site/api/internal/archive-download-metric") {
+        return new Promise<Response>(() => {});
+      }
+      throw new Error(`Unexpected fetch: ${url}`);
+    });
+    vi.stubGlobal("fetch", fetchMock);
+    vi.spyOn(Date, "now").mockReturnValue(2_000);
+
+    const response = await proxyConvexRequest(
+      mockEvent("https://preview.example/api/v1/download?slug=demo"),
+      {
+        VERCEL_ENV: "preview",
+        VITE_CONVEX_SITE_URL: "https://preview-branch-123.convex.site",
+        VITE_CONVEX_URL: "https://preview-branch-123.convex.cloud",
+      },
+      TEST_ARCHIVE_DEPENDENCIES,
+    );
+
+    expect(response.status).toBe(200);
+    expect(response.body).not.toBeNull();
+    const reader = response.body!.getReader();
+    const firstChunk = await Promise.race([
+      reader.read(),
+      new Promise<never>((_, reject) => {
+        setTimeout(() => reject(new Error("zip first byte blocked by download metric")), 500);
+      }),
+    ]);
+
+    expect(firstChunk.done).toBe(false);
+    expect(firstChunk.value?.byteLength).toBeGreaterThan(0);
+    expect(
+      fetchMock.mock.calls.some(
+        ([input]) =>
+          input.toString() ===
+          "https://preview-branch-123.convex.site/api/internal/archive-download-metric",
+      ),
+    ).toBe(true);
+
+    await reader.cancel();
   });
 });

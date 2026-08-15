@@ -1,6 +1,7 @@
 import { ConvexHttpClient } from "convex/browser";
 import type { FunctionReturnType } from "convex/server";
 import { api } from "../../convex/_generated/api";
+import { withOgFetchTimeout } from "./ogFetchTimeout";
 
 export type PublisherOgMeta = {
   handle: string | null;
@@ -27,9 +28,13 @@ export async function fetchPublisherOgMeta(
   convexUrl: string,
 ): Promise<PublisherOgMeta | null> {
   try {
-    const client = new ConvexHttpClient(convexUrl);
-    const profile = await client.query(api.publishers.getOgMetaByHandle, {
-      handle,
+    const profile = await withOgFetchTimeout((signal) => {
+      const client = new ConvexHttpClient(convexUrl, {
+        fetch: (input, init) => fetch(input, { ...init, signal }),
+      });
+      return client.query(api.publishers.getOgMetaByHandle, {
+        handle,
+      });
     });
     if (!profile) return null;
     return {

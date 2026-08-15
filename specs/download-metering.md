@@ -60,3 +60,9 @@ Package graphs render the available `packageDailyStats` rows for the visible
 30-day window and fill missing days with zero. Historical all-time counts are
 not redistributed into daily rows, so the all-time total can exceed the sum of
 the visible daily graph.
+
+## Hosted archive streaming
+
+When the Convex proxy rebuilds a zip from a signed archive manifest, the
+download metric POST is best-effort. It must not be awaited on the path that
+emits the first zip byte. A hung metric origin cannot stall the download.
