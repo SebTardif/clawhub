@@ -21,21 +21,25 @@ export async function fetchPluginOgMeta(
 ): Promise<PluginOgMeta | null> {
   try {
     const url = new URL(`/api/v1/packages/${encodeURIComponent(packageName)}`, apiBase);
-    const response = await withOgFetchTimeout((signal) =>
-      fetch(url.toString(), { headers: { Accept: "application/json" }, signal }),
-    );
-    if (!response.ok) return null;
-    const payload = (await response.json()) as {
-      package?: {
-        name?: string;
-        displayName?: string;
-        summary?: string | null;
-        latestVersion?: string | null;
-        stats?: unknown;
-        verification?: { scanStatus?: string | null } | null;
-      } | null;
-      owner?: { handle?: string | null; image?: string | null } | null;
-    };
+    const payload = await withOgFetchTimeout(async (signal) => {
+      const response = await fetch(url.toString(), {
+        headers: { Accept: "application/json" },
+        signal,
+      });
+      if (!response.ok) return null;
+      return (await response.json()) as {
+        package?: {
+          name?: string;
+          displayName?: string;
+          summary?: string | null;
+          latestVersion?: string | null;
+          stats?: unknown;
+          verification?: { scanStatus?: string | null } | null;
+        } | null;
+        owner?: { handle?: string | null; image?: string | null } | null;
+      };
+    });
+    if (!payload) return null;
     const stats = readStats(payload.package?.stats);
     return {
       name: payload.package?.name ?? null,

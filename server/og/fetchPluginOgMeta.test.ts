@@ -22,6 +22,23 @@ function hangUntilAborted(_input: unknown, init?: RequestInit) {
   });
 }
 
+function stallingBody(signal: AbortSignal | null | undefined) {
+  return new Promise<never>((_resolve, reject) => {
+    if (!signal) return;
+    signal.addEventListener(
+      "abort",
+      () => {
+        reject(
+          signal.reason instanceof Error
+            ? signal.reason
+            : new DOMException("The operation was aborted.", "AbortError"),
+        );
+      },
+      { once: true },
+    );
+  });
+}
+
 describe("fetchPluginOgMeta", () => {
   afterEach(() => {
     vi.useRealTimers();
@@ -63,6 +80,31 @@ describe("fetchPluginOgMeta", () => {
     const fetchMock = vi.fn((input: unknown, init?: RequestInit) => {
       usedSignal = init?.signal ?? undefined;
       return hangUntilAborted(input, init);
+    });
+    vi.stubGlobal("fetch", fetchMock);
+
+    const pending = fetchPluginOgMeta("@openclaw/codex", "https://clawhub.ai");
+    await Promise.resolve();
+    expect(usedSignal).toBeInstanceOf(AbortSignal);
+    expect(usedSignal?.aborted).toBe(false);
+
+    await vi.advanceTimersByTimeAsync(OG_FETCH_TIMEOUT_MS - 1);
+    expect(usedSignal?.aborted).toBe(false);
+
+    await vi.advanceTimersByTimeAsync(1);
+    await expect(pending).resolves.toBeNull();
+    expect(usedSignal?.aborted).toBe(true);
+  });
+
+  it("aborts when the public package API returns headers then stalls the JSON body", async () => {
+    vi.useFakeTimers();
+    let usedSignal: AbortSignal | undefined;
+    const fetchMock = vi.fn((_input: unknown, init?: RequestInit) => {
+      usedSignal = init?.signal ?? undefined;
+      return Promise.resolve({
+        ok: true,
+        json: () => stallingBody(init?.signal),
+      } as unknown as Response);
     });
     vi.stubGlobal("fetch", fetchMock);
 
