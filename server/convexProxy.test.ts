@@ -31,6 +31,7 @@ const TEST_ARCHIVE_DEPENDENCIES = {
 
 describe("Convex HTTP proxy", () => {
   afterEach(() => {
+    vi.useRealTimers();
     vi.restoreAllMocks();
     vi.unstubAllGlobals();
   });
@@ -647,6 +648,7 @@ describe("Convex HTTP proxy", () => {
   });
 
   it("does not wait for download metrics before emitting zip bytes", async () => {
+    vi.useFakeTimers();
     const storedBody = new TextEncoder().encode("# streamed skill\n");
     const fetchMock = vi.fn(async (input: string | URL | Request) => {
       const url = input.toString();
@@ -700,8 +702,8 @@ describe("Convex HTTP proxy", () => {
     const reader = response.body!.getReader();
     const firstChunk = await Promise.race([
       reader.read(),
-      new Promise<never>((_, reject) => {
-        setTimeout(() => reject(new Error("zip first byte blocked by download metric")), 500);
+      vi.advanceTimersByTimeAsync(500).then(() => {
+        throw new Error("zip first byte blocked by download metric");
       }),
     ]);
 
