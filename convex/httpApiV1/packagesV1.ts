@@ -1360,18 +1360,24 @@ const CLAWPACK_STORE_BATCH_FILES = 16;
 async function deleteUnpublishedPackagePublishBlobs(
   ctx: ActionCtx,
   stored: {
-    files?: Array<{ storageId: Id<"_storage"> }>;
-    artifact?: { storageId?: Id<"_storage"> } | null;
+    files?: Array<{ storageId: string }>;
+    artifact?: { storageId?: string } | null;
   },
 ) {
-  const storageIds: Array<Id<"_storage">> = [];
+  const remove = ctx.storage.delete?.bind(ctx.storage);
+  if (!remove) {
+    return;
+  }
+  const storageIds: string[] = [];
   for (const file of stored.files ?? []) {
     storageIds.push(file.storageId);
   }
   if (stored.artifact?.storageId) {
     storageIds.push(stored.artifact.storageId);
   }
-  await Promise.allSettled(storageIds.map((storageId) => ctx.storage.delete(storageId)));
+  await Promise.allSettled(
+    storageIds.map((storageId) => remove(storageId as Id<"_storage">)),
+  );
 }
 
 async function storeClawPackFiles(
