@@ -85,7 +85,7 @@ describe("changelog utils", () => {
 
     it("aborts a hung OpenAI changelog fetch instead of waiting forever", async () => {
       process.env.OPENAI_API_KEY = "test-key";
-      vi.spyOn(AbortSignal, "timeout").mockImplementation(() => {
+      const timeoutSpy = vi.spyOn(AbortSignal, "timeout").mockImplementation(() => {
         const controller = new AbortController();
         setTimeout(() => controller.abort(), 20);
         return controller.signal;
@@ -112,7 +112,7 @@ describe("changelog utils", () => {
         }),
       ).rejects.toMatchObject({ name: "AbortError" });
       expect(Date.now() - started).toBeLessThan(1000);
-      expect(AbortSignal.timeout).toHaveBeenCalledWith(__test.CHANGELOG_TIMEOUT_MS);
+      expect(timeoutSpy).toHaveBeenCalledWith(__test.CHANGELOG_TIMEOUT_MS);
     });
   });
 });
