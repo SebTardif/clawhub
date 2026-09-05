@@ -1375,9 +1375,7 @@ async function deleteUnpublishedPackagePublishBlobs(
   if (stored.artifact?.storageId) {
     storageIds.push(stored.artifact.storageId);
   }
-  await Promise.allSettled(
-    storageIds.map((storageId) => remove(storageId as Id<"_storage">)),
-  );
+  await Promise.allSettled(storageIds.map((storageId) => remove(storageId as Id<"_storage">)));
 }
 
 async function storeClawPackFiles(
