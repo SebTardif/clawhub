@@ -1,5 +1,8 @@
 import { describe, expect, it } from "vitest";
-import { getPreferredRestoredPackageRelease } from "./packages";
+import {
+  getPreferredRestoredPackageRelease,
+  rebuildPackageTagsFromActiveReleases,
+} from "./packages";
 
 function makeRelease(overrides: Record<string, unknown> = {}) {
   return {
@@ -51,5 +54,48 @@ describe("getPreferredRestoredPackageRelease", () => {
     ]);
 
     expect(next?._id).toBe("packageReleases:older");
+  });
+});
+
+describe("rebuildPackageTagsFromActiveReleases", () => {
+  it("does not copy unpublished latest onto rebuilt package tags", () => {
+    const published = makeRelease({
+      _id: "packageReleases:published",
+      version: "1.0.0",
+      createdAt: 10,
+      publicationStatus: "published",
+    });
+    const pending = makeRelease({
+      _id: "packageReleases:pending",
+      version: "2.0.0",
+      createdAt: 20,
+      publicationStatus: "pending",
+      distTags: ["latest"],
+    });
+    const activeReleases = [published, pending] as never[];
+
+    const nextLatest = getPreferredRestoredPackageRelease("code-plugin", activeReleases);
+    const nextTags = rebuildPackageTagsFromActiveReleases(activeReleases as never);
+
+    expect(nextLatest?._id).toBe("packageReleases:published");
+    expect(nextTags.latest).not.toBe("packageReleases:pending");
+    expect(nextTags.latest).toBeUndefined();
+  });
+
+  it("drops tags.latest when only a pending row carries the latest distTag", () => {
+    const pending = makeRelease({
+      _id: "packageReleases:pending",
+      version: "2.0.0",
+      createdAt: 20,
+      publicationStatus: "pending",
+      distTags: ["latest"],
+    });
+    const activeReleases = [pending] as never[];
+
+    const nextLatest = getPreferredRestoredPackageRelease("code-plugin", activeReleases);
+    const nextTags = rebuildPackageTagsFromActiveReleases(activeReleases as never);
+
+    expect(nextLatest).toBeNull();
+    expect(nextTags.latest).toBeUndefined();
   });
 });

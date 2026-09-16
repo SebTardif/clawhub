@@ -6376,10 +6376,11 @@ function getPreservedRestoredPackageRelease(
   );
 }
 
-function rebuildPackageTagsFromActiveReleases(releases: Doc<"packageReleases">[]) {
+export function rebuildPackageTagsFromActiveReleases(releases: Doc<"packageReleases">[]) {
   const tags: Doc<"packages">["tags"] = {};
   for (const release of releases) {
     if (release.softDeletedAt) continue;
+    if (!isPublishedPackageRelease(release)) continue;
     for (const tag of release.distTags ?? []) {
       tags[tag] = release._id;
     }
@@ -6482,6 +6483,8 @@ async function restorePackageDoc(
         distTags: [...(nextLatest.distTags ?? []), "latest"],
       });
     }
+  } else {
+    delete nextTags.latest;
   }
 
   const packagePatch: Partial<Doc<"packages">> = {
@@ -12537,6 +12540,8 @@ async function quarantineMaliciousLatestPackageRelease(
         distTags: [...(nextLatest.distTags ?? []), "latest"],
       });
     }
+  } else {
+    delete nextTags.latest;
   }
 
   const restoredRuntimeId = packageRuntimeIdFromRelease(nextLatest);
