@@ -69,6 +69,7 @@ import {
   getPublicSkillVersionAccessBlock,
   getPublicSkillVersionDownloadBlock,
   getSkillFileModerationInfoFromSkill,
+  isPublicSkillVersionAvailableForSkill,
   isSkillVersionForSkill,
 } from "../lib/skillFileAccess";
 import { normalizeSkillSlug } from "../lib/skillSlugValidator";
@@ -2375,6 +2376,9 @@ export async function skillsGetRouterV1Handler(ctx: ActionCtx, request: Request)
       return text("Version not found", 404, rate.headers);
     }
     if (version.softDeletedAt) return text("Version not available", 410, rate.headers);
+    if (!isPublicSkillVersionAvailableForSkill(version, skillResult.skill._id)) {
+      return text("Version not found", 404, rate.headers);
+    }
 
     const fingerprintEntries = ((await ctx.runQuery(
       internal.skills.listVersionFingerprintsInternal,

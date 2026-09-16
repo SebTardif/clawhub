@@ -7439,6 +7439,53 @@ describe("httpApiV1 handlers", () => {
     expect(runQuery).not.toHaveBeenCalled();
   });
 
+  it("does not verify an unpublished skill version", async () => {
+    const runQuery = vi.fn(async (_query: unknown, args: Record<string, unknown>) => {
+      if ("slug" in args) {
+        return {
+          skill: {
+            _id: "skills:1",
+            slug: "demo",
+            displayName: "Demo",
+            summary: "s",
+            tags: { latest: "skillVersions:1" },
+            stats: {},
+            createdAt: 1,
+            updatedAt: 2,
+            latestVersionId: "skillVersions:1",
+          },
+          latestVersion: { _id: "skillVersions:1", version: "1.0.0" },
+          owner: { _id: "users:1", handle: "acme", displayName: "Acme" },
+          moderationInfo: null,
+        };
+      }
+      if ("skillId" in args && args.version === "2.0.0") {
+        return {
+          _id: "skillVersions:pending",
+          skillId: "skills:1",
+          version: "2.0.0",
+          createdAt: 4,
+          changelog: "pending notes",
+          publicationStatus: "pending",
+          files: [{ path: "SKILL.md", size: 12, storageId: "storage:pending", sha256: "pend-sha" }],
+          softDeletedAt: undefined,
+        };
+      }
+      return null;
+    });
+    const runMutation = vi.fn().mockResolvedValue(okRate());
+    const storage = { get: vi.fn() };
+
+    const response = await __handlers.skillsGetRouterV1Handler(
+      makeCtx({ runQuery, runMutation, storage }),
+      new Request("https://example.com/api/v1/skills/demo/verify?version=2.0.0"),
+    );
+
+    expect(response.status).toBe(404);
+    expect(await response.text()).toBe("Version not found");
+    expect(storage.get).not.toHaveBeenCalled();
+  });
+
   it("returns a skill verification envelope with card and security metadata", async () => {
     const scannerReports = {
       aig: { version: "2.1.0", runs: [], vendorExtension: { preserved: true } },
