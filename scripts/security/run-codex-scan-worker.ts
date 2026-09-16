@@ -8,6 +8,7 @@ import { ConvexHttpClient } from "convex/browser";
 import { api } from "../../convex/_generated/api";
 import type { Id } from "../../convex/_generated/dataModel";
 import { parseLlmEvalResponse, type LlmEvalDimension } from "../../convex/lib/securityPrompt";
+import { readWorkerAssignment } from "../../packages/clawhub-admin/src/scanAssignments";
 import { assertCodexWorkerExecutionAllowed, resolveCodexWorkerHome } from "../codex-worker-guard";
 import { materializeVerifiedArtifactFiles } from "../lib/artifactMaterialization";
 import { createWorkerLogger } from "../lib/workerLogger";
@@ -26,6 +27,7 @@ import {
 } from "./security-scan-worker-summary";
 
 export type ClaimedJob = {
+  scannerReportsUploadUrl?: string | null;
   job: {
     _id: string;
     leaseToken: string;
@@ -1915,12 +1917,13 @@ function validateClawScanArtifactForClawHubProfile(
 
   const checkedAt = artifactCompletedAtMs(artifact);
   let aigAnalysis: AigAnalysis | undefined;
+  let rawAig: string | undefined;
   if (scannerSet.includes("aig")) {
     const aig = asRecord(scanners?.aig);
     if (!aig || aig.raw === undefined) {
       throw new Error("ClawScan aig scanner output was missing");
     }
-    const rawAig = typeof aig.raw === "string" ? aig.raw : JSON.stringify(aig.raw);
+    rawAig = typeof aig.raw === "string" ? aig.raw : JSON.stringify(aig.raw);
     aigAnalysis = normalizeAigAnalysis(rawAig, checkedAt);
     if (aigAnalysis.status === "error") {
       throw new Error(aigAnalysis.error ?? "A.I.G returned unusable scanner output");
@@ -1932,6 +1935,11 @@ function validateClawScanArtifactForClawHubProfile(
     llmAnalysis: toStoredLlmAnalysis(parsed, checkedAt),
     mapping: clawScanDiagnosticMapping(artifact, scannerSet),
     skillSpectorAnalysis: normalizeSkillSpectorAnalysis(rawSkillSpector, checkedAt),
+    scannerReportsJson: JSON.stringify({
+      checkedAt,
+      aig: rawAig ? (JSON.parse(rawAig) as unknown) : null,
+      skillspector: JSON.parse(rawSkillSpector) as unknown,
+    }),
   };
 }
 
@@ -2098,6 +2106,22 @@ export async function processJob(
     aigAnalysis = mapped.aigAnalysis;
     skillSpectorAnalysis = mapped.skillSpectorAnalysis;
     if (!llmAnalysis) throw new Error("Security scan did not produce llmAnalysis");
+    // A signed upload URL advertises support after the separately deployed
+    // backend updates. Upload directly to storage to avoid action argument limits.
+    let scannerReportsStorageId: string | undefined;
+    if (job.scannerReportsUploadUrl) {
+      const uploaded = await fetch(job.scannerReportsUploadUrl, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: mapped.scannerReportsJson,
+      });
+      if (!uploaded.ok) throw new Error(`Scanner report upload failed (${uploaded.status})`);
+      const uploadResult = asRecord(await uploaded.json());
+      if (typeof uploadResult?.storageId !== "string" || !uploadResult.storageId) {
+        throw new Error("Scanner report upload did not return a storage ID");
+      }
+      scannerReportsStorageId = uploadResult.storageId;
+    }
     await client.action(api.securityScan.completeCodexScanJob, {
       token,
       jobId: job.job._id as Id<"securityScanJobs">,
@@ -2105,6 +2129,9 @@ export async function processJob(
       llmAnalysis,
       aigAnalysis,
       skillSpectorAnalysis,
+      ...(scannerReportsStorageId
+        ? { scannerReportsStorageId: scannerReportsStorageId as Id<"_storage"> }
+        : {}),
       runId: process.env.GITHUB_RUN_ID,
     });
     scanCompletedAt = Date.now();
@@ -2201,6 +2228,17 @@ export async function processJob(
   }
 }
 
+function isTransientClaimError(error: unknown) {
+  if (!(error instanceof Error)) return false;
+  // Convex hides internal failures behind this message. Authentication and
+  // validation errors are deliberately not retried here.
+  return (
+    /(?:^|\] )Server Error$/.test(error.message.trim()) ||
+    /socket connection was closed unexpectedly|network connection was lost/i.test(error.message) ||
+    (error instanceof TypeError && /fetch failed/i.test(error.message))
+  );
+}
+
 export async function runContinuouslyRefilledWorkerPool<TJob>(options: {
   concurrency: number;
   maxJobs: number | undefined;
@@ -2218,6 +2256,7 @@ export async function runContinuouslyRefilledWorkerPool<TJob>(options: {
   let totalFailed = 0;
   let totalRetryableFailed = 0;
   let totalClaimFailures = 0;
+  let consecutiveClaimFailures = 0;
 
   while (active.size > 0 || (!queueDrained && options.canClaim(totalClaimed))) {
     while (active.size < options.concurrency && !queueDrained && options.canClaim(totalClaimed)) {
@@ -2240,7 +2279,15 @@ export async function runContinuouslyRefilledWorkerPool<TJob>(options: {
       } catch (error) {
         totalClaimFailures += 1;
         totalFailed += 1;
-        queueDrained = true;
+        consecutiveClaimFailures += 1;
+        const retry =
+          isTransientClaimError(error) &&
+          consecutiveClaimFailures <= 3 &&
+          options.canClaim(totalClaimed);
+        const retryDelayMs = retry
+          ? 1000 * 2 ** (consecutiveClaimFailures - 1) + Math.floor(Math.random() * 500)
+          : null;
+        queueDrained = !retry;
         const message = error instanceof Error ? error.message : String(error);
         logger.error(
           {
@@ -2248,12 +2295,21 @@ export async function runContinuouslyRefilledWorkerPool<TJob>(options: {
             publicReason: sanitizeWorkerErrorMessage(message),
             requested: remainingJobs,
             scannerPhase: "claim",
+            retryDelayMs,
+            consecutiveClaimFailures,
           },
           "failed to claim security scan jobs",
         );
+        if (retryDelayMs !== null) {
+          // Already leased jobs continue running. A new claim never replaces or
+          // retries a terminal scan; an unobserved lease uses normal expiry.
+          await sleepImpl(retryDelayMs);
+          continue;
+        }
         break;
       }
 
+      consecutiveClaimFailures = 0;
       totalClaimed += claimedCount;
       if (claimedCount < remainingJobs) {
         queueDrained = true;
@@ -2353,6 +2409,20 @@ async function main() {
     await sleep(sharedShardIndex * 250);
   }
 
+  let assignedJobIds = readWorkerAssignment(
+    process.env.CODEX_SECURITY_SCAN_ASSIGNED_JOBS,
+    lane,
+    process.env.CODEX_SECURITY_SCAN_SHARD,
+  );
+  logger.info(
+    {
+      event: "security_scan_assignment",
+      mode: assignedJobIds === undefined ? "queue" : "assigned",
+      assignedJobs: assignedJobIds?.length,
+      workerId,
+    },
+    "security scan job assignment",
+  );
   const stats = await runContinuouslyRefilledWorkerPool({
     concurrency: batchLimit,
     maxJobs,
@@ -2364,7 +2434,14 @@ async function main() {
         lane,
         limit,
         leaseMs,
+        assignedJobIds: assignedJobIds as Id<"securityScanJobs">[] | undefined,
       })) as ClaimedJobLease[];
+      // Stop reading running/completed jobs during refills. Automatic retries remain
+      // on the same backend IDs and are picked up by a later local dispatch.
+      if (assignedJobIds !== undefined) {
+        const claimed = new Set(leases.map((lease) => lease._id));
+        assignedJobIds = assignedJobIds.filter((id) => !claimed.has(id));
+      }
       const hydrated = await Promise.all(
         leases.map(async (lease) => {
           try {

@@ -17,12 +17,14 @@ import {
   searchSkillsHttp,
 } from "./httpApi";
 import {
+  searchInsightsV1Http,
   exportSkillsV1Http,
   exportPluginsV1Http,
   listBundlePluginsV1Http,
   listCodePluginsV1Http,
   listPackagesV1Http,
   listPluginsV1Http,
+  listPluginOverviewV1Http,
   listPluginCategoriesV1Http,
   listSkillsV1Http,
   trendingV1Http,
@@ -40,6 +42,7 @@ import {
   resolveSkillVersionV1Http,
   searchSkillsV1Http,
   skillScanBatchStatusV1Http,
+  skillScanJobHistoryV1Http,
   skillScanBatchSubmitV1Http,
   skillScanGetRouterV1Http,
   skillScanSubmitV1Http,
@@ -82,6 +85,7 @@ import { skillPresentationAssetHttp } from "./skillPresentationAssetsHttp";
 const http = installRateLimitedRoutes(httpRouter());
 
 auth.addHttpRoutes(http);
+http.route({ path: "/api/v1/search-insights", method: "GET", handler: searchInsightsV1Http });
 
 http.route({
   pathPrefix: "/api/v1/skill-icons/",
@@ -154,6 +158,12 @@ http.route({
   path: ApiRoutes.plugins,
   method: "GET",
   handler: listPluginsV1Http,
+});
+
+http.route({
+  path: ApiRoutes.pluginOverview,
+  method: "GET",
+  handler: listPluginOverviewV1Http,
 });
 
 http.route({
@@ -268,6 +278,12 @@ http.route({
   path: `${ApiRoutes.skillScans}/batch`,
   method: "POST",
   handler: skillScanBatchSubmitV1Http,
+});
+
+http.route({
+  path: `${ApiRoutes.skillScans}/batch/jobs`,
+  method: "POST",
+  handler: skillScanJobHistoryV1Http,
 });
 
 http.route({

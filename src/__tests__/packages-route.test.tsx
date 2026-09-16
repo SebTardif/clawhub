@@ -106,6 +106,7 @@ describe("plugins route", () => {
     resetConvexReactMocks();
     setupDefaultConvexReactMocks();
     navigateMock.mockReset();
+    navigateMock.mockResolvedValue(undefined);
     redirectMock.mockClear();
     searchMock = {};
     loaderDataMock = undefined;
@@ -625,8 +626,9 @@ describe("plugins route", () => {
     render(<Component />);
 
     const categorySidebar = screen.getByLabelText("Plugin categories");
-    expect(categorySidebar.querySelectorAll("button")).toHaveLength(13);
+    expect(categorySidebar.querySelectorAll("button")).toHaveLength(23);
     expect(categorySidebar.textContent).toContain("Channels");
+    expect(categorySidebar.textContent).toContain("Agent runtimes");
     expect(screen.getByRole("combobox", { name: "Category" })).toBeTruthy();
   });
 

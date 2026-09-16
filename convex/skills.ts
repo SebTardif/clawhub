@@ -52,6 +52,7 @@ import {
   getActivityTrendRangeForEndDay,
 } from "./lib/downloadTrend";
 import { embeddingVisibilityFor } from "./lib/embeddingVisibility";
+import { assertFeaturedCapacity } from "./lib/featuredPolicy";
 import {
   canHealSkillOwnershipByGitHubProviderAccountId,
   getGitHubProviderAccountId,
@@ -103,11 +104,7 @@ import {
   requirePublisherRole,
 } from "./lib/publishers";
 import { RECOMMENDATION_SCORE_VERSION } from "./lib/recommendationScore";
-import {
-  AUTO_HIDE_REPORT_THRESHOLD,
-  MAX_ACTIVE_REPORTS_PER_USER,
-  MAX_REPORT_REASON_LENGTH,
-} from "./lib/reporting";
+import { MAX_ACTIVE_REPORTS_PER_USER, MAX_REPORT_REASON_LENGTH } from "./lib/reporting";
 import {
   canReleaseReservedSlugForPublisher,
   enforceReservedSlugCooldownForNewSkill,
@@ -1548,6 +1545,9 @@ async function hardDeleteSkillStep(
         .withIndex("by_skill", (q) => q.eq("skillId", skill._id))
         .take(HARD_DELETE_VERSION_BATCH_SIZE);
       for (const version of versions) {
+        if (version.scannerReportsStorageId) {
+          await ctx.storage.delete(version.scannerReportsStorageId);
+        }
         await ctx.db.delete(version._id);
       }
       if (versions.length === HARD_DELETE_VERSION_BATCH_SIZE) {
@@ -2391,6 +2391,7 @@ async function upsertSkillBadge(
   if (existing) {
     await ctx.db.patch(existing._id, { byUserId: userId, at });
   } else {
+    if (kind === "highlighted") await assertFeaturedCapacity(ctx, "skill");
     await ctx.db.insert("skillBadges", {
       skillId,
       kind,
@@ -4192,47 +4193,12 @@ export const report = mutation({
     });
 
     const nextReportCount = (skill.reportCount ?? 0) + 1;
-    const shouldAutoHide = nextReportCount > AUTO_HIDE_REPORT_THRESHOLD && !skill.softDeletedAt;
-    const updates: Partial<Doc<"skills">> = {
+    // Reports are moderator intake, not authority to hide another publisher's skill.
+    await ctx.db.patch(skill._id, {
       reportCount: nextReportCount,
       lastReportedAt: now,
       updatedAt: now,
-    };
-    if (shouldAutoHide) {
-      Object.assign(updates, {
-        softDeletedAt: now,
-        moderationStatus: "hidden",
-        moderationReason: "auto.reports",
-        moderationNotes: "Auto-hidden after 4 unique reports.",
-        isSuspicious: computeIsSuspicious({
-          moderationFlags: skill.moderationFlags,
-          moderationReason: "auto.reports",
-        }),
-        hiddenAt: now,
-        lastReviewedAt: now,
-        unpublishedSlugReservedUntil: undefined,
-        unpublishedSlugReleasedAt: undefined,
-        unpublishedOriginalSlug: undefined,
-      });
-    }
-
-    const nextSkill = { ...skill, ...updates };
-    await ctx.db.patch(skill._id, updates);
-    await adjustGlobalPublicCountForSkillChange(ctx, skill, nextSkill);
-    await adjustUserSkillStatsForSkillChange(ctx, skill, nextSkill);
-
-    if (shouldAutoHide) {
-      await setSkillEmbeddingsSoftDeleted(ctx, skill._id, true, now);
-
-      await ctx.db.insert("auditLogs", {
-        actorUserId: userId,
-        action: "skill.auto_hide",
-        targetType: "skill",
-        targetId: skill._id,
-        metadata: { reportCount: nextReportCount },
-        createdAt: now,
-      });
-    }
+    });
 
     await appendSkillModerationEventLog(ctx, {
       kind: "report",
@@ -6175,7 +6141,7 @@ async function buildPublicSkillApiListEntryFromDigest(
   const publicSkill = toPublicSkill(hydratable);
   if (!publicSkill) return null;
   const ownerInfo = digestToOwnerInfo(digest);
-  if (!ownerInfo?.owner) return null;
+  if (!ownerInfo?.owner || !ownerInfo.ownerHandle) return null;
   const latestVersion = await resolveDigestLatestVersionForSkill(ctx, digest);
   if (isHostedSkillPendingPublicReview(hydratable) && !latestVersion) return null;
 
@@ -6192,6 +6158,7 @@ async function buildPublicSkillApiListEntryFromDigest(
       updatedAt: publicSkill.updatedAt,
       latestVersionId: publicSkill.latestVersionId,
     },
+    ownerHandle: ownerInfo.ownerHandle,
     latestVersion,
   };
 }
@@ -9281,6 +9248,7 @@ export const updateVersionAigAnalysisInternal = internalMutation({
 export const updateVersionLlmAnalysisInternal = internalMutation({
   args: {
     versionId: v.id("skillVersions"),
+    scannerReportsStorageId: v.optional(v.id("_storage")),
     moderationMode: v.optional(v.union(v.literal("normal"), v.literal("preserve"))),
     llmAnalysis: v.object({
       status: v.string(),
@@ -9349,9 +9317,21 @@ export const updateVersionLlmAnalysisInternal = internalMutation({
   },
   handler: async (ctx, args) => {
     const version = await ctx.db.get(args.versionId);
-    if (!version) return;
+    if (!version) {
+      if (args.scannerReportsStorageId) throw new ConvexError("Version not found");
+      return;
+    }
     const nextVersion = { ...version, llmAnalysis: args.llmAnalysis };
-    await ctx.db.patch(args.versionId, { llmAnalysis: args.llmAnalysis });
+    if (
+      version.scannerReportsStorageId &&
+      version.scannerReportsStorageId !== args.scannerReportsStorageId
+    ) {
+      await ctx.storage.delete(version.scannerReportsStorageId);
+    }
+    await ctx.db.patch(args.versionId, {
+      llmAnalysis: args.llmAnalysis,
+      scannerReportsStorageId: args.scannerReportsStorageId,
+    });
     await ctx.scheduler?.runAfter(0, internal.skillCards.enqueueForVersionInternal, {
       versionId: args.versionId,
       source: "scan",
@@ -10211,10 +10191,28 @@ export const generateChangelogPreview = action({
     readmeText: v.string(),
     filePaths: v.optional(v.array(v.string())),
   },
-  handler: async (ctx, args) => {
+  handler: async (ctx, args): Promise<{ changelog: string; source: "auto" }> => {
     await requireUserFromAction(ctx);
+    const slug = args.slug.trim().toLowerCase();
+    const skill: Doc<"skills"> | null = await ctx.runQuery(internal.skills.getSkillBySlugInternal, {
+      slug,
+    });
+    const previous: Doc<"skillVersions"> | null = skill?.latestVersionId
+      ? await ctx.runQuery(internal.skills.getVersionByIdInternal, {
+          versionId: skill.latestVersionId,
+        })
+      : null;
+    // Changelog generation reads files and sends them to an external provider.
+    // Apply the same access check as direct file reads before either can happen.
+    if (
+      previous &&
+      (previous.skillId !== skill?._id || !(await canReadSkillVersionFiles(ctx, previous)))
+    ) {
+      throw new ConvexError("Version not available");
+    }
     const changelog = await buildChangelogPreview(ctx, {
-      slug: args.slug.trim().toLowerCase(),
+      slug,
+      previous,
       version: args.version.trim(),
       readmeText: args.readmeText,
       filePaths: args.filePaths?.map((value) => value.trim()).filter(Boolean),
@@ -10884,6 +10882,10 @@ async function setSkillFeaturedForActor(
   const existingBadges = await getSkillBadgeMap(ctx, skill._id);
   const previousHighlighted = isSkillHighlighted({ badges: existingBadges });
   const featured = nextBatch === "highlighted";
+  const result = { ok: true as const, featured, skillId: skill._id, slug: skill.slug };
+  // Keeping a selection must preserve its timestamp, ordering and notifications.
+  if (featured && previousHighlighted) return result;
+  if (!featured && !previousHighlighted && nextBatch === skill.batch) return result;
   const now = Date.now();
 
   if (featured) {
@@ -10906,10 +10908,10 @@ async function setSkillFeaturedForActor(
   });
 
   if (featured && !previousHighlighted) {
-    void queueHighlightedWebhook(ctx, skill._id);
+    await queueHighlightedWebhook(ctx, skill._id);
   }
 
-  return { ok: true as const, featured, skillId: skill._id, slug: skill.slug };
+  return result;
 }
 
 export const setSkillFeaturedForUserInternal = internalMutation({
@@ -13231,6 +13233,7 @@ export const discardPendingPublicationInternal = internalMutation({
     }
 
     const storageIds = new Set<Id<"_storage">>();
+    if (version.scannerReportsStorageId) storageIds.add(version.scannerReportsStorageId);
     for (const file of version.files ?? []) {
       if (typeof file.storageId === "string") {
         storageIds.add(file.storageId as Id<"_storage">);
@@ -13631,23 +13634,20 @@ async function setSkillSoftDeletedByActor(
   const slug = skill.slug;
 
   const isModeratorOrAdmin = user.role === "admin" || user.role === "moderator";
-  let isOwner = skill.ownerUserId === args.userId;
-
-  if (!isOwner) {
-    try {
-      await assertCanManageOwnedResource(ctx, {
-        actor: user,
-        ownerUserId: skill.ownerUserId,
-        ownerPublisherId: skill.ownerPublisherId,
-        allowedPublisherRoles: ["admin"],
-      });
-      isOwner = true;
-    } catch {
-      if (!isModeratorOrAdmin) {
-        // Preserve legacy behavior: delegate to assertModerator to produce the
-        // standard "Forbidden" error for non-owners without elevated roles.
-        assertModerator(user);
-      }
+  let isOwner = false;
+  // A historical publisher user ID does not confer current organization access.
+  try {
+    await assertCanManageOwnedResource(ctx, {
+      actor: user,
+      ownerUserId: skill.ownerUserId,
+      ownerPublisherId: skill.ownerPublisherId,
+      allowedPublisherRoles: ["admin"],
+    });
+    isOwner = true;
+  } catch {
+    if (!isModeratorOrAdmin) {
+      // Preserve the standard authorization error for non-owners.
+      assertModerator(user);
     }
   }
   if (args.deleted && skill.moderationStatus === "removed") {
