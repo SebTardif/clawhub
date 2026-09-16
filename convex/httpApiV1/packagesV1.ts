@@ -4740,7 +4740,7 @@ export async function packagesGetRouterV1Handler(ctx: ActionCtx, request: Reques
           version: packageSegments[1],
         },
       )) as SkillVersionLike | null;
-      if (!isPublicSkillVersionAvailableForSkill(version, skillDetail.skill._id)) {
+      if (!version || !isPublicSkillVersionAvailableForSkill(version, skillDetail.skill._id)) {
         return text("Version not found", 404, rate.headers);
       }
       const effectiveLatestVersionId =
