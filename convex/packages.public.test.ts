@@ -60,6 +60,7 @@ import {
   listPublicPage,
   listPublicNewPluginsPage,
   listPageForViewerInternal,
+  listPluginOverviewCategoryInternal,
   listVersions,
   listVersionsForViewerInternal,
   listVersionsForManager,
@@ -218,6 +219,12 @@ const listPageForViewerInternalHandler = (
       isDone: boolean;
       continueCursor: string;
     }
+  >
+)._handler;
+const listPluginOverviewCategoryInternalHandler = (
+  listPluginOverviewCategoryInternal as unknown as WrappedHandler<
+    { category: string; numItems: number },
+    Array<{ name: string; isOfficial: boolean; stats?: { downloads: number } }>
   >
 )._handler;
 const listPluginExportPageInternalHandler = (
@@ -1172,6 +1179,8 @@ beforeEach(() => {
 });
 
 afterEach(() => {
+  vi.unstubAllGlobals();
+  vi.unstubAllEnvs();
   vi.mocked(getAuthUserId).mockReset();
   vi.mocked(getAuthUserId).mockResolvedValue(null);
 });
@@ -1900,6 +1909,9 @@ function makeDigestCtx(options: {
               },
             };
           }
+          if (table === "officialPublishers") {
+            return { withIndex: () => ({ unique: async () => null }) };
+          }
           if (
             table !== "packageCapabilitySearchDigest" &&
             table !== "packageTopicSearchDigest" &&
@@ -1917,6 +1929,33 @@ function makeDigestCtx(options: {
                 lt: (field: string, value: string) => unknown;
               }) => unknown,
             ) => {
+              if (indexName.includes("_official_")) {
+                indexNames.push(indexName);
+                const filters: Array<{ field: string; value: unknown }> = [];
+                const queryBuilder = {
+                  eq: (field: string, value: unknown) => {
+                    filters.push({ field, value });
+                    return queryBuilder;
+                  },
+                  gte: () => queryBuilder,
+                  lt: () => queryBuilder,
+                };
+                builder?.(queryBuilder);
+                const takeRows = async (limit: number) => {
+                  take(limit);
+                  return (rowsByTable.get(table) ?? [])
+                    .filter((row) =>
+                      filters.every(({ field, value }) => readTestField(row, field) === value),
+                    )
+                    .slice(0, limit);
+                };
+                return {
+                  order: vi.fn(() => ({
+                    paginate: getPaginate(table),
+                    take: vi.fn(takeRows),
+                  })),
+                };
+              }
               if (indexName.includes("_family_")) {
                 indexNames.push(indexName);
                 let family = "";
@@ -2894,13 +2933,24 @@ function makePackageCtx(options: {
           if (table === "packageReleases") {
             const filteredVersionsPage = {
               ...versionsPage,
-              page: versionsPage.page.filter((release) => release.softDeletedAt === undefined),
+              page: versionsPage.page.filter(
+                (release) =>
+                  release.softDeletedAt === undefined &&
+                  release.ownerDeletedAt === undefined &&
+                  (release.publicationStatus === undefined ||
+                    release.publicationStatus === "published"),
+              ),
             };
             return {
               withIndex: vi.fn((indexName: string) => {
                 releaseIndexNames.push(indexName);
                 if (indexName === "by_package_active_created") {
                   return {
+                    filter: vi.fn(() => ({
+                      order: vi.fn(() => ({
+                        paginate: vi.fn().mockResolvedValue(filteredVersionsPage),
+                      })),
+                    })),
                     order: vi.fn(() => ({
                       paginate: vi.fn().mockResolvedValue(filteredVersionsPage),
                     })),
@@ -4587,7 +4637,7 @@ describe("packages public queries", () => {
     expect(result.page.map((entry) => entry.name)).toEqual(["public-plugin"]);
   });
 
-  it("allows owners to list their private packages", async () => {
+  it("excludes private packages from catalog pages even for owners", async () => {
     const { ctx } = makeDigestCtx({
       pages: [
         {
@@ -4609,7 +4659,7 @@ describe("packages public queries", () => {
       viewerUserId: "users:owner",
     });
 
-    expect(result.page.map((entry) => entry.name)).toEqual(["secret-plugin", "public-plugin"]);
+    expect(result.page.map((entry) => entry.name)).toEqual(["public-plugin"]);
   });
 
   it("keeps highlighted package pages in newest-featured order", async () => {
@@ -4707,7 +4757,7 @@ describe("packages public queries", () => {
     expect(result.page.map((entry) => entry.name)).toEqual(["public-plugin"]);
   });
 
-  it("lets legacy no-link personal package owners list private package digests", async () => {
+  it("excludes private catalog digests even for legacy personal owners", async () => {
     const { ctx } = makeDigestCtx({
       publisherDocs: {
         "publishers:legacy-personal": {
@@ -4739,10 +4789,7 @@ describe("packages public queries", () => {
       viewerUserId: "users:viewer",
     });
 
-    expect(result.page.map((entry) => entry.name)).toEqual([
-      "legacy-personal-secret",
-      "public-plugin",
-    ]);
+    expect(result.page.map((entry) => entry.name)).toEqual(["public-plugin"]);
   });
 
   it("does not let inactive no-link personal publishers expose private package digests", async () => {
@@ -4781,7 +4828,7 @@ describe("packages public queries", () => {
     expect(result.page.map((entry) => entry.name)).toEqual(["public-plugin"]);
   });
 
-  it("does not reuse legacy no-link personal access across package owners", async () => {
+  it("excludes all private catalog digests across legacy personal owners", async () => {
     const { ctx } = makeDigestCtx({
       publisherDocs: {
         "publishers:legacy-personal": {
@@ -4819,10 +4866,10 @@ describe("packages public queries", () => {
       viewerUserId: "users:viewer",
     });
 
-    expect(result.page.map((entry) => entry.name)).toEqual(["own-legacy-secret", "public-plugin"]);
+    expect(result.page.map((entry) => entry.name)).toEqual(["public-plugin"]);
   });
 
-  it("allows owners to filter to only their private packages", async () => {
+  it("allows owners to explicitly browse published private packages", async () => {
     const { ctx, indexNames } = makeDigestCtx({
       pages: [
         {
@@ -4852,7 +4899,7 @@ describe("packages public queries", () => {
     expect(indexNames).toEqual(["by_active_channel_updated"]);
   });
 
-  it("allows org collaborators to list their private packages", async () => {
+  it("excludes private packages from catalog pages even for org collaborators", async () => {
     const { ctx } = makeDigestCtx({
       pages: [
         {
@@ -4878,7 +4925,7 @@ describe("packages public queries", () => {
       viewerUserId: "users:member",
     });
 
-    expect(result.page.map((entry) => entry.name)).toEqual(["secret-plugin", "public-plugin"]);
+    expect(result.page.map((entry) => entry.name)).toEqual(["public-plugin"]);
   });
 
   it("applies isOfficial filtering even with family and channel set", async () => {
@@ -5027,7 +5074,7 @@ describe("packages public queries", () => {
     expect(result.map((entry) => entry.package.name)).toEqual(["youtube"]);
   });
 
-  it("allows owners to search their private packages", async () => {
+  it("allows owners to explicitly search published private packages", async () => {
     const { ctx } = makeDigestCtx({
       pages: [
         {
@@ -5363,7 +5410,7 @@ describe("packages public queries", () => {
     expect(result.map((entry) => entry.package.name)).toEqual(["agentmail", "email"]);
   });
 
-  it("allows org collaborators to search their private packages", async () => {
+  it("allows org collaborators to explicitly search published private packages", async () => {
     const { ctx } = makeDigestCtx({
       pages: [
         {
@@ -6044,10 +6091,11 @@ describe("packages public queries", () => {
           continueCursor: "",
         },
       ],
-      categoryRows: excludedCommunityDigests,
+      categoryRows: [officialDigest, ...excludedCommunityDigests],
     });
 
     const result = await listPublicPageHandler(ctx, {
+      family: "code-plugin",
       category: "security",
       officialFirst: true,
       excludedScanStatuses: ["pending"],
@@ -6057,7 +6105,8 @@ describe("packages public queries", () => {
     expect(result.page.map((entry) => entry.name)).toEqual(["official-security"]);
     expect(result.isDone).toBe(false);
     expect(result.continueCursor).toMatch(/^pkgofficialfirst:/);
-    expect(paginate).toHaveBeenCalledTimes(1);
+    expect(paginate).not.toHaveBeenCalled();
+    expect(take).toHaveBeenCalledTimes(2);
     expect(take).toHaveBeenCalledWith(200);
   });
 
@@ -6089,6 +6138,7 @@ describe("packages public queries", () => {
     });
 
     const result = await listPublicPageHandler(ctx, {
+      family: "code-plugin",
       category: "security",
       officialFirst: true,
       paginationOpts: { cursor: null, numItems: 3 },
@@ -6101,8 +6151,70 @@ describe("packages public queries", () => {
     ]);
     expect(result.isDone).toBe(true);
     expect(result.continueCursor).toBe("");
-    expect(paginate).toHaveBeenCalledTimes(1);
-    expect(take).toHaveBeenCalledTimes(1);
+    expect(paginate).not.toHaveBeenCalled();
+    expect(take).toHaveBeenCalledTimes(2);
+  });
+
+  it("fills overview shelves from bounded category indexes while Claws are disabled", async () => {
+    const previous = process.env.CLAWHUB_EXPERIMENTAL_CLAWS;
+    delete process.env.CLAWHUB_EXPERIMENTAL_CLAWS;
+    const genericNoise = Array.from({ length: 50 }, (_, index) =>
+      makeDigest(`generic-noise-${index}`, {
+        family: "code-plugin",
+        pluginCategoryTags: ["models"],
+        stats: { downloads: 1_000 - index, installs: 0, stars: 0, versions: 1 },
+      }),
+    );
+    const categoryRows = [
+      makeDigest("community-code", {
+        pluginCategory: "security",
+        pluginCategoryTags: ["security"],
+        stats: { downloads: 100, installs: 0, stars: 0, versions: 1 },
+      }),
+      makeDigest("official-code", {
+        isOfficial: true,
+        pluginCategory: "security",
+        pluginCategoryTags: ["security"],
+        stats: { downloads: 10, installs: 0, stars: 0, versions: 1 },
+      }),
+      makeDigest("official-bundle", {
+        family: "bundle-plugin",
+        isOfficial: true,
+        pluginCategory: "security",
+        pluginCategoryTags: ["security"],
+        stats: { downloads: 20, installs: 0, stars: 0, versions: 1 },
+      }),
+      makeDigest("community-bundle", {
+        family: "bundle-plugin",
+        pluginCategory: "security",
+        pluginCategoryTags: ["security"],
+        stats: { downloads: 200, installs: 0, stars: 0, versions: 1 },
+      }),
+    ];
+    const { ctx, indexNames, paginate, take } = makeDigestCtx({
+      pages: [{ page: genericNoise, isDone: false, continueCursor: "generic:later" }],
+      categoryRows,
+    });
+
+    try {
+      const result = await listPluginOverviewCategoryInternalHandler(ctx, {
+        category: "security",
+        numItems: 3,
+      });
+
+      expect(result.map((entry) => entry.name)).toEqual([
+        "official-bundle",
+        "official-code",
+        "community-bundle",
+      ]);
+      expect(indexNames).toEqual(Array(4).fill("by_active_family_official_category_downloads"));
+      expect(paginate).not.toHaveBeenCalled();
+      expect(take).toHaveBeenCalledTimes(4);
+      expect(take).toHaveBeenCalledWith(200);
+    } finally {
+      if (previous === undefined) delete process.env.CLAWHUB_EXPERIMENTAL_CLAWS;
+      else process.env.CLAWHUB_EXPERIMENTAL_CLAWS = previous;
+    }
   });
 
   it("keeps highlighted-only filtering while filling official-first category pages", async () => {
@@ -6197,6 +6309,7 @@ describe("packages public queries", () => {
     });
 
     const result = await listPublicPageHandler(ctx, {
+      family: "code-plugin",
       category: "security",
       officialFirst: true,
       paginationOpts: { cursor: null, numItems: 1 },
@@ -6205,8 +6318,8 @@ describe("packages public queries", () => {
     expect(result.page.map((entry) => entry.name)).toEqual(["official-security"]);
     expect(result.isDone).toBe(false);
     expect(result.continueCursor).toMatch(/^pkgofficialfirst:/);
-    expect(paginate).toHaveBeenCalledTimes(1);
-    expect(take).toHaveBeenCalledTimes(1);
+    expect(paginate).not.toHaveBeenCalled();
+    expect(take).toHaveBeenCalledTimes(2);
   });
 
   it("uses plugin category digests for category-filtered search", async () => {
@@ -7357,7 +7470,7 @@ describe("packages public queries", () => {
   });
 
   it("fills public package version pages after skipping pending releases", async () => {
-    const releases = [
+    const releases: Array<Record<string, unknown>> = [
       makeReleaseDoc({
         _id: "packageReleases:pending",
         version: "2.0.0",
@@ -7368,8 +7481,11 @@ describe("packages public queries", () => {
         version: "1.0.0",
       }),
     ];
-    const paginate = vi.fn(
+    const paginateUnfiltered = vi.fn(
       async ({ cursor, numItems }: { cursor: string | null; numItems: number }) => {
+        if (cursor !== null) {
+          throw new Error("A query can only invoke paginate once");
+        }
         const start = cursor ? Number(cursor) : 0;
         const page = releases.slice(start, start + numItems);
         const next = start + page.length;
@@ -7377,6 +7493,22 @@ describe("packages public queries", () => {
           page,
           isDone: next >= releases.length,
           continueCursor: next >= releases.length ? "" : String(next),
+        };
+      },
+    );
+    const paginatePublished = vi.fn(
+      async ({ cursor, numItems }: { cursor: string | null; numItems: number }) => {
+        const published = releases.filter(
+          (release) =>
+            release.publicationStatus === undefined || release.publicationStatus === "published",
+        );
+        const start = cursor ? Number(cursor) : 0;
+        const page = published.slice(start, start + numItems);
+        const next = start + page.length;
+        return {
+          page,
+          isDone: next >= published.length,
+          continueCursor: next >= published.length ? "" : String(next),
         };
       },
     );
@@ -7401,8 +7533,13 @@ describe("packages public queries", () => {
               withIndex: vi.fn((indexName: string) => {
                 releaseIndexNames.push(indexName);
                 return {
+                  filter: vi.fn(() => ({
+                    order: vi.fn(() => ({
+                      paginate: paginatePublished,
+                    })),
+                  })),
                   order: vi.fn(() => ({
-                    paginate,
+                    paginate: paginateUnfiltered,
                   })),
                 };
               }),
@@ -7423,9 +7560,14 @@ describe("packages public queries", () => {
       isDone: true,
       continueCursor: "",
     });
-    expect(paginate).toHaveBeenNthCalledWith(1, { cursor: null, numItems: 1 });
-    expect(paginate).toHaveBeenNthCalledWith(2, { cursor: "1", numItems: 1 });
-    expect(releaseIndexNames).toEqual(["by_package_active_created", "by_package_active_created"]);
+    expect(paginatePublished).toHaveBeenCalledTimes(1);
+    expect(paginatePublished).toHaveBeenCalledWith({
+      cursor: null,
+      numItems: 1,
+      maximumRowsRead: 6,
+    });
+    expect(paginateUnfiltered).not.toHaveBeenCalled();
+    expect(releaseIndexNames).toEqual(["by_package_active_created"]);
   });
 
   it("soft-deletes packages and active releases for the owner", async () => {
@@ -12790,9 +12932,35 @@ describe("packages public queries", () => {
     );
   });
 
-  it("forwards only valid HTTPS plugin manifest icons to release insertion", async () => {
-    async function publishWithManifestIcon(icon: unknown) {
+  it("publishes model categories when omitted and preserves explicit manifest categories", async () => {
+    vi.stubEnv("OPENAI_API_KEY", "test-key");
+    const modelFetch = vi.fn(async () =>
+      Response.json({
+        output: [
+          {
+            type: "message",
+            content: [
+              {
+                type: "output_text",
+                text: JSON.stringify({
+                  categories: ["scheduling"],
+                  evidence: "Manages appointments and availability.",
+                }),
+              },
+            ],
+          },
+        ],
+      }),
+    );
+    vi.stubGlobal("fetch", modelFetch);
+    async function publishWithManifestIcon(
+      icon: unknown,
+      bundleManifest?: Record<string, unknown>,
+      declaredCategories?: string[],
+      portableIcon?: Uint8Array,
+    ) {
       const runMutation = vi.fn(async (_ref: unknown, args: Record<string, unknown>) => {
+        if ("sha256" in args && "contentType" in args) return args;
         if (args.minimumRole === "publisher") {
           return { publisherId: "publishers:owner", linkedUserId: "users:owner" };
         }
@@ -12816,7 +12984,21 @@ describe("packages public queries", () => {
             },
           }),
         ],
-        ["storage:manifest", JSON.stringify({ id: "demo.plugin", icon })],
+        [
+          "storage:manifest",
+          JSON.stringify({
+            id: "demo.plugin",
+            icon,
+            categories: declaredCategories,
+            description: "Manages appointments and availability.",
+            contracts: { tools: ["demoTool"] },
+          }),
+        ],
+        ...(bundleManifest
+          ? ([["storage:bundle-manifest", JSON.stringify(bundleManifest)]] as Array<
+              [string, string]
+            >)
+          : []),
         ["storage:code", "export default {};"],
       ]);
       const ctx = {
@@ -12840,12 +13022,22 @@ describe("packages public queries", () => {
             linkedUserId: "users:owner",
           }),
         runMutation,
-        runAction: makePublishRunActionMock(),
+        runAction: vi.fn(async function (
+          this: PublishScanStorage,
+          ref: FunctionReference<"action">,
+          args: unknown,
+        ) {
+          return getFunctionName(ref) === "skillPresentationImageNode:validateRasterInternal"
+            ? true
+            : makePublishRunActionMock().call(this, ref, args);
+        }),
         scheduler: {
           runAfter: vi.fn(),
         },
         storage: {
           get: vi.fn(async (storageId: string) => {
+            if (storageId === "storage:icon" && portableIcon)
+              return new Blob([new Uint8Array(portableIcon)]);
             const content = storedFiles.get(storageId);
             return content ? new Blob([content]) : null;
           }),
@@ -12858,7 +13050,7 @@ describe("packages public queries", () => {
         payload: {
           name: "demo-plugin",
           displayName: "Demo Plugin",
-          family: "code-plugin",
+          family: bundleManifest ? "bundle-plugin" : "code-plugin",
           version: "1.0.0",
           changelog: "init",
           source: {
@@ -12885,6 +13077,17 @@ describe("packages public queries", () => {
               sha256: "manifest",
               contentType: "application/json",
             },
+            ...(bundleManifest
+              ? [
+                  {
+                    path: ".codex-plugin/plugin.json",
+                    size: 1,
+                    storageId: "storage:bundle-manifest",
+                    sha256: "bundle-manifest",
+                    contentType: "application/json",
+                  },
+                ]
+              : []),
             {
               path: "dist/index.js",
               size: 1,
@@ -12892,6 +13095,17 @@ describe("packages public queries", () => {
               sha256: "code",
               contentType: "application/javascript",
             },
+            ...(portableIcon
+              ? [
+                  {
+                    path: "assets/icon.png",
+                    size: portableIcon.byteLength,
+                    storageId: "storage:icon",
+                    sha256: await sha256Hex(portableIcon),
+                    contentType: "application/octet-stream",
+                  },
+                ]
+              : []),
           ],
         },
       });
@@ -12906,11 +13120,67 @@ describe("packages public queries", () => {
       return insertCall?.[1] as Record<string, unknown>;
     }
 
+    const portableIcon = new Uint8Array(
+      Buffer.from(
+        "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII=",
+        "base64",
+      ),
+    );
+    const hostedIcon = `/api/v1/skill-icons/${await sha256Hex(portableIcon)}`;
+    await expect(
+      publishWithManifestIcon(
+        "https://ignored.example/icon.png",
+        undefined,
+        undefined,
+        portableIcon,
+      ),
+    ).resolves.toMatchObject({ icon: hostedIcon, pluginManifestSummary: { icon: hostedIcon } });
+
     await expect(
       publishWithManifestIcon("https://cdn.example.test/icons/demo.svg"),
-    ).resolves.toMatchObject({ icon: "https://cdn.example.test/icons/demo.svg" });
+    ).resolves.toMatchObject({
+      categories: ["scheduling"],
+      pluginManifestSummary: { categories: ["scheduling"] },
+      categoryClassification: {
+        source: "generated",
+        evidence: "Manages appointments and availability.",
+      },
+    });
+    await expect(
+      publishWithManifestIcon(undefined, {
+        channels: ["whatsapp"],
+        providers: ["openrouter"],
+        kind: "memory",
+      }),
+    ).resolves.toMatchObject({
+      categories: ["scheduling"],
+      pluginManifestSummary: { categories: ["scheduling"] },
+    });
+
+    modelFetch.mockClear();
+    await expect(
+      publishWithManifestIcon(undefined, undefined, ["productivity"]),
+    ).resolves.toMatchObject({
+      categories: ["productivity"],
+      categoryClassification: { source: "manifest" },
+    });
+    for (const bundle of [undefined, { name: "Appointments" }]) {
+      await expect(
+        publishWithManifestIcon(undefined, bundle, ["productivity", "scheduling"]),
+      ).rejects.toThrow("exactly one category");
+    }
+    expect(modelFetch).not.toHaveBeenCalled();
+
+    modelFetch.mockImplementation(async () =>
+      Response.json({ error: "unavailable" }, { status: 503 }),
+    );
+    await expect(publishWithManifestIcon(undefined)).resolves.toMatchObject({
+      categories: ["other"],
+      categoryClassification: { source: "fallback" },
+    });
 
     for (const icon of [
+      "https://cdn.example.test/icons/demo.svg",
       "http://cdn.example.test/icons/demo.svg",
       "/icons/demo.svg",
       "not a url",
@@ -12918,7 +13188,9 @@ describe("packages public queries", () => {
       123,
       { src: "https://cdn.example.test/icons/demo.svg" },
     ]) {
-      await expect(publishWithManifestIcon(icon)).resolves.not.toHaveProperty("icon");
+      const published = await publishWithManifestIcon(icon);
+      expect(published).not.toHaveProperty("icon");
+      expect(published.pluginManifestSummary).not.toHaveProperty("icon");
     }
   });
 
@@ -13063,7 +13335,10 @@ describe("packages public queries", () => {
     );
 
     expect(runMutation).toHaveBeenCalled();
-    expect(result.categories).toEqual(["other"]);
+    expect(result.categories).toEqual(["security"]);
+    expect(result.pluginManifestSummary).toEqual(
+      expect.objectContaining({ categories: ["security"] }),
+    );
     expect(result.topics).toBeUndefined();
     expect(result.sha256hash).toBe(expectedLegacyZipSha256);
     expect(result.verification).toEqual(expect.objectContaining({ scanStatus: "pending" }));

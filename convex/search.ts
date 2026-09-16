@@ -18,6 +18,7 @@ import {
   type CanonicalSkillSearchCandidate,
 } from "./lib/canonicalSkillSearch";
 import { CANONICAL_SKILL_SEARCH_BOUNDS } from "./lib/canonicalSkillSearchBounds";
+import { recordCatalogSearchFacts } from "./lib/catalogSearchObservations";
 import { generateEmbedding } from "./lib/embeddings";
 import { toDayKey } from "./lib/leaderboards";
 import { hasOfficialPublisherRow, toPublicPublisherWithOfficial } from "./lib/officialPublishers";
@@ -32,6 +33,7 @@ import {
   getOwnerPublisher,
   getPublisherByHandle,
 } from "./lib/publishers";
+import { searchInsightSource } from "./lib/searchInsights";
 import { isCuratedSearchResult } from "./lib/searchRanking";
 import {
   matchesAllTokens,
@@ -599,8 +601,25 @@ const nativeSkillSearch = {
 };
 
 export const searchNativeSkills: ReturnType<typeof action> = action({
-  args: nativeSkillSearchArgs,
-  handler: async (ctx, args) => nativeSkillSearch.handler(ctx, args),
+  args: { ...nativeSkillSearchArgs, searchSource: v.optional(searchInsightSource) },
+  handler: async (ctx, { searchSource, ...args }) => {
+    const results = await nativeSkillSearch.handler(ctx, args);
+    // This native read serves filtered homepage shelves, not merged catalog search.
+    // Convex actions have no Request abort signal; only completed responses are recorded.
+    if (args.highlightedOnly || args.officialOnly || args.createdAfter !== undefined)
+      await recordCatalogSearchFacts(ctx, {
+        source: searchSource,
+        artifactKind: "skill",
+        query: args.query,
+        category: args.categorySlug,
+        topic: args.topic,
+        filtered: true,
+        officialResults: results.map(
+          (entry) => entry.owner?.official === true || isSkillOfficial(entry.skill),
+        ),
+      });
+    return results;
+  },
 });
 
 type RollingSkillUsage = {

@@ -96,6 +96,49 @@ const hydrateResultsHandler = (
 )._handler;
 
 describe("search helpers", () => {
+  it.each([{ highlightedOnly: true }, { officialOnly: true }, { createdAfter: 0 }])(
+    "records completed native shelf results once with authoritative counts (%j)",
+    async (filter) => {
+      const rows = [false, true, true].map((official, index) => ({
+        skill: makePublicSkill({
+          id: `skills:${index}`,
+          slug: "local-proof",
+          displayName: `Skill ${index}`,
+          official,
+          featured: true,
+        }),
+        version: null,
+        ownerHandle: "author",
+        owner: { official: index === 0 },
+      }));
+      const runMutation = vi.fn().mockResolvedValue(null);
+      const ctx = { runQuery: vi.fn().mockResolvedValue(rows), runMutation };
+      const args = { query: "local-proof", mode: "exact", limit: 2, ...filter };
+      const before = await searchSkillsHandler(ctx, args);
+      expect(runMutation).not.toHaveBeenCalled();
+      const after = await searchSkillsHandler(ctx, { ...args, searchSource: "clawhub-web" });
+      expect(after).toEqual(before);
+      expect(runMutation).toHaveBeenCalledOnce();
+      expect(runMutation.mock.calls[0][1]).toEqual({
+        source: "clawhub-web",
+        artifactKind: "skill",
+        scope: "shelf",
+        normalizedQuery: "local-proof",
+        category: undefined,
+        topic: undefined,
+        resultCount: 2,
+        officialResultCount: 2,
+      });
+      runMutation.mockClear();
+      await searchSkillsHandler(ctx, {
+        query: "local-proof",
+        mode: "exact",
+        searchSource: "clawhub-web",
+      });
+      expect(runMutation).not.toHaveBeenCalled();
+    },
+  );
+
   it("returns fallback results when vector candidates are empty", async () => {
     generateEmbeddingMock.mockResolvedValueOnce([0, 1, 2]);
     const fallback = [

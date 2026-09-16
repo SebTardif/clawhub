@@ -63,6 +63,7 @@ const claimCodexScanJobLeasesHandler = (
       limit?: number;
       leaseMs?: number;
       targetedJobIds?: string[];
+      assignedJobIds?: string[];
     },
     Array<ScanJob & { leaseToken: string; workerId: string }>
   >
@@ -85,6 +86,7 @@ const claimQueuedJobsInternalHandler = (
       limit: number;
       leaseMs?: number;
       targetedJobIds?: string[];
+      assignedJobIds?: string[];
     },
     Array<ScanJob & { leaseToken: string; workerId: string }>
   >
@@ -316,6 +318,7 @@ const completeCodexScanJobHandler = (
         }>;
         checkedAt: number;
       };
+      scannerReportsStorageId?: string;
       runId?: string;
     },
     { ok: true }
@@ -2808,6 +2811,7 @@ describe("securityScan", () => {
       terminal: 3,
       done: false,
       failedJobIds: ["securityScanJobs:failed"],
+      queuedJobIds: ["securityScanJobs:queued"],
     });
   });
 
@@ -3283,7 +3287,11 @@ describe("securityScan", () => {
     );
 
     const result = await claimCodexScanJobsHandler(
-      { runMutation, runQuery, storage: { getUrl } },
+      {
+        runMutation,
+        runQuery,
+        storage: { getUrl, generateUploadUrl: async () => "https://storage.example/report-upload" },
+      },
       { token: "worker-secret", workerId: "worker-1", limit: 10 },
     );
 
@@ -3342,10 +3350,18 @@ describe("securityScan", () => {
     const getUrl = vi.fn(async (storageId: string) => `https://storage.example/${storageId}`);
 
     const result = (await claimCodexScanJobsHandler(
-      { runMutation, runQuery, storage: { getUrl } },
+      {
+        runMutation,
+        runQuery,
+        storage: { getUrl, generateUploadUrl: async () => "https://storage.example/report-upload" },
+      },
       { token: "worker-secret", workerId: "worker-1", limit: 10 },
     )) as Array<{ target: { files: Array<{ path: string }> } }>;
 
+    expect(result[0]).toHaveProperty(
+      "scannerReportsUploadUrl",
+      "https://storage.example/report-upload",
+    );
     expect(result[0]?.target.files.map((file) => file.path)).toEqual(["SKILL.md"]);
     expect(getUrl).toHaveBeenCalledWith("storage:skill");
     expect(getUrl).not.toHaveBeenCalledWith("storage:card");
@@ -3393,7 +3409,11 @@ describe("securityScan", () => {
     const getUrl = vi.fn(async (storageId: string) => `https://storage.example/${storageId}`);
 
     const result = (await claimCodexScanJobsHandler(
-      { runMutation, runQuery, storage: { getUrl } },
+      {
+        runMutation,
+        runQuery,
+        storage: { getUrl, generateUploadUrl: async () => "https://storage.example/report-upload" },
+      },
       { token: "worker-secret", workerId: "worker-1", limit: 10 },
     )) as Array<{ target: { files: Array<{ path: string }> } }>;
 
@@ -3434,10 +3454,15 @@ describe("securityScan", () => {
     const getUrl = vi.fn(async (storageId: string) => `https://storage.example/${storageId}`);
 
     const result = (await claimCodexScanJobsHandler(
-      { runMutation, runQuery, storage: { getUrl } },
+      {
+        runMutation,
+        runQuery,
+        storage: { getUrl, generateUploadUrl: async () => "https://storage.example/report-upload" },
+      },
       { token: "worker-secret", workerId: "worker-1", limit: 10 },
     )) as Array<{ target: { files: Array<{ path: string }> } }>;
 
+    expect(result[0]).toHaveProperty("scannerReportsUploadUrl", null);
     expect(result[0]?.target.files.map((file) => file.path)).toEqual(["SKILL.md"]);
     expect(getUrl).toHaveBeenCalledWith("storage:skill");
   });
@@ -3454,7 +3479,11 @@ describe("securityScan", () => {
     const getUrl = vi.fn();
 
     const result = await claimCodexScanJobLeasesHandler(
-      { runMutation, runQuery, storage: { getUrl } },
+      {
+        runMutation,
+        runQuery,
+        storage: { getUrl, generateUploadUrl: async () => "https://storage.example/report-upload" },
+      },
       {
         token: "worker-secret",
         workerId: "worker-1",
@@ -3518,7 +3547,14 @@ describe("securityScan", () => {
 
     await expect(
       hydrateCodexScanJobHandler(
-        { runMutation: vi.fn(), runQuery, storage: { getUrl } },
+        {
+          runMutation: vi.fn(),
+          runQuery,
+          storage: {
+            getUrl,
+            generateUploadUrl: async () => "https://storage.example/report-upload",
+          },
+        },
         {
           token: "worker-secret",
           workerId: "worker-1",
@@ -3968,7 +4004,11 @@ describe("securityScan", () => {
     const getUrl = vi.fn(async () => null);
 
     const result = await claimCodexScanJobsHandler(
-      { runMutation, runQuery, storage: { getUrl } },
+      {
+        runMutation,
+        runQuery,
+        storage: { getUrl, generateUploadUrl: async () => "https://storage.example/report-upload" },
+      },
       { token: "worker-secret", workerId: "worker-1", limit: 10 },
     );
 
@@ -4112,6 +4152,87 @@ describe("securityScan", () => {
     ).rejects.toThrow("Exact GitHub Skill Sync job claims are Test-only");
   });
 
+  it("claims only locally assigned bulk skill jobs without reading the shared queue", async () => {
+    const jobs = [
+      makeScanJob({ _id: "securityScanJobs:assigned", source: "bulk-rescan", nextRunAt: 1 }),
+      makeScanJob({ _id: "securityScanJobs:unassigned", source: "bulk-rescan", nextRunAt: 1 }),
+      makeScanJob({ _id: "securityScanJobs:priority", source: "publish", nextRunAt: 1 }),
+    ];
+    const { ctx } = makeClaimCtx(jobs);
+    const claimed = await claimQueuedJobsInternalHandler(ctx, {
+      workerId: "local-assignment",
+      lane: "shared",
+      limit: 32,
+      assignedJobIds: ["securityScanJobs:assigned", "securityScanJobs:priority"],
+    });
+    expect(claimed.map((job) => job._id)).toEqual(["securityScanJobs:assigned"]);
+    expect(ctx.db.query).not.toHaveBeenCalled();
+  });
+
+  it("keeps stale, failed, deferred, package and gated assignments out of claims", async () => {
+    const jobs = [
+      makeScanJob({ _id: "securityScanJobs:running", source: "bulk-rescan", status: "running" }),
+      makeScanJob({ _id: "securityScanJobs:failed", source: "bulk-rescan", status: "failed" }),
+      makeScanJob({
+        _id: "securityScanJobs:future",
+        source: "bulk-rescan",
+        nextRunAt: Date.now() + 60000,
+      }),
+      makeScanJob({
+        _id: "securityScanJobs:package",
+        source: "bulk-rescan",
+        targetKind: "packageRelease",
+      }),
+      makeScanJob({
+        _id: "securityScanJobs:gated",
+        source: "bulk-rescan",
+        rolloutGate: "github-skill-sync",
+      }),
+    ];
+    const { ctx, patches } = makeClaimCtx(jobs);
+    for (const assignedJobIds of [[], jobs.map((job) => job._id)]) {
+      expect(
+        await claimQueuedJobsInternalHandler(ctx, {
+          workerId: "assigned",
+          lane: "shared",
+          limit: 32,
+          assignedJobIds,
+        }),
+      ).toEqual([]);
+    }
+    expect(patches).toEqual([]);
+    expect(ctx.db.query).not.toHaveBeenCalled();
+  });
+
+  it("bounds assignment reads and rejects assignments in the reserved lane or mixed Test mode", async () => {
+    const { ctx } = makeClaimCtx([]);
+    await expect(
+      claimQueuedJobsInternalHandler(ctx, {
+        workerId: "assigned",
+        lane: "priority",
+        limit: 32,
+        assignedJobIds: [],
+      }),
+    ).rejects.toThrow("shared lane");
+    await expect(
+      claimQueuedJobsInternalHandler(ctx, {
+        workerId: "assigned",
+        lane: "shared",
+        limit: 32,
+        assignedJobIds: [],
+        targetedJobIds: [],
+      }),
+    ).rejects.toThrow("no Test targets");
+    await expect(
+      claimQueuedJobsInternalHandler(ctx, {
+        workerId: "assigned",
+        lane: "shared",
+        limit: 32,
+        assignedJobIds: Array.from({ length: 513 }, () => "securityScanJobs:assigned"),
+      }),
+    ).rejects.toThrow("maximum 512");
+  });
+
   it("claims bulk rescans after every supported source", async () => {
     const { ctx } = makeClaimCtx([
       makeScanJob({
@@ -4223,6 +4344,33 @@ describe("securityScan", () => {
     expect(claimed.map((job) => job._id)).toEqual(["securityScanJobs:publish"]);
   });
 
+  it.each([1, 4, 16])(
+    "reads only the needed native queue rows for a %i-job claim with GitHub rollout off",
+    async (limit) => {
+      vi.stubEnv("CLAWHUB_GITHUB_SKILL_SYNC_ROLLOUT_MODE", "off");
+      const jobs = Array.from({ length: 512 }, (_, index) =>
+        makeScanJob({
+          _id: `securityScanJobs:bulk-${index}`,
+          source: "bulk-rescan",
+          createdAt: index + 1,
+          nextRunAt: index + 1,
+        }),
+      );
+      const { ctx } = makeClaimCtx(jobs);
+
+      const claimed = await claimQueuedJobsInternalHandler(ctx, {
+        workerId: "shared-worker",
+        lane: "shared",
+        limit,
+        leaseMs: 60_000,
+      });
+
+      expect(claimed.map((job) => job._id)).toEqual(jobs.slice(0, limit).map((job) => job._id));
+      // Native claims must not lengthen the transaction with nested source queries.
+      expect(ctx.runQuery).not.toHaveBeenCalled();
+    },
+  );
+
   it("skips queued generic GitHub scans while still claiming NVIDIA scans when rollout is off", async () => {
     vi.stubEnv("CLAWHUB_GITHUB_SKILL_SYNC_ROLLOUT_MODE", "off");
     const genericJobs = Array.from({ length: 513 }, (_, index) =>
@@ -4290,6 +4438,11 @@ describe("securityScan", () => {
       "securityScanJobs:nvidia",
       "skillScanRequests:nvidia",
     ]);
+    // Sparse legacy jobs must not turn a one-job claim into hundreds of queries.
+    const publishPages = ctx.runQuery.mock.calls.filter(
+      ([, args]) => (args as { source: string }).source === "publish",
+    );
+    expect(publishPages.length).toBeLessThanOrEqual(3);
   });
 
   it("lets the catalog lane claim only the lowest-priority catalog source", async () => {
@@ -5293,6 +5446,34 @@ describe("securityScan", () => {
       expect(runMutation).not.toHaveBeenCalled();
     },
   );
+
+  it("deletes a newly stored report when committing the scan verdict fails", async () => {
+    vi.stubEnv("SECURITY_SCAN_WORKER_TOKEN", "worker-secret");
+    const runQuery = vi.fn(async () => ({
+      job: { _id: "securityScanJobs:1", targetKind: "skillVersion", leaseToken: "lease-token" },
+      version: { _id: "skillVersions:1" },
+    }));
+    const runMutation = vi.fn(async (_ref: unknown, args: Record<string, unknown>) => {
+      if ("llmAnalysis" in args) throw new Error("commit failed");
+      return { ok: true };
+    });
+    const storage = { store: vi.fn(async () => "storage:new-report"), delete: vi.fn() };
+    await expect(
+      completeCodexScanJobHandler(
+        { runQuery, runMutation, storage },
+        {
+          token: "worker-secret",
+          jobId: "securityScanJobs:1",
+          leaseToken: "lease-token",
+          llmAnalysis: { status: "clean", checkedAt: 123 },
+          aigAnalysis: cleanAigAnalysis,
+          scannerReportsStorageId: "storage:new-report",
+        },
+      ),
+    ).rejects.toThrow("commit failed");
+    expect(storage.store).not.toHaveBeenCalled();
+    expect(storage.delete).toHaveBeenCalledWith("storage:new-report");
+  });
 
   it("caps SkillSpector findings before storing completed scan results", async () => {
     vi.stubEnv("SECURITY_SCAN_WORKER_TOKEN", "worker-secret");

@@ -16,6 +16,12 @@ import {
 } from "./publicRouteReservations";
 import { getFrontmatterValue, parseFrontmatter, sanitizePath } from "./skills";
 
+export const REAL_BUNDLE_MANIFESTS = [
+  { path: ".codex-plugin/plugin.json", format: "codex" },
+  { path: ".claude-plugin/plugin.json", format: "claude" },
+  { path: ".cursor-plugin/plugin.json", format: "cursor" },
+] as const;
+
 const PACKAGE_NAME_PATTERN = /^(?:@[a-z0-9][a-z0-9._-]*\/)?[a-z0-9][a-z0-9._-]*$/;
 
 type PublishFile = {
@@ -98,7 +104,10 @@ function normalizeSkillRootPath(value: unknown) {
           optionalString(value.rootPath))
         : undefined;
   if (!raw) return null;
-  return sanitizePath(raw)?.replace(/^\.\//, "").replace(/\/+$/, "") ?? null;
+  const normalized = sanitizePath(raw)
+    ?.replace(/^(?:\.\/)+/, "")
+    .replace(/\/+$/, "");
+  return normalized === "" ? "." : (normalized ?? null);
 }
 
 function normalizeSkillRootPaths(input: unknown) {
@@ -107,28 +116,34 @@ function normalizeSkillRootPaths(input: unknown) {
 }
 
 function findSkillMarkdownFile(files: PluginManifestSummaryFile[], rootPath: string) {
-  const expected = `${rootPath}/SKILL.md`;
+  const expected = rootPath === "." ? "SKILL.md" : `${rootPath}/SKILL.md`;
   const expectedLower = expected.toLowerCase();
   return (
-    files.find((file) => file.path === expected) ??
-    files.find((file) => file.path.toLowerCase() === expectedLower) ??
+    files.find((file) => file.path.replace(/^(?:\.\/)+/, "") === expected) ??
+    files.find((file) => file.path.replace(/^(?:\.\/)+/, "").toLowerCase() === expectedLower) ??
     null
   );
 }
 
 function skillRootPathFromMarkdownFile(filePath: string) {
-  return filePath.split("/").slice(0, -1).join("/");
+  return (
+    filePath
+      .replace(/^(?:\.\/)+/, "")
+      .split("/")
+      .slice(0, -1)
+      .join("/") || "."
+  );
 }
 
 function findSkillMarkdownFiles(files: PluginManifestSummaryFile[], rootPath: string) {
   const exact = findSkillMarkdownFile(files, rootPath);
   if (exact) return [{ rootPath, file: exact }];
 
-  const directoryPrefix = `${rootPath.toLowerCase()}/`;
+  const directoryPrefix = rootPath === "." ? "" : `${rootPath.toLowerCase()}/`;
   const seen = new Set<string>();
   return files
     .filter((file) => {
-      const lowerPath = file.path.toLowerCase();
+      const lowerPath = file.path.replace(/^(?:\.\/)+/, "").toLowerCase();
       return lowerPath.startsWith(directoryPrefix) && lowerPath.endsWith("/skill.md");
     })
     .map((file) => ({
@@ -279,8 +294,8 @@ export function derivePluginManifestSummary(params: {
   skillManifest?: JsonRecord;
   files: PluginManifestSummaryFile[];
   compatibility?: PackageCompatibility;
+  categories?: readonly string[];
 }) {
-  const icon = normalizePluginManifestIcon(params.pluginManifest);
   const compatibility = extractCompatibilityFromManifest(
     params.pluginManifest,
     params.compatibility,
@@ -299,6 +314,7 @@ export function derivePluginManifestSummary(params: {
         name: metadata.name ?? pathDerivedName(rootPath),
         ...(metadata.description ? { description: metadata.description } : {}),
         rootPath,
+        // Preserve the signed inventory path for exact file reads.
         skillMdPath: file.path,
         sha256: file.sha256,
         size: file.size,
@@ -313,7 +329,7 @@ export function derivePluginManifestSummary(params: {
 
   return {
     schemaVersion: 1 as const,
-    ...(icon ? { icon } : {}),
+    ...(params.categories ? { categories: [...params.categories] } : {}),
     ...(compatibility ? { compatibility } : {}),
     ...(manifestIdentity ? { manifestIdentity } : {}),
     configFields: extractConfigFields(params.pluginManifest),
@@ -567,18 +583,6 @@ export function maybeParseJson(text: string | null | undefined) {
   const trimmed = text.trim();
   if (!trimmed) return undefined;
   return parseJsonFile(trimmed, "JSON file");
-}
-
-export function normalizePluginManifestIcon(manifest: unknown): string | undefined {
-  if (!isRecord(manifest) || typeof manifest.icon !== "string") return undefined;
-  const icon = manifest.icon.trim();
-  if (!icon) return undefined;
-  try {
-    const url = new URL(icon);
-    return url.protocol === "https:" ? icon : undefined;
-  } catch {
-    return undefined;
-  }
 }
 
 export function toConvexSafeJsonValue(
