@@ -2679,8 +2679,9 @@ export async function publishSkillV1Handler(ctx: ActionCtx, request: Request) {
         if (!hasAcceptedLegacyLicenseTerms(payload.acceptLicenseTerms)) {
           return text("MIT-0 license terms must be accepted to publish skills", 400, rate.headers);
         }
-        const result = await publishSkillPayloadForApiUser(ctx, auth.userId, payload);
-        keepStoredFiles = true;
+        const result = await publishSkillPayloadForApiUser(ctx, auth.userId, payload, () => {
+          keepStoredFiles = true;
+        });
         return json({ ok: true, ...result }, 200, rate.headers);
       } finally {
         if (!keepStoredFiles) {
@@ -2700,6 +2701,7 @@ async function publishSkillPayloadForApiUser(
   ctx: ActionCtx,
   userId: Id<"users">,
   payload: ReturnType<typeof parsePublishBody>,
+  onFilesPersisted?: () => void,
 ) {
   const { ownerHandle, sourceOwnerHandle, migrateOwner, ...publishPayload } = payload;
   const uploadTickets = publishPayload.files.flatMap((file) =>
@@ -2734,6 +2736,7 @@ async function publishSkillPayloadForApiUser(
       ...(source ? { sourceOwnerPublisherId: source.publisherId } : {}),
       ...(shouldMigrateOwner ? { migrateOwner: true } : {}),
       ...(uploadTickets.length > 0 ? { skillPublishUploadTickets: uploadTickets } : {}),
+      ...(onFilesPersisted ? { onFilesPersisted } : {}),
     },
   );
 }
