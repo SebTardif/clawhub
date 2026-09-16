@@ -9080,6 +9080,30 @@ describe("packages public queries", () => {
     expect(ctx.scheduler.runAfter).not.toHaveBeenCalled();
   });
 
+  it("keeps the strict finalization result free of release ownership metadata", async () => {
+    const result = { ok: true, packageId: "packages:demo", releaseId: "packageReleases:existing" };
+    const runMutation = vi.fn(async (ref: unknown, args: unknown) => {
+      const name = getFunctionName(ref as FunctionReference<"mutation">);
+      if (name.endsWith("claimPackagePublishAttemptForFinalizationInternal"))
+        return {
+          status: "claimed",
+          attemptId: "publishAttempts:legacy",
+          packageInsertArgs: {},
+          packageFollowup: {},
+        };
+      if (name.endsWith("insertReleaseInternal")) return { ...result, reusedExistingRelease: true };
+      if (name.endsWith("recordPackagePublishAttemptFinalizedInternal"))
+        expect((args as { result: unknown }).result).toEqual(result);
+      return null;
+    });
+    await expect(
+      finalizePackagePublishAttemptInternalHandler(
+        { runMutation, scheduler: { runAfter: vi.fn() } } as never,
+        { attemptId: "publishAttempts:legacy" },
+      ),
+    ).resolves.toEqual(result);
+  });
+
   it("releases release-backed finalization claims when pending promotion fails", async () => {
     const promotionError = new Error("promotion failed");
     const runMutation = vi.fn(async (_ref: unknown, args: unknown) => {
@@ -10829,6 +10853,41 @@ describe("packages public queries", () => {
     expect(ctx.insert).not.toHaveBeenCalled();
     expect(ctx.patch).not.toHaveBeenCalled();
   });
+
+  it.each(["published", "pending"] as const)(
+    "rejects a pending insertion racing an existing %s release",
+    async (publicationStatus) => {
+      const ctx = makeInsertReleaseCtx(makePackageDoc(), [
+        makeReleaseDoc({
+          _id: "packageReleases:existing",
+          version: "1.0.0",
+          integritySha256: "abc123",
+          publicationStatus,
+          clawpackStorageId: "storage:existing-zip",
+        }),
+      ]);
+      await expect(
+        insertReleaseInternalHandler(ctx, {
+          actorUserId: "users:owner",
+          ownerUserId: "users:owner",
+          name: "demo-plugin",
+          displayName: "Demo Plugin",
+          family: "code-plugin",
+          version: "1.0.0",
+          changelog: "retry",
+          tags: ["latest"],
+          summary: "demo",
+          files: [],
+          integritySha256: "abc123",
+          allowExistingRelease: true,
+          publicationStatus: "pending",
+          clawpackStorageId: "storage:new-zip",
+        }),
+      ).rejects.toThrow("already exists");
+      expect(ctx.insert).not.toHaveBeenCalled();
+      expect(ctx.patch).not.toHaveBeenCalled();
+    },
+  );
 
   it("rejects a Claw version retry when the exact artifact digest differs", async () => {
     const ctx = makeInsertReleaseCtx(makePackageDoc({ family: "claw" }), [
@@ -12787,77 +12846,90 @@ describe("packages public queries", () => {
     expect(storedIds.filter((storageId) => !deletedIds.includes(storageId))).toEqual([]);
   });
 
-  it("deletes a newly stored legacy zip when release insert fails", async () => {
-    const storedIds: string[] = [];
-    const deletedIds: string[] = [];
-    const runMutation = vi.fn(async (_ref: unknown, args: unknown) => {
-      if (
-        typeof args === "object" &&
-        args !== null &&
-        "name" in args &&
-        "version" in args &&
-        "files" in args
-      ) {
-        throw new Error(
-          "Version 1.0.0 already exists. Increment the version number and try again.",
-        );
-      }
-      return null;
-    });
-    const trustedPublisher = {
-      _id: "packageTrustedPublishers:1",
-      packageId: "packages:demo",
-      provider: "github-actions",
-      repository: "example/example",
-      repositoryId: "1",
-      repositoryOwner: "example",
-      repositoryOwnerId: "2",
-      workflowFilename: "plugin-clawhub-release.yml",
-      environment: "clawhub-release",
-    };
-    const ctx = {
-      runQuery: vi
-        .fn()
-        .mockResolvedValueOnce({
-          _id: "packagePublishTokens:1",
-          packageId: "packages:demo",
-          provider: "github-actions",
-          repository: "example/example",
-          repositoryId: "1",
-          repositoryOwner: "example",
-          repositoryOwnerId: "2",
-          workflowFilename: "plugin-clawhub-release.yml",
-          environment: "clawhub-release",
-          version: "1.0.0",
-          sha: "abc123",
-          ref: "refs/heads/main",
-          runId: "100",
-          runAttempt: "1",
-          expiresAt: Date.now() + 60_000,
-        })
-        .mockResolvedValueOnce(trustedPublisher)
-        .mockResolvedValueOnce(makePackageDoc({ family: "bundle-plugin" }))
-        .mockResolvedValueOnce(trustedPublisher)
-        .mockResolvedValueOnce(null),
-      runMutation,
-      runAction: makePublishRunActionMock(),
-      scheduler: {
-        runAfter: vi.fn(),
-      },
-      storage: {
-        ...makePackageManifestStorage(),
-        store: vi.fn(async () => {
-          storedIds.push("storage:legacy-zip");
-          return "storage:legacy-zip";
-        }),
-        delete: vi.fn(async (storageId: string) => {
-          deletedIds.push(storageId);
-        }),
-      },
-    };
+  it.each(["rejected", "reused", "created", "followup-failure"] as const)(
+    "keeps legacy ZIP ownership after %s insertion",
+    async (outcome) => {
+      const storedIds: string[] = [];
+      const deletedIds: string[] = [];
+      const runMutation = vi.fn(async (_ref: unknown, args: unknown) => {
+        if (
+          typeof args === "object" &&
+          args !== null &&
+          "name" in args &&
+          "version" in args &&
+          "files" in args
+        ) {
+          if (outcome === "rejected") throw new Error("release insert rejected");
+          return {
+            ok: true,
+            packageId: "packages:demo",
+            releaseId: "packageReleases:result",
+            ...(outcome === "reused" ? { reusedExistingRelease: true } : {}),
+          };
+        }
+        if (
+          outcome === "followup-failure" &&
+          typeof args === "object" &&
+          args !== null &&
+          "source" in args &&
+          args.source === "publish"
+        )
+          throw new Error("post-insert followup failed");
+        return null;
+      });
+      const trustedPublisher = {
+        _id: "packageTrustedPublishers:1",
+        packageId: "packages:demo",
+        provider: "github-actions",
+        repository: "example/example",
+        repositoryId: "1",
+        repositoryOwner: "example",
+        repositoryOwnerId: "2",
+        workflowFilename: "plugin-clawhub-release.yml",
+        environment: "clawhub-release",
+      };
+      const ctx = {
+        runQuery: vi
+          .fn()
+          .mockResolvedValueOnce({
+            _id: "packagePublishTokens:1",
+            packageId: "packages:demo",
+            provider: "github-actions",
+            repository: "example/example",
+            repositoryId: "1",
+            repositoryOwner: "example",
+            repositoryOwnerId: "2",
+            workflowFilename: "plugin-clawhub-release.yml",
+            environment: "clawhub-release",
+            version: "1.0.0",
+            sha: "abc123",
+            ref: "refs/heads/main",
+            runId: "100",
+            runAttempt: "1",
+            expiresAt: Date.now() + 60_000,
+          })
+          .mockResolvedValueOnce(trustedPublisher)
+          .mockResolvedValueOnce(makePackageDoc({ family: "bundle-plugin" }))
+          .mockResolvedValueOnce(trustedPublisher)
+          .mockResolvedValueOnce(null),
+        runMutation,
+        runAction: makePublishRunActionMock(),
+        scheduler: {
+          runAfter: vi.fn(),
+        },
+        storage: {
+          ...makePackageManifestStorage(),
+          store: vi.fn(async () => {
+            storedIds.push("storage:legacy-zip");
+            return "storage:legacy-zip";
+          }),
+          delete: vi.fn(async (storageId: string) => {
+            deletedIds.push(storageId);
+          }),
+        },
+      };
 
-    await expect(
-      publishPackageForTrustedPublisherInternalHandler(ctx as never, {
+      const publication = publishPackageForTrustedPublisherInternalHandler(ctx as never, {
         publishTokenId: "packagePublishTokens:1",
         payload: {
           name: "demo-plugin",
@@ -12867,12 +12939,26 @@ describe("packages public queries", () => {
           bundle: { hostTargets: ["desktop"] },
           files: [packageManifestFile],
         },
-      }),
-    ).rejects.toThrow("Version 1.0.0 already exists. Increment the version number and try again.");
+      });
+      if (outcome === "rejected" || outcome === "followup-failure") {
+        await expect(publication).rejects.toThrow(
+          outcome === "rejected" ? "release insert rejected" : "post-insert followup failed",
+        );
+      } else {
+        await expect(publication).resolves.toEqual({
+          ok: true,
+          packageId: "packages:demo",
+          releaseId: "packageReleases:result",
+          publicationStatus: "published",
+        });
+      }
 
-    expect(storedIds).toEqual(["storage:legacy-zip"]);
-    expect(deletedIds).toEqual(["storage:legacy-zip"]);
-  });
+      expect(storedIds).toEqual(["storage:legacy-zip"]);
+      expect(deletedIds).toEqual(
+        outcome === "rejected" || outcome === "reused" ? ["storage:legacy-zip"] : [],
+      );
+    },
+  );
 
   it("accepts trusted publish tokens when no environment is pinned", async () => {
     const runMutation = vi.fn(async (_ref: unknown, args: unknown) => {

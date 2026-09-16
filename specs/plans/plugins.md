@@ -61,6 +61,17 @@ Additional product decision:
 
 ## Constraints
 
+### Publication archive ownership
+
+Package publication allocates a generated legacy ZIP only when it reaches release
+insertion. The action deletes that ZIP if insertion rejects or an idempotent
+trusted retry reuses an existing release without adopting it. Cleanup never
+includes caller-uploaded artifacts, original file blobs, or an archive already
+attached to a successful release; a later scan/follow-up failure does not undo
+that ownership. Staged retries resolve existing attempts before insertion. A
+concurrent pending insertion that finds an existing version rejects instead of
+creating an attempt that points at a discarded candidate ZIP.
+
 ### Portable plugin icons
 
 Plugin publication resolves only the fixed `assets/icon.png` path used by OpenClaw.
