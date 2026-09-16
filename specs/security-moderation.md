@@ -578,6 +578,7 @@ See also: [acceptable-usage.md](./acceptable-usage.md) for the marketplace polic
   scanner evidence grouped under `security.signals`. Clients should key install
   decisions off `ok`, `decision`, `reasons`, and `security.status` instead of
   re-deriving trust from individual signal payloads.
+- Skill Card completion owns a newly stored card until its attachment mutation succeeds. If attachment rejects a stale lease or unavailable version, delete only that new blob and preserve the original error if cleanup fails. Successful replacement retains prior card blobs and generated bundle fingerprints so existing installs remain resolvable.
 - Exact-version security verdict reads preserve the complete skill identity.
   Batch callers may qualify a request with the publisher handle; owner, slug,
   and version form the dedupe identity, and qualified success or failure results
