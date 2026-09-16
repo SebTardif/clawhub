@@ -16790,6 +16790,67 @@ describe("httpApiV1 handlers", () => {
     expect(await downloadResponse.text()).toBe("Version not found");
   });
 
+  it("blocks file and download access to unpublished package releases", async () => {
+    const runMutation = vi.fn().mockResolvedValue(okRate());
+    const runQuery = vi.fn(async (_query: unknown, args: Record<string, unknown>) => {
+      if ("name" in args) {
+        return {
+          package: {
+            _id: "packages:1",
+            name: "demo-plugin",
+            displayName: "Demo Plugin",
+            family: "code-plugin",
+            tags: { latest: "packageReleases:published" },
+            latestReleaseId: "packageReleases:published",
+            channel: "community",
+            isOfficial: false,
+            createdAt: 1,
+            updatedAt: 1,
+          },
+          latestRelease: null,
+          owner: null,
+        };
+      }
+      if ("version" in args) {
+        return {
+          _id: "packageReleases:pending",
+          version: "2.0.0",
+          createdAt: 2,
+          changelog: "pending",
+          publicationStatus: "pending",
+          files: [
+            {
+              path: "README.md",
+              size: 2,
+              sha256: "a".repeat(64),
+              storageId: "storage:pending",
+              contentType: "text/markdown",
+            },
+          ],
+        };
+      }
+      return null;
+    });
+    const storage = { get: vi.fn() };
+
+    const fileResponse = await __handlers.packagesGetRouterV1Handler(
+      makeCtx({ runQuery, runMutation, storage }),
+      new Request(
+        "https://example.com/api/v1/packages/demo-plugin/file?version=2.0.0&path=README.md",
+      ),
+    );
+    const downloadResponse = await __handlers.packagesGetRouterV1Handler(
+      makeCtx({ runQuery, runMutation, storage }),
+      new Request("https://example.com/api/v1/packages/demo-plugin/download?version=2.0.0"),
+    );
+
+    expect(fileResponse.status).toBe(404);
+    expect(await fileResponse.text()).toBe("Version not found");
+    expect(downloadResponse.status).toBe(404);
+    expect(await downloadResponse.text()).toBe("Version not found");
+    expect(storage.get).not.toHaveBeenCalled();
+  });
+
   it("package publish uses write rate limiting", async () => {
     vi.mocked(getOptionalApiTokenUser).mockResolvedValue({
       userId: "users:1",

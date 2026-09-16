@@ -578,6 +578,8 @@ type ReleaseLike = {
   npmUnpackedSize?: number;
   npmFileCount?: number;
   softDeletedAt?: number;
+  ownerDeletedAt?: number;
+  publicationStatus?: "pending" | "published" | "blocked";
 };
 
 type PluginExportFamily = (typeof PLUGIN_EXPORT_FAMILY_VALUES)[number];
@@ -627,6 +629,10 @@ type RepairOwnerPublisherLike = Pick<Doc<"publishers">, "_id" | "handle" | "dele
 
 function toVisibleRelease(release: ReleaseLike | null) {
   if (!release || ("softDeletedAt" in release && release.softDeletedAt !== undefined)) return null;
+  if (release.ownerDeletedAt !== undefined) return null;
+  if (release.publicationStatus !== undefined && release.publicationStatus !== "published") {
+    return null;
+  }
   return release;
 }
 
