@@ -85,6 +85,7 @@ import {
   MAX_RAW_FILE_BYTES,
   type AmbiguousSkillSlugChoice,
   ambiguousSkillSlugResponse,
+  deleteStoredMultipartFiles,
   formatAuthzMessage,
   formatUserFacingErrorMessage,
   getPathSegments,
@@ -2673,11 +2674,20 @@ export async function publishSkillV1Handler(ctx: ActionCtx, request: Request) {
 
     if (contentType.includes("multipart/form-data")) {
       const payload = await parseMultipartPublish(ctx, request);
-      if (!hasAcceptedLegacyLicenseTerms(payload.acceptLicenseTerms)) {
-        return text("MIT-0 license terms must be accepted to publish skills", 400, rate.headers);
+      let keepStoredFiles = false;
+      try {
+        if (!hasAcceptedLegacyLicenseTerms(payload.acceptLicenseTerms)) {
+          return text("MIT-0 license terms must be accepted to publish skills", 400, rate.headers);
+        }
+        const result = await publishSkillPayloadForApiUser(ctx, auth.userId, payload, () => {
+          keepStoredFiles = true;
+        });
+        return json({ ok: true, ...result }, 200, rate.headers);
+      } finally {
+        if (!keepStoredFiles) {
+          await deleteStoredMultipartFiles(ctx, payload.files);
+        }
       }
-      const result = await publishSkillPayloadForApiUser(ctx, auth.userId, payload);
-      return json({ ok: true, ...result }, 200, rate.headers);
     }
   } catch (error) {
     const message = error instanceof Error ? error.message : "Publish failed";
@@ -2691,6 +2701,7 @@ async function publishSkillPayloadForApiUser(
   ctx: ActionCtx,
   userId: Id<"users">,
   payload: ReturnType<typeof parsePublishBody>,
+  onFilesPersisted?: () => void,
 ) {
   const { ownerHandle, sourceOwnerHandle, migrateOwner, ...publishPayload } = payload;
   const uploadTickets = publishPayload.files.flatMap((file) =>
@@ -2725,6 +2736,7 @@ async function publishSkillPayloadForApiUser(
       ...(source ? { sourceOwnerPublisherId: source.publisherId } : {}),
       ...(shouldMigrateOwner ? { migrateOwner: true } : {}),
       ...(uploadTickets.length > 0 ? { skillPublishUploadTickets: uploadTickets } : {}),
+      ...(onFilesPersisted ? { onFilesPersisted } : {}),
     },
   );
 }

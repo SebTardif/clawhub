@@ -143,6 +143,15 @@ From SKILL.md frontmatter + AgentSkills + Clawdis extensions:
    - GitHub account age ≥ 14 days
 5. Server stores files + metadata, sets `latest` tag, updates stats.
 
+Multipart uploads remain request-owned until `skills.insertVersion` commits a
+pending or published version. `publishVersionForUser` signals that ownership
+transfer immediately after the mutation returns, before attempt creation or
+scan scheduling. Request cleanup deletes only unadopted uploads, including
+partial stores and rejected publication; a later failure must not delete files
+referenced by a committed version. Pending-version compensation owns its own
+file cleanup, even if compensation itself fails. Upload cleanup must not infer
+ownership from the final HTTP status or publishing helper success.
+
 Local fixture data lives in `convex/devSeed.ts` and `fixtures/public-corpus/`.
 
 ## Versioning + tags

@@ -8474,6 +8474,46 @@ describe("httpApiV1 handlers", () => {
     expect(publishVersionForUser).not.toHaveBeenCalled();
   });
 
+  it("publish multipart deletes stored blobs when owner resolution fails", async () => {
+    vi.mocked(requireApiTokenUser).mockResolvedValueOnce({
+      userId: "users:1",
+      user: { handle: "p" },
+    } as never);
+    const runMutation = vi.fn(async (_mutation: unknown, args: Record<string, unknown>) => {
+      if (isRateLimitArgs(args)) return okRate();
+      throw new Error("Publisher not found");
+    });
+    const form = new FormData();
+    form.set(
+      "payload",
+      JSON.stringify({
+        slug: "demo",
+        displayName: "Demo",
+        ownerHandle: "@missing",
+        version: "1.0.0",
+        changelog: "",
+        acceptLicenseTerms: true,
+        tags: ["latest"],
+      }),
+    );
+    form.append("files", new Blob(["hello"], { type: "text/plain" }), "SKILL.md");
+    const store = vi.fn().mockResolvedValue("storage:1");
+    const remove = vi.fn().mockResolvedValue(undefined);
+    const response = await __handlers.publishSkillV1Handler(
+      makeCtx({ runMutation, storage: { store, delete: remove } }),
+      new Request("https://example.com/api/v1/skills", {
+        method: "POST",
+        headers: { Authorization: "Bearer clh_test" },
+        body: form,
+      }),
+    );
+    expect(response.status).toBe(400);
+    expect(await response.text()).toMatch(/publisher not found/i);
+    expect(publishVersionForUser).not.toHaveBeenCalled();
+    expect(store).toHaveBeenCalledTimes(1);
+    expect(remove).toHaveBeenCalledWith("storage:1");
+  });
+
   it("publish json rejects omitted license terms", async () => {
     vi.mocked(requireApiTokenUser).mockResolvedValueOnce({
       userId: "users:1",
@@ -8515,11 +8555,12 @@ describe("httpApiV1 handlers", () => {
       userId: "users:1",
       user: { handle: "p" },
     } as never);
-    vi.mocked(publishVersionForUser).mockResolvedValueOnce({
-      skillId: "s",
-      versionId: "v",
-      embeddingId: "e",
-    } as never);
+    vi.mocked(publishVersionForUser).mockImplementationOnce(
+      async (_ctx, _userId, _args, options) => {
+        options?.onFilesPersisted?.();
+        return { skillId: "s", versionId: "v", embeddingId: "e" } as never;
+      },
+    );
     const runMutation = vi.fn(async (_mutation: unknown, args: Record<string, unknown>) => {
       if (isRateLimitArgs(args)) return okRate();
       if (args.ownerHandle === "me") return { publisherId: "publishers:me" };
@@ -8587,11 +8628,12 @@ describe("httpApiV1 handlers", () => {
       userId: "users:1",
       user: { handle: "p" },
     } as never);
-    vi.mocked(publishVersionForUser).mockResolvedValueOnce({
-      skillId: "s",
-      versionId: "v",
-      embeddingId: "e",
-    } as never);
+    vi.mocked(publishVersionForUser).mockImplementationOnce(
+      async (_ctx, _userId, _args, options) => {
+        options?.onFilesPersisted?.();
+        return { skillId: "s", versionId: "v", embeddingId: "e" } as never;
+      },
+    );
     const runMutation = vi.fn(async (_mutation: unknown, args: Record<string, unknown>) => {
       if (isRateLimitArgs(args)) return okRate();
       if (args.ownerHandle === "openclaw") return { publisherId: "publishers:openclaw" };
@@ -8625,9 +8667,53 @@ describe("httpApiV1 handlers", () => {
       expect.anything(),
       "users:1",
       expect.not.objectContaining({ ownerHandle: expect.anything() }),
-      { ownerPublisherId: "publishers:openclaw" },
+      { ownerPublisherId: "publishers:openclaw", onFilesPersisted: expect.any(Function) },
     );
   });
+
+  it.each([false, true])(
+    "multipart cleanup respects persisted files after failure (%s)",
+    async (persisted) => {
+      vi.mocked(requireApiTokenUser).mockResolvedValueOnce({
+        userId: "users:1",
+        user: { handle: "p" },
+      } as never);
+      vi.mocked(publishVersionForUser).mockImplementationOnce(
+        async (_ctx, _userId, _args, options) => {
+          if (persisted) options?.onFilesPersisted?.();
+          throw new Error(persisted ? "followup failed" : "insert rejected");
+        },
+      );
+      const remove = vi.fn();
+      const form = new FormData();
+      form.set(
+        "payload",
+        JSON.stringify({
+          slug: "demo",
+          displayName: "Demo",
+          version: "1.0.0",
+          acceptLicenseTerms: true,
+          tags: ["latest"],
+        }),
+      );
+      form.append("files", new Blob(["# Demo\n"]), "SKILL.md");
+      const response = await __handlers.publishSkillV1Handler(
+        makeCtx({
+          runMutation: vi.fn().mockResolvedValue(okRate()),
+          storage: { store: vi.fn().mockResolvedValue("storage:request"), delete: remove },
+        }),
+        new Request("https://example.com/api/v1/skills", {
+          method: "POST",
+          headers: { Authorization: "Bearer clh_test" },
+          body: form,
+        }),
+      );
+      expect(response.status).toBe(400);
+      expect(await response.text()).toContain(persisted ? "followup failed" : "insert rejected");
+      if (persisted) expect(remove).not.toHaveBeenCalled();
+      else expect(remove).toHaveBeenCalledExactlyOnceWith("storage:request");
+    },
+  );
 
   it("publish multipart rejects omitted license terms", async () => {
     vi.mocked(requireApiTokenUser).mockResolvedValueOnce({
@@ -8652,8 +8738,10 @@ describe("httpApiV1 handlers", () => {
       }),
     );
     form.append("files", new Blob(["hello"], { type: "text/plain" }), "SKILL.md");
+    const store = vi.fn().mockResolvedValue("storage:1");
+    const remove = vi.fn().mockResolvedValue(undefined);
     const response = await __handlers.publishSkillV1Handler(
-      makeCtx({ runMutation, storage: { store: vi.fn().mockResolvedValue("storage:1") } }),
+      makeCtx({ runMutation, storage: { store, delete: remove } }),
       new Request("https://example.com/api/v1/skills", {
         method: "POST",
         headers: { Authorization: "Bearer clh_test" },
@@ -8663,6 +8751,8 @@ describe("httpApiV1 handlers", () => {
     expect(response.status).toBe(400);
     expect(await response.text()).toMatch(/license terms must be accepted/i);
     expect(publishVersionForUser).not.toHaveBeenCalled();
+    expect(store).toHaveBeenCalledTimes(1);
+    expect(remove).toHaveBeenCalledWith("storage:1");
   });
 
   it("publish rejects explicit license refusal", async () => {
@@ -8709,11 +8799,12 @@ describe("httpApiV1 handlers", () => {
       userId: "users:1",
       user: { handle: "p" },
     } as never);
-    vi.mocked(publishVersionForUser).mockResolvedValueOnce({
-      skillId: "s",
-      versionId: "v",
-      embeddingId: "e",
-    } as never);
+    vi.mocked(publishVersionForUser).mockImplementationOnce(
+      async (_ctx, _userId, _args, options) => {
+        options?.onFilesPersisted?.();
+        return { skillId: "s", versionId: "v", embeddingId: "e" } as never;
+      },
+    );
     const runMutation = vi.fn().mockResolvedValue(okRate());
     const store = vi.fn().mockResolvedValue("storage:1");
     const form = new FormData();
