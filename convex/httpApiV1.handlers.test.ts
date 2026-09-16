@@ -14004,6 +14004,51 @@ describe("httpApiV1 handlers", () => {
     expect(await response.text()).toContain("flagged as malicious");
   });
 
+  it("packages version detail hides unpublished skill versions", async () => {
+    const runQuery = vi.fn(async (_query: unknown, args: Record<string, unknown>) => {
+      if ("name" in args) return null;
+      if ("slug" in args) {
+        return {
+          skill: {
+            _id: "skills:demo",
+            slug: "demo",
+            displayName: "Demo Skill",
+            summary: "Skill summary",
+            latestVersionId: "skillVersions:demo-1",
+            tags: { latest: "skillVersions:demo-1" },
+            badges: {},
+            createdAt: 1,
+            updatedAt: 2,
+          },
+          latestVersion: { _id: "skillVersions:demo-1", version: "1.0.0" },
+          owner: { handle: "steipete" },
+          moderationInfo: null,
+        };
+      }
+      if ("skillId" in args && args.version === "2.0.0") {
+        return {
+          _id: "skillVersions:demo-pending",
+          skillId: "skills:demo",
+          version: "2.0.0",
+          createdAt: 4,
+          changelog: "pending notes",
+          publicationStatus: "pending",
+          files: [{ path: "SKILL.md", size: 12, sha256: "pend-sha", contentType: "text/markdown" }],
+        };
+      }
+      return null;
+    });
+    const runMutation = vi.fn().mockResolvedValue(okRate());
+
+    const response = await __handlers.packagesGetRouterV1Handler(
+      makeCtx({ runQuery, runMutation }),
+      new Request("https://example.com/api/v1/packages/demo/versions/2.0.0"),
+    );
+
+    expect(response.status).toBe(404);
+    expect(await response.text()).toBe("Version not found");
+  });
+
   it("packages version detail blocks moderated skills that are unavailable publicly", async () => {
     let slugLookupCount = 0;
     const runQuery = vi.fn(async (_query: unknown, args: Record<string, unknown>) => {

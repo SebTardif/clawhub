@@ -83,6 +83,7 @@ import {
   getPublicSkillVersionAccessBlock,
   getPublicSkillVersionDownloadBlock,
   getSkillFileModerationInfoFromSkill,
+  isPublicSkillVersionAvailableForSkill,
   isSkillVersionForSkill,
 } from "../lib/skillFileAccess";
 import { isMacJunkPath } from "../lib/skills";
@@ -539,6 +540,7 @@ type SkillVersionLike = {
     contentType?: string;
   }>;
   softDeletedAt?: number;
+  publicationStatus?: "pending" | "published" | "blocked";
 };
 
 type ReleaseLike = {
@@ -4738,7 +4740,9 @@ export async function packagesGetRouterV1Handler(ctx: ActionCtx, request: Reques
           version: packageSegments[1],
         },
       )) as SkillVersionLike | null;
-      if (!version || version.softDeletedAt) return text("Version not found", 404, rate.headers);
+      if (!isPublicSkillVersionAvailableForSkill(version, skillDetail.skill._id)) {
+        return text("Version not found", 404, rate.headers);
+      }
       const effectiveLatestVersionId =
         skillDetail.skill.latestVersionId ?? skillDetail.skill.tags?.latest;
       const moderationBlock = getPublicSkillVersionAccessBlock(
