@@ -330,6 +330,7 @@ async function importGitHubSkillForUser(
     contentType?: string;
   }> = [];
 
+  let filesPersisted = false;
   try {
     let totalBytes = 0;
     for (const path of selected.sort()) {
@@ -394,7 +395,13 @@ async function importGitHubSkillForUser(
           files: storedFiles,
           source: sourceProvenance,
         },
-        { ownerPublisherId: target.publisherId, sourceProvenance },
+        {
+          ownerPublisherId: target.publisherId,
+          sourceProvenance,
+          onFilesPersisted: () => {
+            filesPersisted = true;
+          },
+        },
       );
     } catch (error) {
       throw new ConvexError(buildPublishFailureMessage(error));
@@ -402,7 +409,9 @@ async function importGitHubSkillForUser(
 
     return { ok: true, slug: slugBase, version, ...result };
   } catch (error) {
-    await Promise.allSettled(storedFiles.map((file) => ctx.storage.delete(file.storageId)));
+    if (!filesPersisted) {
+      await Promise.allSettled(storedFiles.map((file) => ctx.storage.delete(file.storageId)));
+    }
     throw error;
   }
 }

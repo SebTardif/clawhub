@@ -152,6 +152,10 @@ referenced by a committed version. Pending-version compensation owns its own
 file cleanup, even if compensation itself fails. Upload cleanup must not infer
 ownership from the final HTTP status or publishing helper success.
 
+GitHub imports validate publish metadata and resolve the owner before storing
+selected files. They use the same persistence signal to end request cleanup;
+failed stores or pre-persistence publication remove only that import's uploads.
+
 Local fixture data lives in `convex/devSeed.ts` and `fixtures/public-corpus/`.
 
 ## Versioning + tags

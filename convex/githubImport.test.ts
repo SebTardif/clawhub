@@ -932,6 +932,26 @@ describe("githubImport", () => {
     expect(ctx.storage.delete).toHaveBeenCalledWith("storage:2");
   });
 
+  it("retains imported files when publication fails after persistence", async () => {
+    const ctx = makeImportCtx();
+    vi.mocked(publishVersionForUser).mockImplementationOnce(
+      async (_ctx, _userId, _args, options) => {
+        options?.onFilesPersisted?.();
+        throw new Error("post-commit followup failed");
+      },
+    );
+    await expect(
+      __test.importGitHubSkillForUser(
+        ctx as never,
+        "users:1" as never,
+        makeImportArgs(),
+        makeOwnedImportFetch(buildOwnedImportZip()) as never,
+      ),
+    ).rejects.toThrow(/post-commit followup failed/);
+    expect(ctx.storage.store).toHaveBeenCalledTimes(2);
+    expect(ctx.storage.delete).not.toHaveBeenCalled();
+  });
+
   it("deletes already-stored blobs when a later store call fails", async () => {
     const store = vi
       .fn()
