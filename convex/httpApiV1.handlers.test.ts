@@ -6618,6 +6618,60 @@ describe("httpApiV1 handlers", () => {
     expect(storage.get).not.toHaveBeenCalled();
   });
 
+  it("does not serve raw files from an unpublished version", async () => {
+    const runQuery = vi.fn(async (_query: unknown, args: Record<string, unknown>) => {
+      if ("slug" in args) {
+        return {
+          skill: {
+            _id: "skills:1",
+            slug: "demo",
+            displayName: "Demo",
+            summary: "s",
+            tags: { latest: "skillVersions:1" },
+            stats: {},
+            createdAt: 1,
+            updatedAt: 2,
+            latestVersionId: "skillVersions:1",
+          },
+          latestVersion: { _id: "skillVersions:1", version: "1.0.0" },
+          owner: null,
+          moderationInfo: null,
+        };
+      }
+      if ("skillId" in args && args.version === "2.0.0") {
+        return {
+          _id: "skillVersions:pending",
+          skillId: "skills:1",
+          version: "2.0.0",
+          publicationStatus: "pending",
+          files: [{ path: "SKILL.md", size: 5, storageId: "storage:pending", sha256: "pend" }],
+          softDeletedAt: undefined,
+        };
+      }
+      if (args.versionId === "skillVersions:1") {
+        return {
+          _id: "skillVersions:1",
+          skillId: "skills:1",
+          version: "1.0.0",
+          publicationStatus: "published",
+          files: [{ path: "SKILL.md", size: 5, storageId: "storage:1", sha256: "abcd" }],
+        };
+      }
+      return null;
+    });
+    const runMutation = vi.fn().mockResolvedValue(okRate());
+    const storage = { get: vi.fn() };
+
+    const response = await __handlers.skillsGetRouterV1Handler(
+      makeCtx({ runQuery, runMutation, storage }),
+      new Request("https://example.com/api/v1/skills/demo/file?path=SKILL.md&version=2.0.0"),
+    );
+
+    expect(response.status).toBe(404);
+    expect(await response.text()).toBe("Version not found");
+    expect(storage.get).not.toHaveBeenCalled();
+  });
+
   it("returns stored Skill Card markdown", async () => {
     const internalVersion = {
       _id: "skillVersions:1",
@@ -6775,6 +6829,53 @@ describe("httpApiV1 handlers", () => {
     const response = await __handlers.skillsGetRouterV1Handler(
       makeCtx({ runQuery, runMutation, storage }),
       new Request("https://example.com/api/v1/skills/demo/card?tag=old"),
+    );
+
+    expect(response.status).toBe(404);
+    expect(await response.text()).toBe("Version not found");
+    expect(storage.get).not.toHaveBeenCalled();
+  });
+
+  it("does not serve Skill Cards from an unpublished version", async () => {
+    const runQuery = vi.fn(async (_query: unknown, args: Record<string, unknown>) => {
+      if ("slug" in args) {
+        return {
+          skill: {
+            _id: "skills:1",
+            slug: "demo",
+            displayName: "Demo",
+            summary: "s",
+            tags: {},
+            stats: {},
+            createdAt: 1,
+            updatedAt: 2,
+            latestVersionId: "skillVersions:1",
+          },
+          latestVersion: { _id: "skillVersions:1", version: "1.0.0" },
+          owner: null,
+          moderationInfo: null,
+        };
+      }
+      if ("skillId" in args && args.version === "2.0.0") {
+        return {
+          _id: "skillVersions:pending",
+          skillId: "skills:1",
+          version: "2.0.0",
+          publicationStatus: "pending",
+          files: [
+            { path: "skill-card.md", size: 12, storageId: "storage:pending", sha256: "pend-card" },
+          ],
+          softDeletedAt: undefined,
+        };
+      }
+      return null;
+    });
+    const runMutation = vi.fn().mockResolvedValue(okRate());
+    const storage = { get: vi.fn() };
+
+    const response = await __handlers.skillsGetRouterV1Handler(
+      makeCtx({ runQuery, runMutation, storage }),
+      new Request("https://example.com/api/v1/skills/demo/card?version=2.0.0"),
     );
 
     expect(response.status).toBe(404);

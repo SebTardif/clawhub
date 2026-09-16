@@ -105,6 +105,13 @@ export function getPublicSkillVersionDownloadBlock(
   version: SkillVersionSecuritySource,
   fallbackModeratedVersionId?: Id<"skillVersions"> | string | null,
 ): SkillFileAccessBlock | null {
+  if (!isPublishedSkillVersion(version)) {
+    return {
+      status: 404,
+      message: "Version not found",
+    };
+  }
+
   const moderationBlock = getPublicSkillVersionAccessBlock(
     moderationInfo,
     version._id,
