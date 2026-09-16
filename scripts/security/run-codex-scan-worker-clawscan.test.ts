@@ -207,6 +207,7 @@ function clawScanArtifactJson(options?: {
           ? {}
           : {
               raw: options?.aigRaw ?? {
+                $schema: "https://json.schemastore.org/sarif-2.1.0.json",
                 version: "2.1.0",
                 runs: [
                   {
@@ -233,6 +234,10 @@ function clawScanArtifactJson(options?: {
             recommendation: "DO_NOT_INSTALL",
           },
           issues: [{ id: "SDI-1", severity: "HIGH", explanation: "test finding" }],
+          analysis_completeness: {
+            coverage_percent: 99.1,
+            futureField: [1, null, { evidence: "full" }],
+          },
         },
       },
       "clawscan-static": {
@@ -474,6 +479,8 @@ JSON`,
     await mkdir(join(packageRoot, "skills", "alpha"), { recursive: true });
     await mkdir(join(packageRoot, "skills", "beta"), { recursive: true });
     await writeFile(join(packageRoot, "package.json"), "{}\n");
+    await writeFile(join(packageRoot, "openclaw.plugin.json"), '{"id":"demo-plugin"}\n');
+    await writeFile(join(packageRoot, "SKILL.md"), "# Bundled skill\n");
     await writeFile(join(packageRoot, "skills", "alpha", "SKILL.md"), "# alpha\n");
     await writeFile(join(packageRoot, "skills", "beta", "SKILL.md"), "# beta\n");
 
@@ -504,7 +511,8 @@ JSON`,
     const copiedFixture = join(workspace, "skillspector-fixture.json");
     await writeFakeClawScanCommand(
       fakeClawScan,
-      `out=""
+      `test "$1" = "./artifact/package/openclaw.plugin.json"
+out=""
 fixture=""
 while [[ $# -gt 0 ]]; do
   case "$1" in
@@ -623,12 +631,17 @@ JSON`,
   });
 
   it.each([
-    { verdict: "benign", expectedStatus: "clean" },
-    { verdict: "suspicious", expectedStatus: "suspicious" },
-    { verdict: "malicious", expectedStatus: "malicious" },
-  ] satisfies Array<{ expectedStatus: string; verdict: ClawScanVerdict }>)(
+    { verdict: "benign", expectedStatus: "clean", reportsSupported: true },
+    { verdict: "suspicious", expectedStatus: "suspicious", reportsSupported: true },
+    { verdict: "malicious", expectedStatus: "malicious", reportsSupported: true },
+    { verdict: "benign", expectedStatus: "clean", reportsSupported: false },
+  ] satisfies Array<{
+    expectedStatus: string;
+    verdict: ClawScanVerdict;
+    reportsSupported: boolean;
+  }>)(
     "persists %s ClawScan verdicts through the existing completion shape",
-    async ({ verdict, expectedStatus }) => {
+    async ({ verdict, expectedStatus, reportsSupported }) => {
       const workspace = await tempDir();
       const fakeClawScan = join(workspace, "fake-clawscan");
       const argsLog = join(workspace, "clawscan-args.log");
@@ -662,6 +675,14 @@ JSON`,
       const previousVirusTotalKey = process.env.VIRUSTOTAL_API_KEY;
       process.env.CODEX_SECURITY_SCAN_CLAWSCAN_COMMAND = fakeClawScan;
       process.env.VIRUSTOTAL_API_KEY = "vt-fixture-that-must-not-reach-clawscan";
+      const uploads: unknown[] = [];
+      const fetchOriginal = globalThis.fetch;
+      vi.spyOn(globalThis, "fetch").mockImplementation(async (url, init) => {
+        if (url !== "https://storage.example/report-upload") return fetchOriginal(url, init);
+        expect(init?.method).toBe("POST");
+        uploads.push(JSON.parse(String(init?.body)));
+        return new Response(JSON.stringify({ storageId: "storage:scanner-report" }));
+      });
       try {
         const client = {
           action: vi.fn(async (..._args: unknown[]) => ({})),
@@ -669,7 +690,12 @@ JSON`,
         const result = await processJob(
           client,
           "worker-auth",
-          skillVersionJob(`securityScanJobs:${verdict}`),
+          {
+            ...skillVersionJob(`securityScanJobs:${verdict}`),
+            ...(reportsSupported
+              ? { scannerReportsUploadUrl: "https://storage.example/report-upload" }
+              : {}),
+          },
           undefined,
         );
 
@@ -695,9 +721,24 @@ JSON`,
           },
         });
         const payload = client.action.mock.calls[0]?.[1] as
-          | { llmAnalysis?: { model?: string } }
+          | { llmAnalysis?: { model?: string }; scannerReportsStorageId?: string }
           | undefined;
         expect(payload?.llmAnalysis?.model).toBeUndefined();
+        if (reportsSupported) {
+          expect(payload?.scannerReportsStorageId).toBe("storage:scanner-report");
+          const original = JSON.parse(artifactJson);
+          expect(uploads).toEqual([
+            {
+              checkedAt: Date.parse(JSON.parse(artifactJson).completedAt),
+              aig: original.scanners.aig.raw,
+              skillspector: original.scanners.skillspector.raw,
+            },
+          ]);
+        } else {
+          // The older deployed action rejects unknown arguments before running.
+          expect(payload).not.toHaveProperty("scannerReportsStorageId");
+          expect(uploads).toEqual([]);
+        }
 
         const invocationArgs = await readFile(argsLog, "utf8");
         expect(invocationArgs).toContain("--profile");

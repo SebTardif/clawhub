@@ -219,6 +219,11 @@ requires v2, including the pre-cutover reusable-workflow revision. The only
 non-v2 OpenClaw route is a directly authenticated ClawHub user supplying an
 explicit manual override.
 
+The CLI must transmit multipart metadata as literal text, including JSON
+containing semicolons and strings beginning with `@` or `<`. Curl's form syntax
+applies only to actual file parts; scalar fields must not become file reads or
+lose text. The upload transport must preserve both metadata and artifact bytes.
+
 OpenClaw must add the v2 identity, post-dispatch parent receipt, package
 inventory list, and child inputs before this server gate is deployed. The v2 child must
 accept the staged response instead of waiting inline for publication, so the
@@ -226,3 +231,13 @@ awaited parent can finish successfully. Published-artifact verification must
 run from a detached post-parent route after ClawHub finalization, not from the
 still-awaited child run. Merge and deployment of the ClawHub verifier alone
 must not move the OpenClaw pin.
+
+## Manual recovery of failed staged packages
+
+`POST /api/v1/publish/attempts/<id>/recover` accepts an ordinary ClawHub user API token and exactly `{ "manualOverrideReason": "..." }` (trimmed, 1–500 characters). It creates a successor only for the current failed staged OpenClaw plugin attempt. The caller must currently have publisher access to the package; platform administrator status does not replace publisher membership. The ordinary GitHub account-age rule also applies. Unauthorized attempt IDs remain undisclosed, and the original attempt status endpoint retains its actor-only visibility.
+
+Recovery retains the failed attempt and consumed v2 token unchanged. The old token, including an expired or revoked token, establishes immutable package/version/artifact provenance only. It grants no recovery authority and is never revived. The new attempt instead records the current user, API token, publisher ownership, and explicit manual reason. Admission and the final publication mutation revalidate this independent authority, current moderation, exact original storage IDs/inventory, and ownership. No request-supplied artifact, identity, or authorization override is accepted.
+
+The successor reuses the staged release and immutable bytes, starts fresh checks, and bypasses cached prior scan results. Only its current claimed clean checks and live finalization claim can publish. Current API-token revocation, lost publisher membership, ownership changes, blocked scans, or moderation prevent publication. The failed automated parent is never represented as successful. No new package version, deleted history, or reset of an active attempt is involved.
+
+A fresh successor returns HTTP 202. An exact replay by the same API token and actor with the same reason returns HTTP 200 and the current successor status; it does not create another attempt. Both responses include `attemptId`, `recoveredFromAttemptId`, `packageId`, `releaseId`, `name`, `version`, `status`, `publicationStatus`, and `reused`. Follow the successor with the existing publish-attempt status endpoint. An independently failed successor may itself be recovered through a fresh explicit request subject to the same checks.

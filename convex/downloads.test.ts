@@ -2,6 +2,11 @@ import type { RateLimitArgs, RateLimitReturns } from "@convex-dev/rate-limiter";
 import { unzipSync } from "fflate";
 import { exportJWK, exportPKCS8, generateKeyPair } from "jose";
 import { afterEach, describe, expect, it, vi } from "vitest";
+
+// Route behavior assumes verified ingress; trust validation is covered by httpRateLimit.edge.test.ts.
+vi.mock("./lib/verifiedClientIp", () => ({
+  getVerifiedClientIp: async () => "203.0.113.1",
+}));
 import type { ActionCtx } from "./_generated/server";
 import { __test, downloadZipHandler, recordArchiveDownloadMetricHandler } from "./downloads";
 import {
@@ -91,20 +96,20 @@ describe("downloads helpers", () => {
     expect(__test.getDownloadIdentityValue(request, "users_123")).toBe("user:users_123");
   });
 
-  it("uses cf-connecting-ip for anonymous identity when trusted headers are enabled", () => {
+  it("rejects unverified cf-connecting-ip for anonymous metrics", () => {
     vi.stubEnv("TRUST_FORWARDED_IPS", "true");
     const request = new Request("https://example.com", {
       headers: { "cf-connecting-ip": "1.2.3.4" },
     });
-    expect(__test.getDownloadIdentityValue(request, null)).toBe("ip:1.2.3.4");
+    expect(__test.getDownloadIdentityValue(request, null)).toBeNull();
   });
 
-  it("falls back to forwarded ip when explicitly enabled", () => {
+  it("rejects unverified forwarded addresses for metrics", () => {
     vi.stubEnv("TRUST_FORWARDED_IPS", "true");
     const request = new Request("https://example.com", {
       headers: { "x-forwarded-for": "10.0.0.1, 10.0.0.2" },
     });
-    expect(__test.getDownloadIdentityValue(request, null)).toBe("ip:10.0.0.1");
+    expect(__test.getDownloadIdentityValue(request, null)).toBeNull();
   });
 
   it("returns null when user and ip are missing", () => {
@@ -460,7 +465,7 @@ describe("downloads helpers", () => {
     expect(runAfter).toHaveBeenCalledTimes(1);
   });
 
-  it("streams stored file chunks, stays deterministic, and skips a Blob that vanishes", async () => {
+  it("streams stored file chunks and stays deterministic", async () => {
     const firstChunk = new Uint8Array(64 * 1024).fill(0x61);
     const secondChunk = new TextEncoder().encode("streamed body\n");
     const releaseSecondChunk = deferred<void>();
@@ -518,7 +523,6 @@ describe("downloads helpers", () => {
           files: [
             { path: "a.txt", storageId: "_storage:skill" },
             { path: "b.txt", storageId: "_storage:notes" },
-            { path: "missing.txt", storageId: "_storage:missing" },
           ],
           softDeletedAt: undefined,
         };
@@ -550,7 +554,9 @@ describe("downloads helpers", () => {
 
     expect(response.status).toBe(200);
     expect(storageGetMetadata).not.toHaveBeenCalled();
-    expect(storageGet).not.toHaveBeenCalled();
+    expect(storageGet).toHaveBeenCalledWith("_storage:skill");
+    expect(storageGet).toHaveBeenCalledWith("_storage:notes");
+    expect(stream).not.toHaveBeenCalled();
 
     const reader = response.body!.getReader();
     const firstArchiveChunk = await reader.read();
@@ -570,7 +576,6 @@ describe("downloads helpers", () => {
     expect(Object.keys(unzipped).sort()).toEqual(["_meta.json", "a.txt", "b.txt"]);
     expect(unzipped["a.txt"]).toEqual(Uint8Array.from([...firstChunk, ...secondChunk]));
     expect(new TextDecoder().decode(unzipped["b.txt"])).toBe("supporting notes\n");
-    expect(storageGet).toHaveBeenCalledWith("_storage:missing");
 
     const repeatResponse = await downloadZipHandler(
       {
@@ -610,6 +615,63 @@ describe("downloads helpers", () => {
       new Request("https://example.com/api/v1/download?slug=demo"),
     );
     expect(new Uint8Array(await repeatResponse.arrayBuffer())).toEqual(responseBytes);
+  });
+
+  it("returns 410 when a skill archive blob is missing from storage", async () => {
+    const runQuery = vi.fn(async (_query: unknown, args: Record<string, unknown>) => {
+      if ("slug" in args) {
+        return {
+          skill: {
+            _id: "skills:1",
+            ownerUserId: "users:1",
+            slug: "demo",
+            tags: {},
+            latestVersionId: "skillVersions:1",
+          },
+          moderationInfo: null,
+        };
+      }
+      if ("versionId" in args) {
+        return {
+          _id: "skillVersions:1",
+          skillId: "skills:1",
+          version: "1.0.0",
+          createdAt: 3,
+          files: [
+            { path: "SKILL.md", storageId: "_storage:1" },
+            { path: "missing.txt", storageId: "_storage:missing" },
+          ],
+          softDeletedAt: undefined,
+        };
+      }
+      return null;
+    });
+    const runMutation = vi.fn(async (_mutation: unknown, args: Record<string, unknown>) => {
+      if (isRateLimitArgs(args)) return okRate();
+      return null;
+    });
+    const runAfter = vi.fn();
+    const storageGet = vi.fn(async (storageId: string) =>
+      storageId === "_storage:1" ? streamingBlob("hello") : null,
+    );
+
+    const response = await downloadZipHandler(
+      {
+        runQuery,
+        runMutation,
+        scheduler: { runAfter },
+        storage: { get: storageGet, getMetadata: vi.fn().mockResolvedValue({}) },
+      } as unknown as ActionCtx,
+      new Request("https://example.com/api/v1/download?slug=demo", {
+        headers: { "cf-connecting-ip": "1.2.3.4" },
+      }),
+    );
+
+    expect(response.status).toBe(410);
+    expect(await response.text()).toBe("Skill archive file missing from storage");
+    expect(response.headers.get("Content-Type")).not.toBe("application/zip");
+    expect(storageGet).toHaveBeenCalledWith("_storage:missing");
+    expect(runAfter).not.toHaveBeenCalled();
   });
 
   it("returns 410 for an explicitly requested revoked version", async () => {
@@ -885,10 +947,7 @@ describe("downloads helpers", () => {
 
     const runQuery = vi.fn(async (_query: unknown, args: Record<string, unknown>) => {
       if ("tokenHash" in args) {
-        return { _id: "apiTokens:1", revokedAt: undefined };
-      }
-      if ("tokenId" in args) {
-        return { _id: "users:token", deletedAt: undefined, deactivatedAt: undefined };
+        return { apiTokenId: "apiTokens:1", user: { _id: "users:token" } };
       }
       if ("slug" in args) {
         return {
