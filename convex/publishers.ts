@@ -2565,7 +2565,7 @@ export const listStarredPage = query({
       await Promise.all(
         starRows.map(async (star): Promise<PublisherCatalogItem | null> => {
           const skill = await ctx.db.get(star.skillId);
-          if (!isPublicPublishedSkill(skill)) return null;
+          if (!skill || !isPublicPublishedSkill(skill)) return null;
           const ownerPublisher = skill.ownerPublisherId
             ? await ctx.db.get(skill.ownerPublisherId)
             : null;
