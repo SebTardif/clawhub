@@ -61,6 +61,16 @@ export const recordDownloadMetricInternal = internalMutation({
   },
   handler: async (ctx, args) => {
     const targetId = args.target.id;
+    // Touch the target before the dedupe insert so overlapping writes conflict
+    // and retry onto the committed dedupe row.
+    const target = await ctx.db.get(targetId);
+    const statsDownloads =
+      target && "statsDownloads" in target && typeof target.statsDownloads === "number"
+        ? target.statsDownloads
+        : null;
+    if (statsDownloads !== null) {
+      await ctx.db.patch(targetId, { statsDownloads });
+    }
     const existing = await ctx.db
       .query("downloadMetricDedupes")
       .withIndex("by_target_identity_day", (q) =>
