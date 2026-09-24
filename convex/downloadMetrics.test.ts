@@ -116,7 +116,10 @@ describe("download metric helpers", () => {
 
   it("touches the skill download stat before inserting a dedupe row", async () => {
     const { db, insert } = makeDb();
-    db.get.mockResolvedValue({ _id: "skills:one", statsDownloads: 4 });
+    db.get.mockResolvedValue({
+      _id: "skills:one",
+      stats: { downloads: 4 },
+    });
 
     await recordDownloadMetricHandler(
       { db },
@@ -135,6 +138,32 @@ describe("download metric helpers", () => {
     );
     expect(db.patch.mock.invocationCallOrder[0]).toBeLessThan(
       insert.mock.invocationCallOrder[0] ?? Number.POSITIVE_INFINITY,
+    );
+  });
+
+  it("touches a package download stat before inserting a dedupe row", async () => {
+    const { db, insert } = makeDb();
+    db.get.mockResolvedValue({
+      _id: "packages:one",
+      stats: { downloads: 2, installs: 1, stars: 0 },
+    });
+
+    await recordDownloadMetricHandler(
+      { db },
+      {
+        target: { kind: "package", id: "packages:one" },
+        identityKind: "ip",
+        identityHash: "hash-ip",
+        dayStart: 0,
+      },
+    );
+
+    expect(db.patch).toHaveBeenCalledWith("packages:one", {
+      stats: { downloads: 2, installs: 1, stars: 0 },
+    });
+    expect(insert).toHaveBeenCalledWith(
+      "downloadMetricDedupes",
+      expect.objectContaining({ targetKind: "package", targetId: "packages:one" }),
     );
   });
 
