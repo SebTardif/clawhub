@@ -331,6 +331,13 @@ async function markInstallTelemetrySeen(
   ctx: MutationCtx,
   params: { userId: Id<"users">; skillId: Id<"skills">; now: number },
 ) {
+  // Patch the skill before the dedupe insert so overlapping reports conflict
+  // and retry. A retry then sees the committed dedupe row.
+  const skill = await ctx.db.get(params.skillId);
+  if (skill && typeof skill.statsInstallsAllTime === "number") {
+    await ctx.db.patch(skill._id, { statsInstallsAllTime: skill.statsInstallsAllTime });
+  }
+
   const dayStart = getDayStart(params.now);
   const existing = await ctx.db
     .query("installTelemetryDedupes")
