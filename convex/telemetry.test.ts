@@ -194,7 +194,7 @@ describe("telemetry install events", () => {
     ctx.db.get = async () =>
       ({
         _id: "skills:demo",
-        statsInstallsAllTime: 4,
+        stats: { installsAllTime: 4 },
       }) as never;
 
     await reportCliInstallHandler(ctx, {

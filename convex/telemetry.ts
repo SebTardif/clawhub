@@ -12,6 +12,7 @@ import {
   getSkillSlugAliasBySlugForPublisher,
   resolvePublisherByOwnerHandle,
 } from "./lib/skills/slugResolution";
+import { readCanonicalStat } from "./lib/skillStats";
 import { insertStatEvent } from "./skillStatEvents";
 
 const DAY_MS = 86_400_000;
@@ -334,8 +335,12 @@ async function markInstallTelemetrySeen(
   // Patch the skill before the dedupe insert so overlapping reports conflict
   // and retry. A retry then sees the committed dedupe row.
   const skill = await ctx.db.get(params.skillId);
-  if (skill && typeof skill.statsInstallsAllTime === "number") {
-    await ctx.db.patch(skill._id, { statsInstallsAllTime: skill.statsInstallsAllTime });
+  if (skill) {
+    const installsAllTime =
+      skill.stats || typeof skill.statsInstallsAllTime === "number"
+        ? readCanonicalStat(skill, "installsAllTime")
+        : 0;
+    await ctx.db.patch(skill._id, { statsInstallsAllTime: installsAllTime });
   }
 
   const dayStart = getDayStart(params.now);
