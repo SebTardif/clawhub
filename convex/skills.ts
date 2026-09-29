@@ -129,7 +129,10 @@ import {
   selectSkillCardFile,
   sourceSkillVersionFiles,
 } from "./lib/skillCards";
-import { isPublicSkillVersionAvailableForSkill } from "./lib/skillFileAccess";
+import {
+  isPublishedSkillVersion,
+  isPublicSkillVersionAvailableForSkill,
+} from "./lib/skillFileAccess";
 import { isHostedSkillPresentationIconPath } from "./lib/skillPresentation";
 import {
   fetchText,
@@ -3370,6 +3373,7 @@ export const getSecurityVerdictTargetInternal = internalQuery({
       .unique();
     const version =
       versionDoc &&
+      isPublishedSkillVersion(versionDoc) &&
       (versionDoc.softDeletedAt || isPublicSkillVersionAvailableForSkill(versionDoc, skill._id))
         ? versionDoc
         : null;

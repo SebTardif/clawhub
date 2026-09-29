@@ -1171,20 +1171,21 @@ async function buildSecurityVerdictItem(
       "version.not_found",
     );
   }
-  if (version.softDeletedAt) {
-    return buildSecurityVerdictError(
-      item,
-      "version_unavailable",
-      "Version not available",
-      "version.unavailable",
-    );
-  }
+  // Withheld versions stay undiscoverable even when also soft-deleted.
   if (version.publicationStatus && version.publicationStatus !== "published") {
     return buildSecurityVerdictError(
       item,
       "version_not_found",
       "Version not found",
       "version.not_found",
+    );
+  }
+  if (version.softDeletedAt) {
+    return buildSecurityVerdictError(
+      item,
+      "version_unavailable",
+      "Version not available",
+      "version.unavailable",
     );
   }
 
