@@ -1133,7 +1133,7 @@ describe("skills.sh Vercel source boundary", () => {
     );
     expect(() => skillsShPageIdentityHash([malformed as never])).not.toThrow();
     expect(skillsShPageIdentityHash([malformed as never])).toBe(
-      skillsShPageIdentityHash([{ ...liveRow, id: "missing" }]),
+      skillsShPageIdentityHash([{ ...liveRow, id: "missing:0:0" }]),
     );
   });
 
