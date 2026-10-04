@@ -678,7 +678,11 @@ async function toPublisherListItem(
     return publishedRows;
   };
   const getPreviewRows = async () =>
-    publishedRows ?? (await getPublisherPublishedPreviewRows(ctx, publisher._id));
+    // Full rows stay unfiltered for owner inventory and computed counts.
+    // Public previews must not reuse private names from that cache.
+    publishedRows
+      ? withoutPrivatePackages(publishedRows)
+      : await getPublisherPublishedPreviewRows(ctx, publisher._id);
   const stats =
     !options.forceComputedStats && hasPublisherStats(publisher)
       ? getPublisherDenormalizedStats(publisher)

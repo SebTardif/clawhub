@@ -2747,6 +2747,128 @@ describe("publishers membership controls", () => {
     expect(result.page[0]?.publishedItems.map((item) => item.downloads)).toEqual([128, 98, 12]);
   });
 
+  it("omits private packages from public directory previews when counters are missing", async () => {
+    const publisherRows = [
+      {
+        _id: "publishers:openclaw",
+        _creationTime: 1,
+        kind: "org",
+        handle: "openclaw",
+        displayName: "OpenClaw",
+        createdAt: 1,
+        updatedAt: 1,
+      },
+    ];
+    const packageRows = [
+      {
+        _id: "packages:secret-package",
+        ownerPublisherId: "publishers:openclaw",
+        softDeletedAt: undefined,
+        family: "code-plugin",
+        name: "@openclaw/secret-package",
+        displayName: "Secret Package",
+        summary: "internal codename",
+        channel: "private",
+        stats: { downloads: 5000, stars: 1, installs: 9, versions: 1 },
+        updatedAt: 9,
+      },
+      {
+        _id: "packages:public-plugin",
+        ownerPublisherId: "publishers:openclaw",
+        softDeletedAt: undefined,
+        family: "code-plugin",
+        name: "@openclaw/public-plugin",
+        displayName: "Public Plugin",
+        summary: "A public plugin",
+        channel: "community",
+        scanStatus: "clean",
+        stats: { downloads: 80, stars: 1, installs: 5, versions: 1 },
+        updatedAt: 4,
+      },
+      {
+        _id: "packages:blocked-plugin",
+        ownerPublisherId: "publishers:openclaw",
+        softDeletedAt: undefined,
+        family: "code-plugin",
+        name: "@openclaw/blocked-plugin",
+        displayName: "Blocked Plugin",
+        summary: "A blocked plugin",
+        channel: "community",
+        scanStatus: "malicious",
+        stats: { downloads: 40, stars: 1, installs: 2, versions: 1 },
+        updatedAt: 3,
+      },
+    ];
+    const ctx = {
+      db: {
+        get: vi.fn(async () => null),
+        query: vi.fn((table: string) => ({
+          withIndex: vi.fn((indexName: string, buildQuery: (q: unknown) => unknown) => {
+            const fields: Record<string, unknown> = {};
+            const q = {
+              eq: (field: string, value: unknown) => {
+                fields[field] = value;
+                return q;
+              },
+            };
+            buildQuery(q);
+            if (table === "publishers" && indexName === "by_handle") {
+              return { unique: vi.fn(async () => null) };
+            }
+            if (table === "publishers" && indexName === "by_active_total_downloads") {
+              return {
+                order: vi.fn(() => ({
+                  collect: vi.fn(async () => publisherRows),
+                  take: vi.fn(async () => publisherRows),
+                })),
+              };
+            }
+            if (table === "publishers" && indexName === "by_active_total_installs") {
+              return {
+                order: vi.fn(() => ({
+                  take: vi.fn(async () => publisherRows),
+                })),
+              };
+            }
+            if (table === "skills" && indexName === "by_owner_publisher_active_updated") {
+              return indexedRows([]);
+            }
+            if (table === "packages" && indexName === "by_owner_publisher_active_updated") {
+              return indexedRows(
+                packageRows.filter((pkg) => pkg.ownerPublisherId === fields.ownerPublisherId),
+              );
+            }
+            if (table === "officialPublishers" && indexName === "by_publisher") {
+              return { unique: vi.fn(async () => null) };
+            }
+            throw new Error(`unexpected ${table} index ${indexName}`);
+          }),
+        })),
+      },
+    };
+
+    const listed = await listPublicHandler(ctx as never, { limit: 48 });
+    const page = await listPublicPageHandler(ctx as never, {
+      paginationOpts: { cursor: null, numItems: 25 },
+    });
+    const expectedNames = ["Public Plugin", "Blocked Plugin"];
+    const expectedStats = {
+      skills: 0,
+      packages: 3,
+      installs: 16,
+      downloads: 5120,
+      stars: 3,
+    };
+
+    expect(listed.items[0]?.publishedItems?.map((item) => item.displayName)).toEqual(expectedNames);
+    expect(listed.items[0]?.stats).toEqual(expectedStats);
+    expect(page.page[0]?.publishedItems.map((item) => item.displayName)).toEqual(expectedNames);
+    expect(page.page[0]?.stats).toEqual(expectedStats);
+    expect(JSON.stringify({ listed, page })).not.toContain("Secret Package");
+    expect(JSON.stringify({ listed, page })).not.toContain("secret-package");
+    expect(JSON.stringify({ listed, page })).not.toContain("internal codename");
+  });
+
   it("does not hydrate every publisher catalog preview before filtering public publisher pages", async () => {
     const publisherRows = Array.from({ length: 120 }, (_, index) => ({
       _id: `publishers:user-${index}`,
