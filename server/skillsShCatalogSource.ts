@@ -1502,7 +1502,8 @@ export async function measureSkillsShTrendingSource(
     if (response.pagination.total !== catalogTotal) {
       throw new Error("skills.sh trending source total changed during measurement");
     }
-    const identityHash = skillsShPageIdentityHash(response.data, page);
+    const capturedRows = capturedSkillsShCatalogRows(response.data, page);
+    const identityHash = skillsShPageIdentityHash(capturedRows, page);
     const contentHash = skillsShPageContentHash(response.data, page);
     requestedPages.push({
       page,
@@ -1511,7 +1512,6 @@ export async function measureSkillsShTrendingSource(
       identityHash,
       contentHash,
     });
-    const capturedRows = capturedSkillsShCatalogRows(response.data, page);
     if (capturedRows.length > 0) {
       const captured = {
         page,
@@ -1659,10 +1659,12 @@ function normalizedTaxonomyFields(value: unknown) {
     .sort();
 }
 
-export function skillsShPageIdentityHash(rows: SkillsShCatalogListRow[], page = 0) {
+export function skillsShPageIdentityHash(rows: SkillsShCatalogListRow[], _page = 0) {
+  // Hash the id text that is already stored. A legacy blank id stays an empty
+  // line. A later capture's missing:<page>:<offset> placeholder stays itself.
   return sha256Hex(
-    capturedSkillsShCatalogRows(rows, page)
-      .map((row) => `${row.id.trim().toLowerCase()}\n`)
+    rows
+      .map((row) => `${typeof row.id === "string" ? row.id.trim().toLowerCase() : ""}\n`)
       .join(""),
   );
 }
@@ -1885,9 +1887,9 @@ export async function measureSkillsShMirrorProofSource(
       throw new Error("skills.sh catalog source total changed during proof measurement");
     }
     firstPage ??= response;
-    const identityHash = skillsShPageIdentityHash(response.data, page);
-    const contentHash = skillsShPageContentHash(response.data, page);
     const capturedRows = capturedSkillsShCatalogRows(response.data, page);
+    const identityHash = skillsShPageIdentityHash(capturedRows, page);
+    const contentHash = skillsShPageContentHash(response.data, page);
     const captured =
       response.data.length > 0
         ? {

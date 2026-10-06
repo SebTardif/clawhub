@@ -1133,8 +1133,29 @@ describe("skills.sh Vercel source boundary", () => {
     );
     expect(() => skillsShPageIdentityHash([malformed as never])).not.toThrow();
     expect(skillsShPageIdentityHash([malformed as never])).toBe(
+      skillsShPageIdentityHash([{ ...liveRow, id: "" }]),
+    );
+    expect(skillsShPageIdentityHash([malformed as never])).not.toBe(
       skillsShPageIdentityHash([{ ...liveRow, id: "missing:0:0" }]),
     );
+  });
+
+  it("keeps a legacy blank id hash distinct from the stored missing placeholder", () => {
+    const row = {
+      id: "owner/repo/skill",
+      installUrl: "https://github.com/owner/repo",
+      installs: 1,
+      name: "Skill",
+      slug: "skill",
+      source: "owner/repo",
+      sourceType: "github",
+      url: "https://skills.sh/owner/repo/skill",
+    };
+    const legacy = [{ ...row, id: "   " }, row];
+    const empty = [{ ...row, id: "" }, row];
+    const stored = [{ ...row, id: "missing:4:0" }, row];
+    expect(skillsShPageIdentityHash(legacy, 4)).toBe(skillsShPageIdentityHash(empty, 4));
+    expect(skillsShPageIdentityHash(legacy, 4)).not.toBe(skillsShPageIdentityHash(stored, 4));
   });
 
   it("requires the exact skills.sh site route for well-known identity", () => {
