@@ -185,34 +185,37 @@ describe("telemetry install events", () => {
     );
   });
 
-  it("touches the skill stat before inserting an install dedupe row", async () => {
+  it("records two users installing the same skill without writing the skill document", async () => {
     const { ctx, insert, patch } = makeInstallCtx({
-      skills: [{ _id: "skills:demo", slug: "demo" }],
-      dedupes: [null],
-      installs: [null],
+      skills: [
+        { _id: "skills:demo", slug: "demo" },
+        { _id: "skills:demo", slug: "demo" },
+      ],
+      dedupes: [null, null],
+      installs: [null, null],
     });
-    ctx.db.get = async () =>
-      ({
-        _id: "skills:demo",
-        stats: { installsAllTime: 4 },
-      }) as never;
 
     await reportCliInstallHandler(ctx, {
       userId: "users:one",
       slug: "demo",
       version: "1.0.0",
     });
+    await reportCliInstallHandler(ctx, {
+      userId: "users:two",
+      slug: "demo",
+      version: "1.2.0",
+    });
 
-    expect(patch).toHaveBeenCalledWith("skills:demo", { statsInstallsAllTime: 4 });
+    expect(patch).not.toHaveBeenCalled();
+    const dedupeInserts = insert.mock.calls.filter((call) => call[0] === "installTelemetryDedupes");
+    expect(dedupeInserts.map((call) => call[1])).toEqual([
+      expect.objectContaining({ userId: "users:one", skillId: "skills:demo" }),
+      expect.objectContaining({ userId: "users:two", skillId: "skills:demo" }),
+    ]);
     expect(insert).toHaveBeenCalledWith(
-      "installTelemetryDedupes",
-      expect.objectContaining({ skillId: "skills:demo" }),
+      "skillStatEvents",
+      expect.objectContaining({ skillId: "skills:demo", kind: "install_new" }),
     );
-    const patchOrder = patch.mock.invocationCallOrder[0];
-    const dedupeOrder = insert.mock.invocationCallOrder.find(
-      (_order, index) => insert.mock.calls[index]?.[0] === "installTelemetryDedupes",
-    );
-    expect(patchOrder).toBeLessThan(dedupeOrder ?? Number.POSITIVE_INFINITY);
   });
 
   it("records the first CLI install without root state", async () => {
