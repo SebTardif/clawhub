@@ -47,7 +47,7 @@ export async function proxyHermitContentRightsRequest(
 
   try {
     if (request.method === "GET" && segments.length === 1) {
-      return proxyResponse(
+      return await proxyResponse(
         await dependencies.fetch(`${baseUrl}${hermitCasePath(caseId)}`, {
           method: "GET",
           headers,
@@ -58,7 +58,7 @@ export async function proxyHermitContentRightsRequest(
     if (request.method === "POST" && segments.length === 2 && segments[1] === "correspondence") {
       const form = await request.formData();
       form.set("actor", actorUserId);
-      return proxyResponse(
+      return await proxyResponse(
         await dependencies.fetch(`${baseUrl}${hermitCasePath(caseId, true)}`, {
           method: "POST",
           headers,

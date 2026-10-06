@@ -153,4 +153,52 @@ describe("ClawHub content rights Hermit proxy", () => {
     expect(usedSignal?.aborted).toBe(true);
     expect(await response.text()).toBe("Hermit content rights service unavailable");
   });
+
+  it("returns 502 when Hermit headers arrive and the GET body aborts", async () => {
+    const response = await proxyHermitContentRightsRequest(
+      new Request("https://clawhub.ai/api/v1/content-rights/CHR-000007"),
+      "users:admin",
+      {
+        baseUrl: "https://forms.openclaw.ai",
+        serviceToken: "shared-token",
+        fetch: async () => stalledBodyResponse(),
+      },
+    );
+
+    expect(response.status).toBe(502);
+    expect(await response.text()).toBe("Hermit content rights service unavailable");
+  });
+
+  it("returns 502 when Hermit headers arrive and the POST body aborts", async () => {
+    const body = new FormData();
+    body.set("text", "Exact email body");
+    const response = await proxyHermitContentRightsRequest(
+      new Request("https://clawhub.ai/api/v1/content-rights/CHR-000007/correspondence", {
+        method: "POST",
+        body,
+      }),
+      "users:admin",
+      {
+        baseUrl: "https://forms.openclaw.ai",
+        serviceToken: "shared-token",
+        fetch: async () => stalledBodyResponse(),
+      },
+    );
+
+    expect(response.status).toBe(502);
+    expect(await response.text()).toBe("Hermit content rights service unavailable");
+  });
 });
+
+function stalledBodyResponse(): Response {
+  return new Response(
+    new ReadableStream({
+      start(controller) {
+        controller.error(
+          new DOMException("The operation was aborted due to timeout", "TimeoutError"),
+        );
+      },
+    }),
+    { status: 200, headers: { "content-type": "application/json" } },
+  );
+}
