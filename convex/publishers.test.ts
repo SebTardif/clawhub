@@ -7841,6 +7841,15 @@ describe("publisher bootstrap", () => {
         displayName: "Plugin 1",
         stats: { downloads: 8, stars: 0, installs: 8, versions: 1 },
       },
+      {
+        _id: "packages:staged",
+        _creationTime: 11,
+        ownerPublisherId: "publishers:alice",
+        family: "plugin",
+        softDeletedAt: undefined,
+        displayName: "Staged Plugin",
+        stats: { downloads: 0, stars: 0, installs: 0, versions: 0 },
+      },
     ];
     const ctx = {
       db: {
@@ -7914,6 +7923,7 @@ describe("publisher bootstrap", () => {
       "Skill 3",
       "Skill 2",
       "Skill 1",
+      "Staged Plugin",
     ]);
   });
 

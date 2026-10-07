@@ -340,6 +340,7 @@ type PublisherPublishedRows = {
 async function getPublisherPublishedRows(
   ctx: Pick<QueryCtx, "db">,
   publisherId: Id<"publishers">,
+  options?: { includeUnpublishedPackages?: boolean },
 ): Promise<PublisherPublishedRows> {
   const [skills, packages] = await Promise.all([
     ctx.db
@@ -357,7 +358,9 @@ async function getPublisherPublishedRows(
   ]);
   return {
     skills: skills.filter(isPublicPublishedSkill),
-    packages: packages.filter((pkg) => !hasNoPublishedPackageVersions(pkg)),
+    packages: options?.includeUnpublishedPackages
+      ? packages
+      : packages.filter((pkg) => !hasNoPublishedPackageVersions(pkg)),
   };
 }
 
@@ -2327,7 +2330,9 @@ async function toPublisherDeletionInventory(
   publisher: Doc<"publishers">,
 ) {
   if (!(await getPublicPublisherVisibility(ctx, publisher))) return null;
-  const rows = await getPublisherPublishedRows(ctx, publisher._id);
+  const rows = await getPublisherPublishedRows(ctx, publisher._id, {
+    includeUnpublishedPackages: true,
+  });
   const stats = getIndexedPublisherStatsFromRows(rows);
   return {
     handle: publisher.handle,
