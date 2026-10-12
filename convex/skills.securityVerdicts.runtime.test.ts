@@ -60,14 +60,6 @@ it("withholds pending and blocked including deleted rows through query and HTTP"
       body: JSON.stringify({ items: [{ slug: "review-fixture", version: state.version }] }),
     });
     const body = await response.json();
-    console.log(
-      JSON.stringify({
-        version: state.version,
-        queryVersion: result?.version,
-        httpStatus: response.status,
-        body,
-      }),
-    );
     expect(response.status).toBe(200);
     if (
       ["pending", "blocked", "pending-deleted", "blocked-deleted", "missing"].includes(
