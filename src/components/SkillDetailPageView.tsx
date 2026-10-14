@@ -25,7 +25,7 @@ import { ActivityMetricLabel } from "./ActivityMetricLabel";
 import { DetailHero, DetailPageShell, DETAIL_HERO_TOPIC_LIMIT } from "./DetailPageShell";
 import { DetailSecuritySummaryLabel } from "./DetailSecuritySummary";
 import { useDownloadsSidebarMetricBlock } from "./DownloadsMetricCard";
-import { InlineCodeSummary } from "./InlineCodeSummary";
+import { InlineMarkdownSummary } from "./InlineMarkdownSummary";
 import { SidebarMetadata } from "./SidebarMetadata";
 import { buildSkillHref } from "./skillDetailUtils";
 import { SkillCommandLineCard } from "./SkillInstallSurface";
@@ -123,6 +123,7 @@ function getGitHubRepositoryLink(skill: SkillDetailViewSkill) {
   return (
     <a
       href={`https://github.com/${repo}`}
+      data-analytics-public-detail=""
       target="_blank"
       rel="noopener noreferrer"
       className="plugin-external-link"
@@ -378,9 +379,8 @@ export function SkillDetailPageView({
             <div className="pending-banner-content">
               <strong>Security scan in progress</strong>
               <p>
-                Your skill is being scanned by VirusTotal. It will be visible to others once the
-                scan completes. This usually takes up to 5 minutes — grab a coffee or exfoliate your
-                shell while you wait.
+                Your skill is undergoing security checks. It will be visible to others once the
+                checks complete.
               </p>
             </div>
           </div>
@@ -542,8 +542,9 @@ export function SkillDetailPageView({
                     className={`section-subtitle skill-summary-line${
                       hasSummaryToggle && !isSummaryExpanded ? " line-clamp-2" : ""
                     }`}
+                    data-analytics-public-detail=""
                   >
-                    <InlineCodeSummary>{headerDescription}</InlineCodeSummary>
+                    <InlineMarkdownSummary>{headerDescription}</InlineMarkdownSummary>
                   </p>
                   {hasSummaryToggle ? (
                     <button
@@ -557,7 +558,7 @@ export function SkillDetailPageView({
                   ) : null}
                 </div>
                 {creatorContent || owner || ownerHandle ? (
-                  <div className="skill-hero-creator">
+                  <div className="skill-hero-creator" data-analytics-public-detail="">
                     {creatorContent ?? (
                       <UserBadge
                         user={heroCreatorPublisher}

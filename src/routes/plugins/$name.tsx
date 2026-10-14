@@ -41,7 +41,7 @@ import {
 } from "../../components/DetailSecuritySummary";
 import { useDownloadsSidebarMetricBlock } from "../../components/DownloadsMetricCard";
 import { EmptyState } from "../../components/EmptyState";
-import { InlineCodeSummary } from "../../components/InlineCodeSummary";
+import { InlineMarkdownSummary } from "../../components/InlineMarkdownSummary";
 import { InstallCopyButton } from "../../components/InstallCopyButton";
 import { Container } from "../../components/layout/Container";
 import { MarkdownPreview } from "../../components/MarkdownPreview";
@@ -70,8 +70,7 @@ import {
   buildPluginCategoryBrowseHref,
   buildPluginTopicBrowseHref,
   formatCatalogTopicLabel,
-  PLUGIN_CATEGORIES,
-  resolvePluginBrowseCategorySlug,
+  getPluginCategoryBySlug,
 } from "../../lib/categories";
 import { formatRetryDelay } from "../../lib/formatRetryDelay";
 import { buildPluginMeta } from "../../lib/og";
@@ -192,11 +191,18 @@ export async function loadPluginDetail(requestedName: string): Promise<PluginDet
   }
 
   try {
+    let releaseVersion = detail.package.latestVersion;
+    let cursor: string | undefined;
+    // Beta-only packages have published releases but no stable/latest pointer.
+    while (!releaseVersion) {
+      const releases = await fetchPackageVersions(resolvedName, { limit: 1, cursor });
+      releaseVersion = releases.items[0]?.version;
+      if (releaseVersion || !releases.nextCursor) break;
+      cursor = releases.nextCursor;
+    }
     const [version, readme] = await Promise.all([
-      detail.package.latestVersion
-        ? fetchPackageVersion(resolvedName, detail.package.latestVersion)
-        : Promise.resolve(null),
-      fetchPackageReadme(resolvedName),
+      releaseVersion ? fetchPackageVersion(resolvedName, releaseVersion) : Promise.resolve(null),
+      releaseVersion ? fetchPackageReadme(resolvedName, releaseVersion) : Promise.resolve(null),
     ]);
 
     return { detail, version, versions: undefined, readme, rateLimited: null };
@@ -390,6 +396,7 @@ function PluginDetailTabs({
         className={`skill-readme-preview${
           isReadmeLong && !isReadmeExpanded ? " is-collapsed" : ""
         }`}
+        data-analytics-public-detail=""
       >
         <MarkdownPreview assetBaseUrl={readmeAssetBaseUrl}>{readme}</MarkdownPreview>
       </div>
@@ -1176,8 +1183,7 @@ function PluginDetailPageContent({ name, loaderData }: PluginDetailPageProps) {
   const pkg = detail.package;
   const headerCategories = (pkg.categories ?? [])
     .flatMap((value) => {
-      const slug = resolvePluginBrowseCategorySlug(value);
-      const category = PLUGIN_CATEGORIES.find((item) => item.slug === slug);
+      const category = getPluginCategoryBySlug(value);
       return category ? [category] : [];
     })
     .slice(0, 3);
@@ -1478,7 +1484,13 @@ function PluginDetailPageContent({ name, loaderData }: PluginDetailPageProps) {
           .replace(/^https?:\/\//, "")
           .replace(/\/$/, "");
         return (
-          <a href={href} target="_blank" rel="noopener noreferrer" className="plugin-external-link">
+          <a
+            href={href}
+            target="_blank"
+            rel="noopener noreferrer"
+            className="plugin-external-link"
+            data-analytics-public-detail=""
+          >
             <GitHubIcon />
             {display}
           </a>
@@ -1629,7 +1641,7 @@ function PluginDetailPageContent({ name, loaderData }: PluginDetailPageProps) {
                         <Sparkles size={14} />
                       </div>
                       <span className="plugin-catalog-empty-alert-title">
-                        Categorize your plugin
+                        Add topics to your plugin
                       </span>
                       <span className="skill-hero-taxonomy-separator" aria-hidden="true" />
                       <Button
@@ -1637,11 +1649,11 @@ function PluginDetailPageContent({ name, loaderData }: PluginDetailPageProps) {
                         variant="link"
                         size="xs"
                         className="plugin-catalog-empty-alert-cta"
-                        aria-label="Add categories and topics"
+                        aria-label="Add topics"
                         onClick={() => setIsCatalogMetadataDialogOpen(true)}
                       >
                         <Plus size={13} aria-hidden="true" />
-                        Add categories & topics
+                        Add topics
                       </Button>
                     </div>
                   </div>
@@ -1692,7 +1704,7 @@ function PluginDetailPageContent({ name, loaderData }: PluginDetailPageProps) {
                           variant="link"
                           size="xs"
                           className="plugin-catalog-empty-alert-cta"
-                          aria-label="Edit categories and topics"
+                          aria-label="Edit topics"
                           onClick={() => setIsCatalogMetadataDialogOpen(true)}
                         >
                           <Pencil size={13} aria-hidden="true" />
@@ -1718,8 +1730,9 @@ function PluginDetailPageContent({ name, loaderData }: PluginDetailPageProps) {
                   className={`section-subtitle skill-summary-line${
                     hasSummaryToggle && !isSummaryExpanded ? " line-clamp-2" : ""
                   }`}
+                  data-analytics-public-detail=""
                 >
-                  <InlineCodeSummary>{headerSummary}</InlineCodeSummary>
+                  <InlineMarkdownSummary>{headerSummary}</InlineMarkdownSummary>
                 </p>
                 {hasSummaryToggle ? (
                   <button
@@ -1733,7 +1746,9 @@ function PluginDetailPageContent({ name, loaderData }: PluginDetailPageProps) {
                 ) : null}
               </div>
               {pluginHeroCreator ? (
-                <div className="skill-hero-creator">{pluginHeroCreator}</div>
+                <div className="skill-hero-creator" data-analytics-public-detail="">
+                  {pluginHeroCreator}
+                </div>
               ) : null}
 
               {rateLimited?.scope === "metadata" ? (
@@ -1852,20 +1867,18 @@ function PluginDetailPageContent({ name, loaderData }: PluginDetailPageProps) {
         <Dialog open={isCatalogMetadataDialogOpen} onOpenChange={setIsCatalogMetadataDialogOpen}>
           <DialogContent className="plugin-catalog-metadata-dialog">
             <DialogHeader>
-              <DialogTitle>Categorize this plugin</DialogTitle>
-              <DialogDescription>
-                Select up to 3 categories and add topics to organize this plugin.
-              </DialogDescription>
+              <DialogTitle>Edit plugin topics</DialogTitle>
+              <DialogDescription>Add topics to make this plugin easier to find.</DialogDescription>
             </DialogHeader>
             <CatalogMetadataEditor
               kind="plugin"
+              showCategories={false}
               categories={manageContext.package.categories}
               suggestedCategories={manageContext.suggestedCategories}
               topics={manageContext.package.topics}
               onSave={async (value) => {
                 await setCatalogMetadata({
                   packageId: manageContext.package._id,
-                  categories: value.categories,
                   topics: value.topics,
                 });
                 toast.success("Catalog metadata updated.");

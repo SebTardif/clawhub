@@ -1,11 +1,61 @@
-import { describe, expect, it } from "vitest";
+/* @vitest-environment node */
+
+import { mkdirSync, mkdtempSync, rmSync, statSync } from "node:fs";
+import { createServer } from "node:net";
+import { join } from "node:path";
+import { describe, expect, it, vi } from "vitest";
 import {
+  buildLocalAuthBackendEnv,
   buildLocalAuthTrendingSnapshotArgs,
+  createLocalAuthTempDir,
   resolveLocalAuthDeployment,
+  resolveLocalAuthExternalNodeDependencies,
   resolveLocalAuthRunnerConfig,
 } from "./playwright-local-auth-config";
 
 describe("playwright local-auth runner config", () => {
+  it.skipIf(process.platform === "win32")(
+    "shortens a deep same-volume TMPDIR for Unix sockets",
+    async () => {
+      const parent = mkdtempSync(join(process.cwd(), ".auth-scratch-test-"));
+      const deepTemp = join(parent, "nested-".repeat(20));
+      mkdirSync(deepTemp);
+      vi.stubEnv("TMPDIR", deepTemp);
+      const server = createServer();
+      let scratch: string | undefined;
+      try {
+        scratch = createLocalAuthTempDir();
+        expect(statSync(scratch).dev).toBe(statSync(process.cwd()).dev);
+        const socketPath = join(scratch, "node-executor.sock");
+        expect(Buffer.byteLength(socketPath)).toBeLessThan(100);
+        await new Promise<void>((resolve, reject) => {
+          server.once("error", reject);
+          server.listen(socketPath, resolve);
+        });
+      } finally {
+        if (server.listening) await new Promise<void>((resolve) => server.close(() => resolve()));
+        vi.unstubAllEnvs();
+        if (scratch) rmSync(scratch, { recursive: true, force: true });
+        rmSync(parent, { recursive: true, force: true });
+      }
+    },
+  );
+
+  it("sets backend timeouts without bypassing npm cache staleness checks", () => {
+    expect(buildLocalAuthBackendEnv({})).toEqual({
+      HTTP_SERVER_TIMEOUT_SECONDS: "900",
+      FUNRUN_ISOLATE_ACTIVE_THREADS: "2",
+      npm_config_fetch_timeout: "60000",
+      npm_config_fetch_retries: "5",
+    });
+  });
+
+  it("preserves an explicit unlimited isolate override for runtime diagnosis", () => {
+    expect(buildLocalAuthBackendEnv({ FUNRUN_ISOLATE_ACTIVE_THREADS: "0" })).toMatchObject({
+      FUNRUN_ISOLATE_ACTIVE_THREADS: "0",
+    });
+  });
+
   it("defaults local-auth Convex to the anonymous deployment marker", () => {
     expect(resolveLocalAuthDeployment(undefined, null)).toBe("anonymous:anonymous-agent");
     expect(resolveLocalAuthDeployment(undefined, undefined)).toBe("anonymous:anonymous-agent");
@@ -94,4 +144,76 @@ describe("playwright local-auth runner config", () => {
       },
     });
   });
+});
+
+describe("local-auth external Node dependencies", () => {
+  function resolveFromFiles(files: Record<string, unknown>) {
+    return resolveLocalAuthExternalNodeDependencies({
+      readFile: (path) => {
+        if (!(path in files)) throw new Error(`Missing file: ${path}`);
+        return JSON.stringify(files[path]);
+      },
+    });
+  }
+
+  it("pins explicit package names to their installed versions, including scoped packages", () => {
+    expect(
+      resolveFromFiles({
+        "convex.json": { node: { externalPackages: ["sharp", "@example/native"] } },
+        "node_modules/sharp/package.json": { version: "0.35.3" },
+        "node_modules/@example/native/package.json": { version: "1.2.3" },
+      }),
+    ).toEqual([
+      { name: "sharp", version: "0.35.3" },
+      { name: "@example/native", version: "1.2.3" },
+    ]);
+  });
+
+  it.each([
+    { externalPackages: ["*"] },
+    { externalPackages: ["sharp", "*"] },
+    { externalPackages: ["sharp", 42] },
+    { externalPackages: [null] },
+    { externalPackages: [""] },
+    { externalPackages: "sharp" },
+  ])("skips non-explicit external package lists: $externalPackages", (node) => {
+    expect(
+      resolveFromFiles({
+        "convex.json": { node },
+        "node_modules/sharp/package.json": { version: "0.35.3" },
+      }),
+    ).toEqual([]);
+  });
+
+  it("returns no dependencies when convex.json is missing", () => {
+    expect(resolveFromFiles({})).toEqual([]);
+  });
+
+  it.each([{}, { node: {} }, null])(
+    "returns no dependencies without externalPackages: %j",
+    (config) => {
+      expect(resolveFromFiles({ "convex.json": config })).toEqual([]);
+    },
+  );
+
+  it("skips a missing package.json while resolving the other installed packages", () => {
+    expect(
+      resolveFromFiles({
+        "convex.json": { node: { externalPackages: ["missing", "sharp"] } },
+        "node_modules/sharp/package.json": { version: "0.35.3" },
+      }),
+    ).toEqual([{ name: "sharp", version: "0.35.3" }]);
+  });
+
+  it.each([{}, { version: 42 }, { version: "" }, null])(
+    "skips packages without a version: %j",
+    (pkg) => {
+      expect(
+        resolveFromFiles({
+          "convex.json": { node: { externalPackages: ["sharp"] } },
+          "node_modules/sharp/package.json": pkg,
+        }),
+      ).toEqual([]);
+    },
+  );
 });

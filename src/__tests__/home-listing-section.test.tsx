@@ -36,6 +36,7 @@ vi.mock("../convex/client", () => ({
 
 vi.mock("../../convex/_generated/api", () => ({
   api: {
+    featuredSkills: { listPublic: "featuredSkills:listPublic" },
     skills: {
       listPublicPageV4: "skills:listPublicPageV4",
       listPublicTrendingPage: "skills:listPublicTrendingPage",
@@ -64,7 +65,7 @@ const featuredPlugin = {
   channel: "community" as const,
   isOfficial: false,
   summary: "Runs workflows.",
-  icon: "https://example.com/demo-plugin.png",
+  icon: `/api/v1/skill-icons/${"a".repeat(64)}`,
   createdAt: 1,
   updatedAt: 2,
   latestVersion: "1.0.0",
@@ -87,8 +88,19 @@ function initialPluginListing({
 }
 
 function renderSkillsListing() {
-  const result = render(<HomeListingSection initialListing={initialPluginListing()} />);
-  fireEvent.click(screen.getByRole("button", { name: "Skills" }));
+  const result = render(
+    <HomeListingSection
+      initialListing={{
+        kind: "skills",
+        tab: "trending",
+        categorySlugs: [],
+        fetchLimit: 20,
+        items: [],
+        hasMore: false,
+        trendingState: "empty",
+      }}
+    />,
+  );
   fireEvent.click(screen.getByRole("tab", { name: "New" }));
   return result;
 }
@@ -156,8 +168,8 @@ describe("HomeListingSection", () => {
     const searchPanel = document.querySelector(".browse-search-panel");
     expect(toolbar?.nextElementSibling).toBe(searchPanel);
     expect(Array.from(contentTypeButtons, (button) => button.textContent)).toEqual([
-      "Skills",
       "Plugins",
+      "Skills",
     ]);
     expect(screen.getByRole("button", { name: "Plugins" }).getAttribute("aria-pressed")).toBe(
       "true",
@@ -167,6 +179,7 @@ describe("HomeListingSection", () => {
     );
     expect(screen.getAllByRole("tab").map((tab) => tab.textContent)).toEqual([
       "Featured",
+      "Trending",
       "Official",
       "New",
     ]);
@@ -195,31 +208,200 @@ describe("HomeListingSection", () => {
     expect(screen.getByRole("button", { name: "Close search" })).toBeTruthy();
   });
 
-  it("keeps the initial Skills skeleton iconless", () => {
-    fetchCatalogDiscoveryCapabilitiesMock.mockReturnValue(new Promise(() => {}));
+  it("defaults to Plugins without loader data and selects Featured first when switching to Skills", async () => {
+    render(<HomeListingSection />);
+    expect(screen.getByRole("button", { name: "Plugins" }).getAttribute("aria-pressed")).toBe(
+      "true",
+    );
+    expect(screen.getByRole("tab", { name: "Featured" }).getAttribute("aria-selected")).toBe(
+      "true",
+    );
+    await screen.findByText("Demo Plugin");
+    expect(convexQueryMock).not.toHaveBeenCalled();
+    fireEvent.click(screen.getByRole("tab", { name: "Official" }));
+    fireEvent.click(screen.getByRole("button", { name: "Skills" }));
+    expect(screen.getByRole("button", { name: "Skills" }).getAttribute("aria-pressed")).toBe(
+      "true",
+    );
+    expect(screen.getAllByRole("tab").map((tab) => tab.textContent)).toEqual([
+      "Featured",
+      "Trending",
+      "Official",
+      "New",
+    ]);
+    expect(screen.getByRole("tab", { name: "Featured" }).getAttribute("aria-selected")).toBe(
+      "true",
+    );
+    await screen.findByText("Demo Skill");
+  });
+
+  it("reports kind and tab switches for the URL without reporting the initial view", async () => {
+    const onViewChange = vi.fn();
+    render(
+      <HomeListingSection
+        initialListing={initialPluginListing()}
+        requestedView={{ kind: "plugins", tab: "featured" }}
+        onViewChange={onViewChange}
+      />,
+    );
+    await screen.findByText("Demo Plugin");
+    expect(onViewChange).not.toHaveBeenCalled();
+
+    fireEvent.click(screen.getByRole("tab", { name: "New" }));
+    expect(onViewChange).toHaveBeenLastCalledWith({ kind: "plugins", tab: "new" });
+    fireEvent.click(screen.getByRole("button", { name: "Skills" }));
+    expect(onViewChange).toHaveBeenLastCalledWith({ kind: "skills", tab: "featured" });
+    fireEvent.click(screen.getByRole("tab", { name: "Trending" }));
+    expect(onViewChange).toHaveBeenLastCalledWith({ kind: "skills", tab: "trending" });
+    expect(onViewChange).toHaveBeenCalledTimes(3);
+  });
+
+  it("opens the URL-requested view instead of a loader listing for another view", async () => {
+    render(
+      <HomeListingSection
+        initialListing={initialPluginListing()}
+        requestedView={{ kind: "skills", tab: "official" }}
+      />,
+    );
+
+    expect(screen.getByRole("button", { name: "Skills" }).getAttribute("aria-pressed")).toBe(
+      "true",
+    );
+    expect(screen.getByRole("tab", { name: "Official" }).getAttribute("aria-selected")).toBe(
+      "true",
+    );
+    expect(screen.queryByText("Demo Plugin")).toBeNull();
+    await screen.findByText("Demo Skill");
+    expect(convexQueryMock).toHaveBeenCalledWith(
+      "skills:listPublicPageV4",
+      expect.objectContaining({ officialOnly: true }),
+    );
+  });
+
+  it("follows outside URL changes without echoing them back", async () => {
+    const onViewChange = vi.fn();
+    const { rerender } = render(
+      <HomeListingSection
+        initialListing={initialPluginListing()}
+        requestedView={{ kind: "skills", tab: "new" }}
+        onViewChange={onViewChange}
+      />,
+    );
+    await screen.findByText("Demo Skill");
+
+    rerender(
+      <HomeListingSection
+        initialListing={initialPluginListing()}
+        requestedView={{ kind: "plugins", tab: "featured" }}
+        onViewChange={onViewChange}
+      />,
+    );
+
+    expect(screen.getByRole("button", { name: "Plugins" }).getAttribute("aria-pressed")).toBe(
+      "true",
+    );
+    expect(screen.getByRole("tab", { name: "Featured" }).getAttribute("aria-selected")).toBe(
+      "true",
+    );
+    await screen.findByText("Demo Plugin");
+    expect(onViewChange).not.toHaveBeenCalled();
+  });
+
+  it("reports the Featured fallback when a requested Trending feed is unavailable", async () => {
+    const onViewChange = vi.fn();
+    render(
+      <HomeListingSection
+        initialListing={{
+          kind: "skills",
+          tab: "trending",
+          categorySlugs: [],
+          fetchLimit: 20,
+          items: [],
+          hasMore: false,
+          trendingState: "unavailable",
+        }}
+        requestedView={{ kind: "skills", tab: "trending" }}
+        onViewChange={onViewChange}
+      />,
+    );
+
+    expect(screen.getByRole("tab", { name: "Featured" }).getAttribute("aria-selected")).toBe(
+      "true",
+    );
+    expect(screen.queryByRole("tab", { name: "Trending" })).toBeNull();
+    expect(onViewChange).toHaveBeenCalledWith({ kind: "skills", tab: "featured" });
+    await screen.findByText("Demo Skill");
+  });
+
+  it("keeps the Skills skeleton iconless after switching from Plugins", () => {
+    convexQueryMock.mockReturnValue(new Promise(() => {}));
 
     render(<HomeListingSection />);
+    fireEvent.click(screen.getByRole("button", { name: "Skills" }));
 
+    expect(screen.getByRole("tab", { name: "Featured" }).getAttribute("aria-selected")).toBe(
+      "true",
+    );
     const loadingResults = screen.getByRole("status", { name: "Loading results" });
     expect(loadingResults.querySelector(".browse-results-skeleton-icon")).toBeNull();
     expect(loadingResults.querySelector(".browse-list-head-icon-spacer")).toBeNull();
-    expect(loadingResults.querySelectorAll(".skill-list-item-no-icon")).toHaveLength(6);
+    expect(loadingResults.querySelectorAll(".skill-listing-row")).toHaveLength(6);
+  });
+
+  it("counts settled shelf input once while excluding switches, pagination, and repeat whitespace", async () => {
+    convexActionMock.mockResolvedValue(
+      Array.from({ length: 20 }, (_, i) => ({
+        skill: {
+          _id: `skills:${i}`,
+          slug: `result-${i}`,
+          displayName: `Result ${i}`,
+          stats: { downloads: 1 },
+        },
+      })),
+    );
+    renderSkillsListing();
+    fireEvent.click(screen.getByRole("button", { name: "Search catalog" }));
+    const input = screen.getByRole("searchbox", { name: "Search skills" });
+    fireEvent.change(input, { target: { value: "l" } });
+    fireEvent.change(input, { target: { value: "local" } });
+    expect(convexActionMock).not.toHaveBeenCalled();
+    await screen.findByText("Result 0");
+    expect(convexActionMock.mock.calls.filter(([, args]) => args.searchSource)).toHaveLength(1);
+    fireEvent.change(input, { target: { value: "local " } });
+    fireEvent.click(screen.getByRole("button", { name: "Load more" }));
+    await waitFor(() => expect(convexActionMock).toHaveBeenCalledTimes(2));
+    fireEvent.click(screen.getByRole("tab", { name: "Official" }));
+    await waitFor(() => expect(convexActionMock).toHaveBeenCalledTimes(3));
+    fireEvent.click(screen.getByRole("combobox", { name: "Category" }));
+    fireEvent.click(screen.getByRole("radio", { name: "Development" }));
+    await waitFor(() => expect(convexActionMock).toHaveBeenCalledTimes(4));
+    expect(convexActionMock.mock.calls.filter(([, args]) => args.searchSource)).toHaveLength(1);
+    fireEvent.change(input, { target: { value: "pending" } });
+    fireEvent.click(screen.getByRole("tab", { name: "Featured" }));
+    await waitFor(() =>
+      expect(convexQueryMock).toHaveBeenCalledWith("featuredSkills:listPublic", {
+        query: "pending",
+      }),
+    );
+    expect(convexActionMock.mock.calls.filter(([, args]) => args.searchSource)).toHaveLength(1);
   });
 
   it("searches skills within the selected tab and category", async () => {
-    convexActionMock.mockResolvedValue([
-      {
-        skill: {
-          _id: "skills:featured-development",
-          slug: "featured-development",
-          displayName: "Featured Development Skill",
-          summary: "Builds software.",
-          categories: ["development"],
-          stats: { stars: 1, downloads: 10 },
+    convexQueryMock.mockResolvedValue({
+      page: [
+        {
+          skill: {
+            _id: "skills:featured-development",
+            slug: "featured-development",
+            displayName: "Featured Development Skill",
+            summary: "Builds software.",
+            categories: ["development"],
+            stats: { stars: 1, downloads: 10 },
+          },
+          ownerHandle: "builder",
         },
-        ownerHandle: "builder",
-      },
-    ]);
+      ],
+    });
 
     render(<HomeListingSection initialListing={initialPluginListing()} />);
     fireEvent.click(screen.getByRole("button", { name: "Skills" }));
@@ -232,11 +414,8 @@ describe("HomeListingSection", () => {
     });
 
     await waitFor(() => {
-      expect(convexActionMock).toHaveBeenCalledWith("search:searchNativeSkills", {
+      expect(convexQueryMock).toHaveBeenCalledWith("featuredSkills:listPublic", {
         query: "development",
-        limit: 20,
-        highlightedOnly: true,
-        categorySlug: "development",
       });
       expect(screen.getByText("Featured Development Skill")).toBeTruthy();
     });
@@ -321,6 +500,114 @@ describe("HomeListingSection", () => {
     expect(screen.getByRole("tab", { name: "Official" }).getAttribute("aria-selected")).toBe(
       "true",
     );
+  });
+
+  it("browses, searches, and restores cached plugin Trending without category or relevance sorting", async () => {
+    const ranked = Array.from({ length: 25 }, (_, index) => ({
+      ...featuredPlugin,
+      name: `ranked-${index}`,
+      displayName: `Ranked Plugin ${index}`,
+      summary: index === 0 || index === 24 ? "Calendar workflow" : "Other workflow",
+      updatedAt: index,
+    }));
+    fetchPluginCatalogMock.mockImplementation(
+      ({ cursor, limit }: { cursor?: string; limit: number }) => {
+        const start = cursor ? Number(cursor) : 0;
+        return Promise.resolve({
+          items: ranked.slice(start, start + limit),
+          nextCursor: start + limit < ranked.length ? String(start + limit) : null,
+        });
+      },
+    );
+    render(<HomeListingSection initialListing={initialPluginListing()} />);
+    fireEvent.click(screen.getByRole("combobox", { name: "Category" }));
+    fireEvent.click(screen.getByRole("radio", { name: "Channels" }));
+    fireEvent.click(screen.getByRole("tab", { name: "Trending" }));
+    expect(screen.queryByRole("combobox", { name: "Category" })).toBeNull();
+    await screen.findByText("Ranked Plugin 0");
+    expect(screen.queryByText("Ranked Plugin 24")).toBeNull();
+    fireEvent.click(screen.getByRole("button", { name: "Load more" }));
+    await screen.findByText("Ranked Plugin 24");
+    expect(screen.queryByRole("button", { name: "Load more" })).toBeNull();
+    expect(
+      Array.from(
+        document.querySelectorAll(".home-v2-listing-row-name"),
+        (node) => node.textContent,
+      ),
+    ).toEqual(ranked.map((item) => item.displayName));
+
+    fireEvent.click(screen.getByRole("button", { name: "Search catalog" }));
+    fireEvent.change(screen.getByRole("searchbox", { name: "Search plugins" }), {
+      target: { value: "calendar" },
+    });
+    await waitFor(() =>
+      expect(document.querySelectorAll(".home-v2-listing-row-name")).toHaveLength(2),
+    );
+    expect(screen.getByText("Ranked Plugin 0")).toBeTruthy();
+    expect(screen.getByText("Ranked Plugin 24")).toBeTruthy();
+    expect(fetchPluginCatalogMock).toHaveBeenLastCalledWith(
+      expect.objectContaining({ sort: "trending", limit: 100 }),
+    );
+    expect(fetchPluginCatalogMock.mock.calls.some(([args]) => args.q)).toBe(false);
+
+    fireEvent.click(screen.getByRole("button", { name: "Close search" }));
+    await screen.findByText("Ranked Plugin 19");
+    fireEvent.click(screen.getByRole("tab", { name: "Featured" }));
+    await screen.findByText("Demo Plugin");
+    expect(screen.getByRole("combobox", { name: "Category" }).textContent).toContain(
+      "All categories",
+    );
+    const callsBefore = fetchPluginCatalogMock.mock.calls.length;
+    fireEvent.click(screen.getByRole("tab", { name: "Trending" }));
+    await screen.findByText("Ranked Plugin 0");
+    expect(fetchPluginCatalogMock).toHaveBeenCalledTimes(callsBefore);
+  });
+
+  it("keeps plugin Trending rows visible when loading more fails", async () => {
+    fetchPluginCatalogMock.mockRejectedValue(new Error("Feed unavailable"));
+    render(
+      <HomeListingSection
+        initialListing={{ ...initialPluginListing(), tab: "trending", hasMore: true }}
+      />,
+    );
+    fireEvent.click(screen.getByRole("button", { name: "Load more" }));
+    await waitFor(() =>
+      expect(screen.getByRole("button", { name: "Load more" }).hasAttribute("disabled")).toBe(
+        false,
+      ),
+    );
+    expect(screen.getByText("Demo Plugin")).toBeTruthy();
+    expect(screen.queryByText("Listings took a coffee break")).toBeNull();
+  });
+
+  it("shows 24-hour downloads for plugin Trending instead of lifetime totals", () => {
+    render(
+      <HomeListingSection
+        initialListing={{
+          ...initialPluginListing(),
+          tab: "trending",
+          items: [
+            {
+              ...featuredPlugin,
+              trending24h: { downloads: 7, installs: 2, windowStart: 0, windowEnd: 86400000 },
+            },
+          ],
+        }}
+      />,
+    );
+    expect(document.querySelector(".home-v2-listing-row")?.textContent).toContain("7");
+    expect(document.querySelector(".home-v2-listing-row")?.textContent).not.toContain("120");
+  });
+
+  it("explains the 24-hour window when plugin Trending has no eligible activity", () => {
+    render(
+      <HomeListingSection
+        initialListing={{ ...initialPluginListing({ items: [] }), tab: "trending" }}
+      />,
+    );
+    expect(
+      screen.getByText("No plugins have eligible activity in the current 24-hour window."),
+    ).toBeTruthy();
   });
 
   it("passes New plugin eligibility into catalog search", async () => {
@@ -529,8 +816,8 @@ describe("HomeListingSection", () => {
   });
 
   it("reuses cached skill tabs instead of refetching when switching back", async () => {
-    convexQueryMock.mockImplementation((_name, args: { highlightedOnly?: boolean }) => {
-      const featured = args.highlightedOnly === true;
+    convexQueryMock.mockImplementation((name) => {
+      const featured = name === "featuredSkills:listPublic";
       return Promise.resolve({
         page: [
           {

@@ -1,4 +1,6 @@
 import { expect, test } from "@playwright/test";
+import { loadSmokeSkillFixture } from "../scripts/lib/smokeSkillFixture";
+import { buildPublisherProfileHref } from "../src/lib/ownerRoute";
 import { expectHealthyPage, trackRuntimeErrors, waitForHydration } from "./helpers/runtimeErrors";
 
 function escapeRegExp(value: string) {
@@ -59,26 +61,22 @@ test("skills browse can filter, change view, and open detail", async ({ page }) 
 });
 
 test("known public skill detail links to owner profile", async ({ page, request }) => {
-  const response = await request.get(seedApiUrl("/api/v1/skills/gifgrep"));
-  test.skip(!response.ok(), "gifgrep fixture missing");
-
-  const payload = (await response.json()) as {
-    owner?: { handle?: string | null };
-    skill?: { slug?: string | null };
-  };
-  const ownerHandle = payload.owner?.handle?.trim();
-  const slug = payload.skill?.slug?.trim();
-
-  test.skip(!ownerHandle || !slug, "gifgrep fixture missing owner handle or slug");
+  const payload = await loadSmokeSkillFixture(async (path) => {
+    const response = await request.get(seedApiUrl(path));
+    return { status: response.status(), json: () => response.json() };
+  });
+  const ownerHandle = payload.owner.handle;
+  const slug = payload.skill.slug;
 
   const errors = trackRuntimeErrors(page);
   await page.goto(`/${ownerHandle}/${slug}`, { waitUntil: "domcontentloaded" });
-  const ownerLink = page.locator(`a[href="/user/${ownerHandle}"]`).first();
+  const ownerHref = buildPublisherProfileHref(ownerHandle);
+  const ownerLink = page.getByRole("link", { name: /^View .* profile$/ }).first();
 
-  await expect(ownerLink).toHaveAttribute("href", new RegExp(`/user/${ownerHandle}$`));
+  await expect(ownerLink).toHaveAttribute("href", ownerHref);
   await waitForHydration(page);
   await ownerLink.click();
-  await expect(page).toHaveURL(new RegExp(`/user/${ownerHandle}$`));
+  await expect(page).toHaveURL(new RegExp(`${escapeRegExp(ownerHref)}$`));
   await expect(page.getByRole("region", { name: "Publisher catalog" })).toBeVisible();
   await expect(page.locator(".skill-card, .skill-list-item").first()).toBeVisible();
   await expectHealthyPage(page, errors);
@@ -87,7 +85,7 @@ test("known public skill detail links to owner profile", async ({ page, request 
 test("plugins browse can search, change view, and open detail", async ({ page }) => {
   const errors = trackRuntimeErrors(page);
 
-  await page.goto("/plugins", { waitUntil: "domcontentloaded" });
+  await page.goto("/plugins?sort=downloads", { waitUntil: "domcontentloaded" });
   await expect(page.getByRole("heading", { name: /^Plugins/ })).toBeVisible();
   await waitForHydration(page);
   await expect(page.locator(".skill-card, .skill-list-item").first()).toBeVisible();
@@ -96,20 +94,22 @@ test("plugins browse can search, change view, and open detail", async ({ page })
   await expect(page).toHaveURL(/view=grid/);
   await expect(page.locator(".skill-card").first()).toBeVisible();
 
+  await page.getByRole("button", { name: "Search plugins", exact: true }).click();
   const searchInput = page.getByPlaceholder("Search plugins...");
   await searchInput.fill("security");
+  await searchInput.press("Enter");
   await expect(page).toHaveURL(/q=security/);
   await expect(page.getByText("Unable to load plugins")).toHaveCount(0);
   await expect(page.locator(".skill-card, .skill-list-item, .empty-state").first()).toBeVisible();
 
-  await page.getByRole("button", { name: "Clear plugin search" }).click();
+  await page.getByRole("button", { name: "Close search" }).click();
   await expect(page).not.toHaveURL(/q=security/);
   await expect(page.locator(".skill-card, .skill-list-item").first()).toBeVisible();
 
-  const firstPlugin = page.locator("a.skill-card, a.skill-list-item").first();
+  const firstPlugin = page.getByRole("link", { name: /^Plugin:/ }).first();
   await expect(firstPlugin).toBeVisible();
   const href = await firstPlugin.getAttribute("href");
-  expect(href).toMatch(/^\/plugins\//);
+  expect(href).toMatch(/^\/(?:[^/]+\/)?plugins\//);
 
   await firstPlugin.scrollIntoViewIfNeeded();
   await firstPlugin.click();

@@ -1,5 +1,5 @@
 import { createFileRoute, useNavigate, useSearch } from "@tanstack/react-router";
-import { DocsLinks, getPackageScopeOwnerMismatch, isPluginCategorySlug } from "clawhub-schema";
+import { DocsLinks, getPackageScopeOwnerMismatch } from "clawhub-schema";
 import { useAction, useMutation, useQuery } from "convex/react";
 import { ExternalLink, Info, Lock } from "lucide-react";
 import { type ReactNode, startTransition, useEffect, useMemo, useRef, useState } from "react";
@@ -35,6 +35,7 @@ import { Input } from "../../components/ui/input";
 import { Label } from "../../components/ui/label";
 import { Textarea } from "../../components/ui/textarea";
 import { VersionInput } from "../../components/VersionInput";
+import { captureAnalyticsOperation, emitAnalytics } from "../../lib/analyticsEvents";
 import {
   detectRelativeReadmeAssets,
   type RelativeReadmeAssetReport,
@@ -262,6 +263,7 @@ export function PublishPluginRoute() {
     search.family === "bundle-plugin" ? "bundle-plugin" : "code-plugin",
   );
   const [name, setName] = useState(search.name ?? "");
+  const analyticsFormStarted = useRef(false);
   const [displayName, setDisplayName] = useState(search.displayName ?? "");
   const [ownerHandle, setOwnerHandle] = useState(search.ownerHandle ?? "");
   const [version, setVersion] = useState(search.nextVersion ?? "0.1.0");
@@ -269,10 +271,7 @@ export function PublishPluginRoute() {
   const changelogTouchedRef = useRef(false);
   const changelogRequestRef = useRef(0);
   const changelogKeyRef = useRef<string | null>(null);
-  const [categories, setCategories] = useState<string[]>([]);
-  const [suggestedCategories, setSuggestedCategories] = useState<string[]>();
   const [topics, setTopics] = useState("");
-  const categoriesTouchedRef = useRef(false);
   const topicsTouchedRef = useRef(false);
   const [sourceRepo, setSourceRepo] = useState(search.sourceRepo ?? "");
   const [sourceCommit, setSourceCommit] = useState("");
@@ -459,7 +458,6 @@ export function PublishPluginRoute() {
     const prefill = await derivePluginPrefill(normalized);
     setDetectedPrefillFields(listPrefilledFields(prefill));
     setCodePluginFieldIssues(prefill.missingRequiredFields ?? []);
-    setSuggestedCategories(prefill.suggestedCategories);
     if (prefill.family === "code-plugin") setFamily(prefill.family);
     if (prefill.name) setName(prefill.name);
     if (prefill.displayName) setDisplayName(prefill.displayName);
@@ -475,7 +473,6 @@ export function PublishPluginRoute() {
     setIgnoredPaths([]);
     setDetectedPrefillFields([]);
     setCodePluginFieldIssues([]);
-    setSuggestedCategories(undefined);
     changelogRequestRef.current += 1;
     changelogKeyRef.current = null;
     if (!changelogTouchedRef.current) setChangelog("");
@@ -502,15 +499,6 @@ export function PublishPluginRoute() {
 
   useEffect(() => {
     if (!existing?.package) return;
-    if (!categoriesTouchedRef.current) {
-      const nextCategories = (existing.package.categories ?? []).filter(isPluginCategorySlug);
-      setCategories((current) =>
-        current.length === nextCategories.length &&
-        current.every((category, index) => category === nextCategories[index])
-          ? current
-          : nextCategories,
-      );
-    }
     if (!topicsTouchedRef.current) {
       const nextTopics = formatCatalogTopicsInput(existing.package.topics ?? []);
       setTopics((current) => (current === nextTopics ? current : nextTopics));
@@ -583,7 +571,15 @@ export function PublishPluginRoute() {
 
   if (!isAuthenticated || !me) {
     return (
-      <main className="py-10">
+      <main
+        onFocusCapture={() => {
+          if (!analyticsFormStarted.current) {
+            analyticsFormStarted.current = true;
+            emitAnalytics("form_start", { form_id: "plugin_publish", ui_location: "publish" });
+          }
+        }}
+        className="py-10"
+      >
         <Container size="narrow">
           <EmptyState
             title="Sign in to publish a plugin"
@@ -732,14 +728,10 @@ export function PublishPluginRoute() {
                   <CatalogMetadataFields
                     kind="plugin"
                     presentation="publish"
-                    categories={categories}
-                    suggestedCategories={suggestedCategories}
+                    showCategories={false}
+                    categories={[]}
                     topics={topics}
                     disabled={metadataDisabled}
-                    onCategoriesChange={(nextCategories) => {
-                      categoriesTouchedRef.current = true;
-                      setCategories(nextCategories);
-                    }}
                     onTopicsChange={(nextTopics) => {
                       topicsTouchedRef.current = true;
                       setTopics(nextTopics);
@@ -987,8 +979,18 @@ export function PublishPluginRoute() {
                 onClick={() => {
                   startTransition(() => {
                     void (async () => {
+                      const operation = captureAnalyticsOperation("plugin_publish");
                       try {
+                        emitAnalytics("form_attempt", {
+                          form_id: "plugin_publish",
+                          ui_location: "publish",
+                        });
                         if (validationError) {
+                          emitAnalytics("form_validation_error", {
+                            form_id: "plugin_publish",
+                            field_name: "form",
+                            error_code: "invalid",
+                          });
                           toast.error(validationError);
                           return;
                         }
@@ -1021,9 +1023,6 @@ export function PublishPluginRoute() {
                             family,
                             version: version.trim(),
                             changelog: changelog.trim(),
-                            ...(categories.length || categoriesTouchedRef.current
-                              ? { categories }
-                              : {}),
                             ...(topics.trim() || topicsTouchedRef.current
                               ? { topics: parseCatalogTopicsInput(topics) }
                               : {}),
@@ -1057,6 +1056,13 @@ export function PublishPluginRoute() {
                           },
                         });
                         const publishResult = parsePluginPublishResult(result);
+                        // The server has accepted the artifact, not confirmed a public release.
+                        operation?.emit("resource_action", {
+                          action: "publish",
+                          content_type: "plugin",
+                          action_result: "accepted",
+                          ui_location: "publish",
+                        });
                         const submittedPackageName =
                           publishResult.packageName ?? canonicalDraftName;
                         const existingPluginHasPage = Boolean(
@@ -1093,6 +1099,12 @@ export function PublishPluginRoute() {
                           });
                         }
                       } catch (publishError) {
+                        operation?.emit("resource_action", {
+                          action: "publish",
+                          content_type: "plugin",
+                          action_result: "error",
+                          ui_location: "publish",
+                        });
                         const message = formatPublishError(publishError);
                         setError(message);
                         if (!isPluginInspectorPublishError(message)) {

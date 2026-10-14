@@ -10,6 +10,8 @@ import {
   syncPackageSearchDigestForPackageId,
 } from "./functions";
 import { assertRole, requireUserFromAction } from "./lib/access";
+import { assertFeaturedCapacity } from "./lib/featuredPolicy";
+import { resolvePackageIcon } from "./lib/packageIcons";
 import { extractPackageDigestFields } from "./lib/packageSearchDigest";
 import {
   derivePersonalPublisherHandle,
@@ -22,6 +24,7 @@ import {
 import { recomputePublisherStats } from "./lib/publisherStats";
 import { buildSkillSummaryBackfillPatch, type ParsedSkillData } from "./lib/skillBackfill";
 import { isSkillCardPath } from "./lib/skillCards";
+import { isHostedSkillPresentationIconPath } from "./lib/skillPresentation";
 import {
   computeQualitySignals,
   evaluateQuality,
@@ -32,11 +35,307 @@ import { getFrontmatterValue, hashSkillFiles } from "./lib/skills";
 import { computeIsSuspicious } from "./lib/skillSafety";
 import { getFirstSearchToken, getMirrorFirstSearchToken } from "./lib/skillSearchDigest";
 import { generateSkillSummary } from "./lib/skillSummary";
+import { ACTIVE_PUBLISH_ATTEMPT_STATUSES } from "./publishAttempts";
 
 const DEFAULT_BATCH_SIZE = 50;
 const MAX_BATCH_SIZE = 200;
 const DEFAULT_MAX_BATCHES = 20;
 const MAX_MAX_BATCHES = 200;
+
+type PluginIconCandidate = {
+  packageId: Id<"packages">;
+  name: string;
+  ownerPublisherId?: Id<"publishers">;
+  release: Doc<"packageReleases">;
+  icon?: string;
+  trustedSource: boolean;
+};
+
+export const listPluginIconRepairCandidatesInternal = internalQuery({
+  args: {
+    family: v.union(v.literal("code-plugin"), v.literal("bundle-plugin")),
+    cursor: v.union(v.string(), v.null()),
+    limit: v.number(),
+  },
+  handler: async (ctx, args) => {
+    const page = await ctx.db
+      .query("packages")
+      .withIndex("by_active_family_recommended_score", (q) =>
+        q.eq("softDeletedAt", undefined).eq("family", args.family),
+      )
+      .paginate({ cursor: args.cursor, numItems: clampInt(args.limit, 1, 25) });
+    const candidates: PluginIconCandidate[] = [];
+    for (const pkg of page.page) {
+      if (isHostedSkillPresentationIconPath(pkg.icon) || !pkg.latestReleaseId) continue;
+      const release = await ctx.db.get(pkg.latestReleaseId);
+      if (
+        !release ||
+        release.softDeletedAt !== undefined ||
+        (release.publicationStatus && release.publicationStatus !== "published")
+      )
+        continue;
+      const owner = pkg.ownerPublisherId ? await ctx.db.get(pkg.ownerPublisherId) : null;
+      candidates.push({
+        packageId: pkg._id,
+        name: pkg.normalizedName,
+        ownerPublisherId: pkg.ownerPublisherId,
+        release,
+        icon: pkg.icon,
+        trustedSource:
+          pkg.normalizedName.startsWith("@openclaw/") &&
+          owner?.handle === "openclaw" &&
+          isPublisherActive(owner),
+      });
+    }
+    return {
+      candidates,
+      scanned: page.page.length,
+      cursor: page.continueCursor,
+      isDone: page.isDone,
+    };
+  },
+});
+
+export const applyPluginIconRepairInternal = internalMutation({
+  args: {
+    packageId: v.id("packages"),
+    releaseId: v.id("packageReleases"),
+    ownerPublisherId: v.optional(v.id("publishers")),
+    icon: v.string(),
+    expectedIcon: v.optional(v.string()),
+  },
+  handler: async (ctx, args) => {
+    if (!isHostedSkillPresentationIconPath(args.icon)) throw new ConvexError("Invalid plugin icon");
+    const pkg = await ctx.db.get(args.packageId);
+    const release = await ctx.db.get(args.releaseId);
+    // A concurrent publish, ownership change, or deletion invalidates the prepared repair.
+    if (
+      !pkg ||
+      isHostedSkillPresentationIconPath(pkg.icon) ||
+      pkg.icon !== args.expectedIcon ||
+      pkg.softDeletedAt !== undefined ||
+      pkg.latestReleaseId !== args.releaseId ||
+      pkg.ownerPublisherId !== args.ownerPublisherId ||
+      !release ||
+      release.packageId !== pkg._id ||
+      release.softDeletedAt !== undefined ||
+      (release.publicationStatus && release.publicationStatus !== "published")
+    )
+      return false;
+    await ctx.db.patch(release._id, {
+      icon: args.icon,
+      ...(release.pluginManifestSummary
+        ? { pluginManifestSummary: { ...release.pluginManifestSummary, icon: args.icon } }
+        : {}),
+    });
+    await ctx.db.patch(pkg._id, {
+      icon: args.icon,
+      ...(pkg.latestVersionSummary
+        ? { latestVersionSummary: { ...pkg.latestVersionSummary, icon: args.icon } }
+        : {}),
+    });
+    return true;
+  },
+});
+
+// Storage reads, GitHub fetches and raster decoding require an action. Keep this repair
+// bounded and cursor-resumable instead of scheduling untracked actions from migrateOne.
+export const repairPluginIconsInternal = internalAction({
+  args: {
+    family: v.optional(v.union(v.literal("code-plugin"), v.literal("bundle-plugin"))),
+    cursor: v.optional(v.union(v.string(), v.null())),
+    limit: v.optional(v.number()),
+    dryRun: v.optional(v.boolean()),
+  },
+  handler: async (
+    ctx,
+    args,
+  ): Promise<{
+    scanned: number;
+    matched: number;
+    patched: number;
+    cursor: string;
+    isDone: boolean;
+    dryRun: boolean;
+    samples: Array<{ name: string; icon: string }>;
+  }> => {
+    const dryRun = args.dryRun !== false;
+    const page = await ctx.runQuery(internal.maintenance.listPluginIconRepairCandidatesInternal, {
+      family: args.family ?? "code-plugin",
+      cursor: args.cursor ?? null,
+      limit: args.limit ?? 10,
+    });
+    const samples: Array<{ name: string; icon: string }> = [];
+    let patched = 0;
+    for (const candidate of page.candidates) {
+      const icon = isHostedSkillPresentationIconPath(candidate.release.icon)
+        ? candidate.release.icon
+        : await resolvePackageIcon(ctx, {
+            files: candidate.release.files,
+            ...(candidate.trustedSource ? { trustedSource: candidate.release.verification } : {}),
+            dryRun,
+          });
+      if (!icon) continue;
+      samples.push({ name: candidate.name, icon });
+      if (
+        !dryRun &&
+        (await ctx.runMutation(internal.maintenance.applyPluginIconRepairInternal, {
+          packageId: candidate.packageId,
+          releaseId: candidate.release._id,
+          ownerPublisherId: candidate.ownerPublisherId,
+          expectedIcon: candidate.icon,
+          icon,
+        }))
+      )
+        patched += 1;
+    }
+    return {
+      scanned: page.scanned,
+      matched: samples.length,
+      patched,
+      cursor: page.cursor,
+      isDone: page.isDone,
+      dryRun,
+      samples,
+    };
+  },
+});
+
+type StalePackagePublishAttempt = {
+  attemptId: Id<"publishAttempts">;
+  slug: string;
+  version: string;
+  status: Doc<"publishAttempts">["status"];
+  packageId: Id<"packages">;
+  releaseId: Id<"packageReleases">;
+  createdNewParent: boolean;
+  createdAt: number;
+  lastError: string | null;
+  releasePublicationStatus: Doc<"packageReleases">["publicationStatus"] | null;
+};
+
+export const listStalePackagePublishAttemptsInternal = internalQuery({
+  args: {
+    version: v.string(),
+    slugPrefix: v.optional(v.string()),
+    limit: v.optional(v.number()),
+    attemptIds: v.optional(v.array(v.id("publishAttempts"))),
+  },
+  handler: async (ctx, args): Promise<StalePackagePublishAttempt[]> => {
+    // Large attempt rows exhausted 16 MiB at ~600 reads. Share a 200-row default
+    // budget across statuses; point reads let operators target attempts beyond it.
+    const limit = clampInt(args.limit ?? 200, 1, 500);
+    const attempts: Doc<"publishAttempts">[] = [];
+    if (args.attemptIds) {
+      const ids = [...new Set(args.attemptIds)];
+      if (ids.length > limit) throw new ConvexError(`At most ${limit} attemptIds are allowed`);
+      for (const id of ids) {
+        const attempt = await ctx.db.get(id);
+        if (attempt) attempts.push(attempt);
+      }
+    } else {
+      for (const status of ACTIVE_PUBLISH_ATTEMPT_STATUSES) {
+        if (attempts.length === limit) break;
+        attempts.push(
+          ...(await ctx.db
+            .query("publishAttempts")
+            .withIndex("by_status_and_created", (q) => q.eq("status", status))
+            .take(limit - attempts.length)),
+        );
+      }
+    }
+    const candidates: StalePackagePublishAttempt[] = [];
+    for (const attempt of attempts) {
+      if (
+        attempt.kind !== "package" ||
+        attempt.version !== args.version ||
+        !attempt.packageId ||
+        !attempt.packageReleaseId ||
+        !ACTIVE_PUBLISH_ATTEMPT_STATUSES.some((status) => status === attempt.status) ||
+        (args.slugPrefix !== undefined && !attempt.slug.startsWith(args.slugPrefix))
+      )
+        continue;
+      const release = await ctx.db.get(attempt.packageReleaseId);
+      candidates.push({
+        attemptId: attempt._id,
+        slug: attempt.slug,
+        version: attempt.version,
+        status: attempt.status,
+        packageId: attempt.packageId,
+        releaseId: attempt.packageReleaseId,
+        createdNewParent: attempt.createdNewParent ?? false,
+        createdAt: attempt.createdAt,
+        lastError: attempt.finalizationLastError ?? attempt.checkClaimLastError ?? null,
+        releasePublicationStatus: release?.publicationStatus ?? null,
+      });
+    }
+    return candidates;
+  },
+});
+
+const discardStalePackagePublishAttemptsArgs = {
+  version: v.string(),
+  slugPrefix: v.optional(v.string()),
+  attemptIds: v.optional(v.array(v.id("publishAttempts"))),
+  reason: v.string(),
+  dryRun: v.optional(v.boolean()),
+};
+type DiscardStalePackagePublishAttemptsResult = {
+  dryRun: boolean;
+  candidates: StalePackagePublishAttempt[];
+  discarded: Array<{
+    attemptId: Id<"publishAttempts">;
+    releaseDeleted: boolean;
+    parentDeleted: boolean;
+  }>;
+};
+
+export const discardStalePackagePublishAttemptsInternal = internalAction({
+  args: discardStalePackagePublishAttemptsArgs,
+  handler: async (ctx, args): Promise<DiscardStalePackagePublishAttemptsResult> => {
+    const reason = args.reason.trim();
+    if (!reason) throw new ConvexError("Reason is required");
+    if (reason.length > 500) throw new ConvexError("Reason too long (max 500 chars)");
+    const dryRun = args.dryRun !== false;
+    const candidates: StalePackagePublishAttempt[] = await ctx.runQuery(
+      internal.maintenance.listStalePackagePublishAttemptsInternal,
+      { version: args.version, slugPrefix: args.slugPrefix, attemptIds: args.attemptIds },
+    );
+    const discarded: DiscardStalePackagePublishAttemptsResult["discarded"] = [];
+    if (!dryRun) {
+      for (const candidate of candidates) {
+        const result = await ctx.runMutation(
+          internal.packages.discardPendingPackagePublicationInternal,
+          {
+            packageId: candidate.packageId,
+            releaseId: candidate.releaseId,
+            createdNewParent: candidate.createdNewParent,
+            reason,
+            attemptId: candidate.attemptId,
+          },
+        );
+        if (result.retiredAttemptIds.includes(candidate.attemptId)) {
+          discarded.push({
+            attemptId: candidate.attemptId,
+            releaseDeleted: result.deleted,
+            parentDeleted: result.parentDeleted ?? false,
+          });
+        }
+      }
+    }
+    return { dryRun, candidates, discarded };
+  },
+});
+
+export const discardStalePackagePublishAttempts = action({
+  args: discardStalePackagePublishAttemptsArgs,
+  handler: async (ctx, args): Promise<DiscardStalePackagePublishAttemptsResult> => {
+    const { user } = await requireUserFromAction(ctx);
+    assertRole(user, ["admin"]);
+    return ctx.runAction(internal.maintenance.discardStalePackagePublishAttemptsInternal, args);
+  },
+});
+
 const DEFAULT_EMPTY_SKILL_MAX_README_BYTES = 8000;
 const DEFAULT_EMPTY_SKILL_NOMINATION_THRESHOLD = 3;
 const PLATFORM_SKILL_LICENSE = "MIT-0" as const;
@@ -1617,8 +1916,8 @@ export const upsertSkillBadgeRecordInternal = internalMutation({
     at: v.number(),
   },
   handler: async (ctx, args) => {
+    const skill = await ctx.db.get(args.skillId);
     const syncDenormalizedBadge = async () => {
-      const skill = await ctx.db.get(args.skillId);
       if (!skill) return;
       await ctx.db.patch(args.skillId, {
         badges: {
@@ -1635,6 +1934,15 @@ export const upsertSkillBadgeRecordInternal = internalMutation({
     if (existing) {
       await syncDenormalizedBadge();
       return { inserted: false as const };
+    }
+    // Restore persisted legacy membership even above the cap. Only a new
+    // selection consumes capacity; an upgrade must not silently drop selections.
+    if (
+      args.kind === "highlighted" &&
+      !skill?.badges?.highlighted &&
+      skill?.batch !== "highlighted"
+    ) {
+      await assertFeaturedCapacity(ctx, "skill");
     }
     await ctx.db.insert("skillBadges", {
       skillId: args.skillId,

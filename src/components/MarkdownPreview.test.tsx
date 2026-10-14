@@ -240,6 +240,8 @@ describe("MarkdownPreview — syntax highlighting", () => {
       { timeout: 8000 },
     );
 
+    expect(container.querySelector("code")?.className).toContain("language-ts");
+    expect(container.querySelector(".markdown-code-block-language")?.textContent).toBe("ts");
     // Raw code text must still be present after highlighting
     expect(container.querySelector("pre")?.textContent).toContain("const x");
   });
@@ -289,6 +291,14 @@ describe("MarkdownPreview — syntax highlighting", () => {
 });
 
 describe("MarkdownPreview — sanitization of malicious HTML", () => {
+  it("does not let user Markdown opt into or replace application analytics ownership", () => {
+    const container = renderMarkdown(
+      '<div data-analytics-public-detail=""><a href="https://example.test/" data-analytics-selection-owner="promotion">Resource</a></div>',
+    );
+    expect(container.querySelector("a")?.getAttribute("href")).toBe("https://example.test/");
+    expect(container.querySelector("[data-analytics-public-detail]")).toBeNull();
+    expect(container.querySelector("[data-analytics-selection-owner]")).toBeNull();
+  });
   it("strips <script> tags", () => {
     const container = renderMarkdown(`hello<script>window.__pwn = 1;</script>world`);
     expect(container.querySelector("script")).toBeNull();

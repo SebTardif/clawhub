@@ -7,10 +7,42 @@ import type { PackageListItem } from "../lib/packageApi";
 import { PluginListItem } from "./PluginListItem";
 
 vi.mock("@tanstack/react-router", () => ({
-  Link: ({ children, to }: { children?: ReactNode; to?: string }) => <a href={to}>{children}</a>,
+  Link: ({ children, to, ...props }: { children?: ReactNode; to?: string }) => (
+    <a href={to} {...props}>
+      {children}
+    </a>
+  ),
 }));
 
 describe("PluginListItem", () => {
+  it.each(["list", "card"] as const)(
+    "renders complete Markdown links separately from %s navigation",
+    (variant) => {
+      const { container } = render(
+        <PluginListItem
+          item={makePlugin({
+            summary:
+              "Connect with [Microsoft Teams](https://example.com/" +
+              "long-path/".repeat(20) +
+              ") and **collaborate**.",
+          })}
+          variant={variant}
+        />,
+      );
+      expect(screen.getByRole("link", { name: "Plugin: Demo Plugin" }).getAttribute("href")).toBe(
+        "/local/plugins/demo-plugin",
+      );
+      expect(screen.getByRole("link", { name: "Microsoft Teams" }).getAttribute("href")).toBe(
+        "https://example.com/" + "long-path/".repeat(20),
+      );
+      expect(container.querySelector("a a")).toBeNull();
+      expect(container.querySelector("strong")?.textContent).toBe("collaborate");
+      expect(container.querySelector(".plugin-summary")?.textContent).toBe(
+        "Connect with Microsoft Teams and collaborate.",
+      );
+    },
+  );
+
   it("renders official list plugins with the compact official mark", () => {
     render(<PluginListItem item={makePlugin()} />);
 
@@ -25,6 +57,28 @@ describe("PluginListItem", () => {
     expect(screen.getByLabelText("Official")).toBeTruthy();
     expect(screen.queryByText("Official")).toBeNull();
     expect(screen.queryByText("Verified")).toBeNull();
+  });
+
+  it.each(["list", "card"] as const)(
+    "shows publisher badges on community %s plugins",
+    (variant) => {
+      render(
+        <PluginListItem
+          item={makePlugin({ isOfficial: false, channel: "community", ownerOfficial: true })}
+          variant={variant}
+        />,
+      );
+      expect(screen.getByLabelText("Official")).toBeTruthy();
+    },
+  );
+
+  it("leaves unverified community publishers unbadged", () => {
+    render(
+      <PluginListItem
+        item={makePlugin({ isOfficial: false, channel: "community", ownerOfficial: false })}
+      />,
+    );
+    expect(screen.queryByLabelText("Official")).toBeNull();
   });
 
   it("renders author topics", () => {
@@ -59,28 +113,60 @@ describe("PluginListItem", () => {
     expect(screen.getByLabelText("Categories")).toBeTruthy();
   });
 
-  it("renders a plugin manifest icon URL with safe image attributes", () => {
+  it("renders a hosted bundled plugin icon with safe image attributes", () => {
     render(
       <PluginListItem
-        item={makePlugin({ icon: "https://cdn.example.test/icons/demo.svg" })}
+        item={makePlugin({
+          icon: `/api/v1/skill-icons/${"a".repeat(64)}`,
+          ownerImage: "https://example.test/publisher.png",
+        })}
         variant="card"
       />,
     );
 
     const image = document.querySelector<HTMLImageElement>(".marketplace-icon-image");
     expect(image).toBeTruthy();
-    expect(image?.getAttribute("src")).toBe("https://cdn.example.test/icons/demo.svg");
+    expect(image?.getAttribute("src")).toBe(`/api/v1/skill-icons/${"a".repeat(64)}`);
     expect(image?.getAttribute("referrerpolicy")).toBe("no-referrer");
     expect(image?.getAttribute("loading")).toBe("lazy");
     expect(image?.getAttribute("decoding")).toBe("async");
   });
 
-  it("falls back to the default plugin glyph when a manifest icon fails to load", () => {
+  it.each(["list", "card"] as const)(
+    "uses the publisher profile image without a bundled icon in the %s variant",
+    (variant) => {
+      const { container } = render(
+        <PluginListItem
+          item={makePlugin({
+            icon: "https://composio.dev/favicon.ico",
+            ownerImage: "https://avatars.githubusercontent.com/u/128464815?v=4",
+          })}
+          variant={variant}
+        />,
+      );
+      expect(container.querySelector("img")?.getAttribute("src")).toBe(
+        "https://avatars.githubusercontent.com/u/128464815?v=4",
+      );
+    },
+  );
+
+  it("falls back to the category glyph when the publisher image fails to load", () => {
+    const { container } = render(
+      <PluginListItem
+        item={makePlugin({ categories: ["models"], ownerImage: "https://example.test/broken.png" })}
+      />,
+    );
+    fireEvent.error(container.querySelector("img")!);
+    expect(container.querySelector("img")).toBeNull();
+    expect(container.querySelector(".lucide-brain")).toBeTruthy();
+  });
+
+  it("falls back to the category glyph when a bundled icon fails to load", () => {
     render(
       <PluginListItem
         item={makePlugin({
           categories: ["models"],
-          icon: "https://cdn.example.test/broken.svg",
+          icon: `/api/v1/skill-icons/${"b".repeat(64)}`,
         })}
       />,
     );

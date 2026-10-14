@@ -1,13 +1,16 @@
 import { Link } from "@tanstack/react-router";
-import { isPluginCategorySlug, PLUGIN_CATEGORY_DEFINITIONS } from "clawhub-schema";
+import { isPluginCategorySlug } from "clawhub-schema";
 import { Download } from "lucide-react";
+import { emitAnalytics, publicAnalyticsContentId } from "../lib/analyticsEvents";
 import { BrowseCategoryIcon } from "../lib/browseCategoryIcons";
+import { getPluginCategoryBySlug } from "../lib/categories";
 import { formatCompactStat } from "../lib/numberFormat";
 import type { PackageListItem } from "../lib/packageApi";
 import { buildPluginDetailHref } from "../lib/pluginRoutes";
 import { presentationTitle } from "../lib/presentationTitle";
 import { PUBLIC_CATALOG_NAME_PREVIEW_LENGTH, truncateText } from "../lib/truncateText";
 import { CatalogTopicList } from "./CatalogTopicList";
+import { InlineMarkdownSummary } from "./InlineMarkdownSummary";
 import { MarketplaceIcon } from "./MarketplaceIcon";
 import { OfficialBadge } from "./OfficialBadge";
 
@@ -18,18 +21,12 @@ type PluginListItemProps = {
   showOfficialBadge?: boolean;
 };
 
-const PLUGIN_CATEGORIES_BY_SLUG = new Map(
-  PLUGIN_CATEGORY_DEFINITIONS.map((category) => [category.slug, category]),
-);
-
 function getPluginTaxonomyDisplay(item: PackageListItem) {
   const topics = (item.topics ?? []).filter((topic) => topic.trim());
   if (topics.length > 0) return { labels: topics, ariaLabel: "Topics" };
 
   const categories = (item.categories ?? []).flatMap((category) => {
-    return isPluginCategorySlug(category) && PLUGIN_CATEGORIES_BY_SLUG.has(category)
-      ? [category]
-      : [];
+    return isPluginCategorySlug(category) && getPluginCategoryBySlug(category) ? [category] : [];
   });
   return { labels: categories, ariaLabel: "Categories" };
 }
@@ -37,7 +34,7 @@ function getPluginTaxonomyDisplay(item: PackageListItem) {
 function getPluginCategories(item: PackageListItem) {
   return (item.categories ?? []).flatMap((slug) => {
     if (!isPluginCategorySlug(slug)) return [];
-    const category = PLUGIN_CATEGORIES_BY_SLUG.get(slug);
+    const category = getPluginCategoryBySlug(slug);
     return category ? [category] : [];
   });
 }
@@ -48,25 +45,37 @@ export function PluginListItem({
   href,
   showOfficialBadge = true,
 }: PluginListItemProps) {
+  const isOfficial = item.isOfficial || item.ownerOfficial === true;
   const downloads = formatCompactStat(item.stats?.downloads ?? 0);
   const taxonomy = getPluginTaxonomyDisplay(item);
   const categories = getPluginCategories(item);
   const primaryCategory = categories[0] ?? null;
   const pluginHref = href ?? buildPluginDetailHref(item.name, { ownerHandle: item.ownerHandle });
   const displayName = presentationTitle(item.displayName, item.name);
+  const recordSelection = () => {
+    if (item.channel === "official" || item.channel === "community")
+      emitAnalytics("select_content", {
+        content_type: "plugin",
+        content_id: publicAnalyticsContentId("plugin", item.name),
+        ui_location: "catalog",
+      });
+  };
 
   if (variant === "card") {
     return (
-      <Link
-        to={pluginHref}
-        className="card skill-card plugin-card"
-        aria-label={`Plugin: ${displayName}`}
-      >
+      <div className="card skill-card plugin-card plugin-summary-item">
+        <Link
+          to={pluginHref}
+          onClick={recordSelection}
+          className="plugin-detail-link"
+          aria-label={`Plugin: ${displayName}`}
+        />
         <div className="skill-card-header">
           <MarketplaceIcon
             kind="plugin"
             label={displayName}
             imageUrl={item.icon}
+            publisherImageUrl={item.ownerImage}
             categorySlug={primaryCategory?.slug}
             size="md"
           />
@@ -78,12 +87,14 @@ export function PluginListItem({
               <span className="skill-card-owner">
                 {item.ownerHandle ? `@${item.ownerHandle}` : "community"}
               </span>
-              {showOfficialBadge && item.isOfficial ? <OfficialBadge /> : null}
+              {showOfficialBadge && isOfficial ? <OfficialBadge /> : null}
             </span>
           </div>
         </div>
-        <p className="skill-card-summary">
-          {truncateText(item.summary ?? "Plugin package for agent workflows.", 100)}
+        <p className="skill-card-summary plugin-summary">
+          <InlineMarkdownSummary>
+            {item.summary ?? "Plugin package for agent workflows."}
+          </InlineMarkdownSummary>
         </p>
         <CatalogTopicList topics={taxonomy.labels} limit={2} ariaLabel={taxonomy.ariaLabel} />
         <div className="skill-card-footer">
@@ -107,16 +118,23 @@ export function PluginListItem({
             ) : null}
           </div>
         </div>
-      </Link>
+      </div>
     );
   }
 
   return (
-    <Link to={pluginHref} className="skill-list-item" aria-label={`Plugin: ${displayName}`}>
+    <div className="skill-list-item plugin-summary-item">
+      <Link
+        to={pluginHref}
+        onClick={recordSelection}
+        className="plugin-detail-link"
+        aria-label={`Plugin: ${displayName}`}
+      />
       <MarketplaceIcon
         kind="plugin"
         label={displayName}
         imageUrl={item.icon}
+        publisherImageUrl={item.ownerImage}
         categorySlug={primaryCategory?.slug}
       />
       <div className="skill-list-item-body">
@@ -129,11 +147,13 @@ export function PluginListItem({
               <span className="skill-list-item-owner">@{item.ownerHandle}</span>
             ) : null}
           </span>
-          {showOfficialBadge && item.isOfficial ? <OfficialBadge /> : null}
+          {showOfficialBadge && isOfficial ? <OfficialBadge /> : null}
           <CatalogTopicList topics={taxonomy.labels} limit={2} ariaLabel={taxonomy.ariaLabel} />
         </div>
-        <p className="skill-list-item-summary">
-          {truncateText(item.summary ?? "Plugin package for agent workflows.", 80)}
+        <p className="skill-list-item-summary plugin-summary">
+          <InlineMarkdownSummary>
+            {item.summary ?? "Plugin package for agent workflows."}
+          </InlineMarkdownSummary>
         </p>
       </div>
       <div className="skill-list-item-meta">
@@ -141,6 +161,6 @@ export function PluginListItem({
           <Download size={14} aria-hidden="true" /> {downloads}
         </span>
       </div>
-    </Link>
+    </div>
   );
 }

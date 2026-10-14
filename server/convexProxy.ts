@@ -15,6 +15,8 @@ import {
   ARCHIVE_REQUEST_IDENTITY_HEADER,
   CLAWHUB_VERCEL_PROJECT,
   CLAWHUB_VERCEL_TEAM,
+  STAGING_CONVEX_SITE_ORIGIN,
+  STAGING_EDGE_SECRET_HEADER,
 } from "../convex/lib/clawhubVercelOidc";
 import {
   buildDeterministicZipStream,
@@ -24,6 +26,7 @@ import {
   validateFilePath,
   validateSlug,
 } from "../convex/lib/skillZip";
+import { VERIFIED_CLIENT_IP_HEADER } from "../convex/lib/verifiedClientIp";
 import { convexDeploymentName, resolveConvexSiteUrl } from "../src/lib/convexDeploymentUrl";
 
 const ARCHIVE_MANIFEST_REQUEST_HEADER = "x-clawhub-archive-manifest";
@@ -52,9 +55,11 @@ const ARCHIVE_REPRESENTATION_HEADERS = [
 ] as const;
 
 type ProxyEnv = {
+  CLAWHUB_STAGING_EDGE_SECRET?: string;
   CONVEX_URL?: string;
   VERCEL_ENV?: string;
   VERCEL_TARGET_ENV?: string;
+  VITE_APP_BUILD_SHA?: string;
   VITE_CLAWHUB_DEPLOY_ENV?: string;
   VITE_CONVEX_SITE_URL?: string;
   VITE_CONVEX_URL?: string;
@@ -73,6 +78,7 @@ const DEFAULT_PROXY_DEPENDENCIES: ProxyDependencies = {
 const archiveJwksByOrigin = new Map<string, ReturnType<typeof createRemoteJWKSet>>();
 
 const BUNDLED_PROXY_ENV: ProxyEnv = {
+  VITE_APP_BUILD_SHA: import.meta.env.VITE_APP_BUILD_SHA,
   VITE_CLAWHUB_DEPLOY_ENV: import.meta.env.VITE_CLAWHUB_DEPLOY_ENV,
   VITE_CONVEX_SITE_URL: import.meta.env.VITE_CONVEX_SITE_URL,
   VITE_CONVEX_URL: import.meta.env.VITE_CONVEX_URL,
@@ -84,6 +90,7 @@ export function resolveConvexProxyEnv(
 ): ProxyEnv {
   return {
     ...runtimeEnv,
+    ...(bundledEnv.VITE_APP_BUILD_SHA ? { VITE_APP_BUILD_SHA: bundledEnv.VITE_APP_BUILD_SHA } : {}),
     ...(bundledEnv.VITE_CLAWHUB_DEPLOY_ENV
       ? { VITE_CLAWHUB_DEPLOY_ENV: bundledEnv.VITE_CLAWHUB_DEPLOY_ENV }
       : {}),
@@ -104,6 +111,12 @@ function isTestFrontend(env: ProxyEnv) {
   const targetEnvironment =
     env.VITE_CLAWHUB_DEPLOY_ENV?.trim() || env.VERCEL_TARGET_ENV?.trim() || env.VERCEL_ENV?.trim();
   return targetEnvironment === "test";
+}
+
+function isStagingFrontend(env: ProxyEnv) {
+  const targetEnvironment =
+    env.VITE_CLAWHUB_DEPLOY_ENV?.trim() || env.VERCEL_TARGET_ENV?.trim() || env.VERCEL_ENV?.trim();
+  return targetEnvironment === "staging";
 }
 
 export function isConvexProxyMethodAllowed(method: string, env: ProxyEnv) {
@@ -139,29 +152,51 @@ export async function proxyConvexRequest(
 
   const requestUrl = getRequestURL(event);
   const target = buildConvexProxyTarget(`${requestUrl.pathname}${requestUrl.search}`, env);
+  const stagingFrontend = isStagingFrontend(env);
+  const stagingTarget = new URL(target).origin === STAGING_CONVEX_SITE_ORIGIN;
+  const stagingEdgeSecret =
+    stagingFrontend && stagingTarget ? env.CLAWHUB_STAGING_EDGE_SECRET?.trim() : undefined;
+  if (
+    stagingFrontend &&
+    (!stagingTarget ||
+      !stagingEdgeSecret ||
+      stagingEdgeSecret.length < 32 ||
+      stagingEdgeSecret.length > 256)
+  ) {
+    return new Response("ClawHub staging edge identity unavailable", {
+      status: 503,
+      headers: { "Cache-Control": "no-store" },
+    });
+  }
   const isArchiveRequest = isArchivePath(new URL(target).pathname);
   let archiveRequestToken: string | undefined;
-  if (isArchiveRequest) {
+  const isVercelRuntime = env.VERCEL_ENV === "production" || env.VERCEL_ENV === "preview";
+  if (isArchiveRequest || isVercelRuntime) {
     try {
       archiveRequestToken = await dependencies.getArchiveRequestToken();
     } catch {
-      return new Response("Archive streaming identity unavailable", {
+      return new Response("ClawHub edge identity unavailable", {
         status: 503,
         headers: { "Cache-Control": "no-store" },
       });
     }
   }
+  // Vercel overwrites this header at ingress. Never forward a visitor's chosen
+  // ClawHub IP/identity headers, including when running outside Vercel.
+  const clientIp = isVercelRuntime
+    ? (
+        event.req.headers.get("x-vercel-forwarded-for") ?? event.req.headers.get("x-forwarded-for")
+      )?.trim()
+    : undefined;
   const proxied = await proxyRequest(event, target, {
-    ...(isArchiveRequest
-      ? {
-          fetchOptions: {
-            headers: {
-              [ARCHIVE_MANIFEST_REQUEST_HEADER]: "v1",
-              [ARCHIVE_REQUEST_IDENTITY_HEADER]: archiveRequestToken!,
-            },
-          },
-        }
-      : {}),
+    fetchOptions: {
+      headers: {
+        [ARCHIVE_REQUEST_IDENTITY_HEADER]: archiveRequestToken ?? "",
+        [STAGING_EDGE_SECRET_HEADER]: stagingEdgeSecret ?? "",
+        [VERIFIED_CLIENT_IP_HEADER]: clientIp ?? "",
+        ...(isArchiveRequest ? { [ARCHIVE_MANIFEST_REQUEST_HEADER]: "v1" } : {}),
+      },
+    },
   });
   // H3's HTTPResponse is not guaranteed to share Nitro's bundled class identity.
   // Normalize it before crossing that boundary or Nitro can stringify the wrapper.
@@ -178,6 +213,7 @@ export async function proxyConvexRequest(
       target,
       event.req.signal,
       dependencies.verifyArchiveManifest,
+      (promise) => event.waitUntil(promise),
     );
   }
   if (
@@ -186,15 +222,7 @@ export async function proxyConvexRequest(
   ) {
     return new Response("Invalid or expired archive manifest", { status: 502 });
   }
-  if (isPreviewFrontend(env) || isTestFrontend(env)) {
-    const deployment = convexDeploymentName(target);
-    if (deployment) {
-      response.headers.set(
-        isTestFrontend(env) ? "X-ClawHub-Test-Backend" : "X-ClawHub-Preview-Backend",
-        deployment,
-      );
-    }
-  }
+  addDeploymentProofHeader(response, env, target);
   return response;
 }
 
@@ -212,6 +240,7 @@ async function streamArchive(
   target: string,
   signal: AbortSignal,
   verifyArchiveManifest: ProxyDependencies["verifyArchiveManifest"],
+  waitUntil: (promise: Promise<unknown>) => void,
 ) {
   let value: unknown;
   try {
@@ -248,11 +277,11 @@ async function streamArchive(
 
   let metricRecorded = false;
   const recordMetric = () => {
-    if (metricRecorded || !manifest.metricToken) return;
+    if (metricRecorded || !manifest.metricToken || signal.aborted) return;
     metricRecorded = true;
     const controller = new AbortController();
     const timeout = setTimeout(() => controller.abort(), ARCHIVE_METRIC_FETCH_TIMEOUT_MS);
-    void fetch(new URL("/api/internal/archive-download-metric", target), {
+    const metric = fetch(new URL("/api/internal/archive-download-metric", target), {
       method: "POST",
       headers: { "content-type": "application/jose" },
       body: manifest.metricToken,
@@ -264,6 +293,8 @@ async function streamArchive(
       .finally(() => {
         clearTimeout(timeout);
       });
+    // Keep the bounded POST alive when the hosted response finishes.
+    waitUntil(metric);
   };
 
   const stream = buildDeterministicZipStream(
@@ -271,11 +302,12 @@ async function streamArchive(
       path: entry.path,
       openStream: async () => {
         const response = await fetch(entry.url, { redirect: "error", signal });
-        if (response.status === 404) return null;
+        if (response.status === 404) {
+          throw new Error("Signed archive entry disappeared after manifest creation");
+        }
         if (!response.ok || !response.body) {
           throw new Error(`Failed to fetch archive entry: ${response.status}`);
         }
-        recordMetric();
         return response.body;
       },
     })),
@@ -285,16 +317,17 @@ async function streamArchive(
   for (const name of ARCHIVE_REPRESENTATION_HEADERS) headers.delete(name);
   headers.set("content-type", "application/zip");
   headers.set("content-disposition", `attachment; filename="${manifest.filename}"`);
-  const response = new Response(stream, { status: 200, headers });
-  if (isPreviewFrontend(env) || isTestFrontend(env)) {
-    const deployment = convexDeploymentName(target);
-    if (deployment) {
-      response.headers.set(
-        isTestFrontend(env) ? "X-ClawHub-Test-Backend" : "X-ClawHub-Preview-Backend",
-        deployment,
-      );
-    }
-  }
+  // Only complete archives count. Keep the original capability expiry: a slow
+  // successful download may outlive its best-effort metric, never its bytes.
+  const completedStream = stream.pipeThrough(
+    new TransformStream<Uint8Array, Uint8Array>({
+      flush() {
+        recordMetric();
+      },
+    }),
+  );
+  const response = new Response(completedStream, { status: 200, headers });
+  addDeploymentProofHeader(response, env, target);
   return response;
 }
 
@@ -479,13 +512,24 @@ function archiveResponseHeaders(manifestResponse: Response, filename: string) {
 }
 
 function addDeploymentProofHeader(response: Response, env: ProxyEnv, target: string) {
-  if (!isPreviewFrontend(env) && !isTestFrontend(env)) return;
+  const header = isTestFrontend(env)
+    ? "X-ClawHub-Test-Backend"
+    : isStagingFrontend(env)
+      ? "X-ClawHub-Staging-Backend"
+      : isPreviewFrontend(env)
+        ? "X-ClawHub-Preview-Backend"
+        : null;
+  if (!header) return;
   const deployment = convexDeploymentName(target);
   if (!deployment) return;
-  response.headers.set(
-    isTestFrontend(env) ? "X-ClawHub-Test-Backend" : "X-ClawHub-Preview-Backend",
-    deployment,
-  );
+  response.headers.set(header, deployment);
+  if (isStagingFrontend(env)) {
+    response.headers.delete("X-ClawHub-Staging-Build-SHA");
+    const buildSha = env.VITE_APP_BUILD_SHA?.trim();
+    if (buildSha && /^[0-9a-f]{40}$/.test(buildSha)) {
+      response.headers.set("X-ClawHub-Staging-Build-SHA", buildSha);
+    }
+  }
 }
 
 async function readBoundedArchiveManifest(response: Response) {

@@ -23,11 +23,20 @@ import {
 import { useEffect, useMemo, useRef, useState } from "react";
 import { api } from "../../convex/_generated/api";
 import {
+  emitPublicSearchSubmission,
+  emitAnalytics,
+  publicAnalyticsContentId,
+} from "../lib/analyticsEvents";
+import {
   getUserFacingAuthError,
   isBannedAccountAuthError,
   routeToBannedAccountPage,
 } from "../lib/authErrorMessage";
 import { gravatarUrl } from "../lib/gravatar";
+import {
+  navigateWithManualCatalogSearch,
+  type ManualCatalogSearch,
+} from "../lib/manualCatalogSearch";
 import { PRIMARY_NAV_ITEMS, SECONDARY_NAV_ITEMS } from "../lib/nav-items";
 import { buildPublisherProfileHref, buildSkillDetailHref } from "../lib/ownerRoute";
 import { buildPluginDetailHref, displayPluginPackageName } from "../lib/pluginRoutes";
@@ -141,11 +150,11 @@ export default function Header() {
     isAuthenticated && me ? {} : "skip",
   );
   const [navSearchQuery, setNavSearchQuery] = useState("");
+  const manualCatalogSearchRef = useRef<ManualCatalogSearch | null>(null);
   const [typeaheadOpen, setTypeaheadOpen] = useState(false);
   const [typeaheadActiveIndex, setTypeaheadActiveIndex] = useState(0);
   const [mobileSearchOpen, setMobileSearchOpen] = useState(false);
   const [mobileMenuOpen, setMobileMenuOpen] = useState(false);
-  const [headerScrolled, setHeaderScrolled] = useState(false);
   const searchWrapRef = useRef<HTMLDivElement | null>(null);
   const mobileSearchWrapRef = useRef<HTMLDivElement | null>(null);
   const mobileSearchTriggerRef = useRef<HTMLButtonElement | null>(null);
@@ -161,7 +170,11 @@ export default function Header() {
     pluginResults,
     creatorResults,
     isSearching: typeaheadSearching,
+    pluginSearchError,
+    skillSearchError,
   } = useUnifiedSearch(navSearchQuery, "all", {
+    manualCatalogSearch: manualCatalogSearchRef.current,
+    detectPluginHasMore: false,
     debounceMs: 180,
     enabled: typeaheadOpen && hasNavSearchQuery,
     limits: { skills: 4, plugins: 4, creators: 4 },
@@ -221,7 +234,7 @@ export default function Header() {
   }, [creatorResults, hasNavSearchQuery, trimmedNavSearchQuery]);
 
   const typeaheadItems = useMemo(
-    () => [...typeaheadSkillItems, ...typeaheadPluginItems, ...typeaheadCreatorItems],
+    () => [...typeaheadPluginItems, ...typeaheadSkillItems, ...typeaheadCreatorItems],
     [typeaheadCreatorItems, typeaheadPluginItems, typeaheadSkillItems],
   );
   const activeTypeaheadItem = showTypeahead ? typeaheadItems[typeaheadActiveIndex] : undefined;
@@ -250,26 +263,6 @@ export default function Header() {
     document.addEventListener("pointerdown", handlePointerDown);
     return () => document.removeEventListener("pointerdown", handlePointerDown);
   }, [typeaheadOpen, mobileSearchOpen]);
-
-  useEffect(() => {
-    const threshold = 8;
-    let frame = 0;
-    const update = () => {
-      frame = 0;
-      setHeaderScrolled(window.scrollY > threshold);
-    };
-    const onScroll = () => {
-      if (frame) return;
-      frame = window.requestAnimationFrame(update);
-    };
-
-    update();
-    window.addEventListener("scroll", onScroll, { passive: true });
-    return () => {
-      window.removeEventListener("scroll", onScroll);
-      if (frame) window.cancelAnimationFrame(frame);
-    };
-  }, [location.pathname]);
 
   useEffect(() => {
     const onKeyDown = (event: KeyboardEvent) => {
@@ -301,14 +294,27 @@ export default function Header() {
     setMode(next);
   };
 
+  const handleNavSearchChange = (value: string) => {
+    const query = value.trim();
+    if (query !== trimmedNavSearchQuery) {
+      manualCatalogSearchRef.current = { query, consumed: {} };
+    }
+    setNavSearchQuery(value);
+    setTypeaheadOpen(true);
+  };
+
+  const openSearchResults = (type?: TypeaheadSection) => {
+    if (type !== "creators")
+      emitPublicSearchSubmission(trimmedNavSearchQuery, type ?? "all", "header");
+    void navigateWithManualCatalogSearch(manualCatalogSearchRef.current, () =>
+      navigate({ to: "/search", search: { q: trimmedNavSearchQuery, type } }),
+    );
+  };
+
   const handleNavSearch = (e: React.FormEvent) => {
     e.preventDefault();
-    const q = navSearchQuery.trim();
-    if (!q) return;
-    void navigate({
-      to: "/search",
-      search: { q, type: undefined },
-    });
+    if (!trimmedNavSearchQuery) return;
+    openSearchResults();
     setNavSearchQuery("");
     setTypeaheadOpen(false);
     setMobileSearchOpen(false);
@@ -317,6 +323,11 @@ export default function Header() {
   const navigateToTypeaheadItem = (item: TypeaheadItem) => {
     if (item.kind === "skill") {
       if (!isUnifiedNativeSkillResult(item.result)) {
+        emitAnalytics("select_content", {
+          content_type: "catalog_skill",
+          content_id: publicAnalyticsContentId("catalog_skill", item.result.result.externalId),
+          ui_location: "header",
+        });
         void navigate({ to: item.result.result.route });
         setNavSearchQuery("");
         setTypeaheadOpen(false);
@@ -325,19 +336,26 @@ export default function Header() {
       }
       const resultOwnerHandle = item.result.ownerHandle?.trim();
       if (!resultOwnerHandle) {
-        void navigate({
-          to: "/search",
-          search: { q: trimmedNavSearchQuery, type: "skills" },
-        });
+        openSearchResults("skills");
         setNavSearchQuery("");
         setTypeaheadOpen(false);
         setMobileSearchOpen(false);
         return;
       }
+      emitAnalytics("select_content", {
+        content_type: "skill",
+        content_id: publicAnalyticsContentId("skill", item.result.skill._id),
+        ui_location: "header",
+      });
       void navigate({
         to: buildSkillDetailHref(resultOwnerHandle, item.result.skill.slug),
       });
     } else if (item.kind === "plugin") {
+      emitAnalytics("select_content", {
+        content_type: "plugin",
+        content_id: publicAnalyticsContentId("plugin", item.result.plugin.name),
+        ui_location: "header",
+      });
       void navigate({
         to: buildPluginDetailHref(item.result.plugin.name, {
           ownerHandle: item.result.plugin.ownerHandle,
@@ -346,10 +364,7 @@ export default function Header() {
     } else if (item.kind === "creator") {
       const publisherHandle = item.result.creator.handle.trim();
       if (!publisherHandle) {
-        void navigate({
-          to: "/search",
-          search: { q: trimmedNavSearchQuery, type: "creators" },
-        });
+        openSearchResults("creators");
         setNavSearchQuery("");
         setTypeaheadOpen(false);
         setMobileSearchOpen(false);
@@ -359,10 +374,7 @@ export default function Header() {
         to: buildPublisherProfileHref(publisherHandle),
       });
     } else {
-      void navigate({
-        to: "/search",
-        search: { q: trimmedNavSearchQuery, type: item.section },
-      });
+      openSearchResults(item.section);
     }
     setNavSearchQuery("");
     setTypeaheadOpen(false);
@@ -403,7 +415,7 @@ export default function Header() {
   };
 
   return (
-    <header className={`navbar navbar-calm${headerScrolled ? " navbar-calm-scrolled" : ""}`}>
+    <header className="navbar navbar-calm">
       <div className="navbar-inner">
         <div className="navbar-top">
           <div className="navbar-calm-start">
@@ -486,11 +498,7 @@ export default function Header() {
               </Sheet>
             </div>
 
-            <Link
-              to="/"
-              search={{ q: undefined, highlighted: undefined, search: undefined }}
-              className="brand"
-            >
+            <Link to="/" search={{}} className="brand">
               <span className="brand-mark">
                 <img
                   src={CLAWHUB_BRAND_MARK_SRC}
@@ -562,10 +570,7 @@ export default function Header() {
                   role="combobox"
                   placeholder="Search skills, plugins, and creators"
                   value={navSearchQuery}
-                  onChange={(e) => {
-                    setNavSearchQuery(e.target.value);
-                    setTypeaheadOpen(true);
-                  }}
+                  onChange={(e) => handleNavSearchChange(e.target.value)}
                   onFocus={() => setTypeaheadOpen(true)}
                   onKeyDown={handleSearchKeyDown}
                   aria-label="Search"
@@ -581,6 +586,8 @@ export default function Header() {
                 <SearchTypeahead
                   activeIndex={typeaheadActiveIndex}
                   loading={typeaheadSearching}
+                  pluginSearchError={pluginSearchError}
+                  skillSearchError={skillSearchError}
                   onHoverItem={setTypeaheadActiveIndex}
                   onSelectItem={navigateToTypeaheadItem}
                   creatorItems={typeaheadCreatorItems}
@@ -761,10 +768,7 @@ export default function Header() {
                 role="combobox"
                 placeholder="Search skills, plugins, and creators"
                 value={navSearchQuery}
-                onChange={(e) => {
-                  setNavSearchQuery(e.target.value);
-                  setTypeaheadOpen(true);
-                }}
+                onChange={(e) => handleNavSearchChange(e.target.value)}
                 onFocus={() => setTypeaheadOpen(true)}
                 onKeyDown={handleSearchKeyDown}
                 aria-label="Search"
@@ -794,6 +798,8 @@ export default function Header() {
               <SearchTypeahead
                 activeIndex={typeaheadActiveIndex}
                 loading={typeaheadSearching}
+                pluginSearchError={pluginSearchError}
+                skillSearchError={skillSearchError}
                 onHoverItem={setTypeaheadActiveIndex}
                 onSelectItem={navigateToTypeaheadItem}
                 creatorItems={typeaheadCreatorItems}
@@ -850,6 +856,8 @@ function SearchTypeahead({
   activeIndex,
   creatorItems,
   loading,
+  pluginSearchError,
+  skillSearchError,
   onHoverItem,
   onSelectItem,
   pluginItems,
@@ -859,6 +867,8 @@ function SearchTypeahead({
   activeIndex: number;
   creatorItems: TypeaheadItem[];
   loading: boolean;
+  pluginSearchError?: boolean;
+  skillSearchError?: boolean;
   onHoverItem: (index: number) => void;
   onSelectItem: (item: TypeaheadItem) => void;
   pluginItems: TypeaheadItem[];
@@ -870,7 +880,7 @@ function SearchTypeahead({
   const hasPluginMatches = pluginItems.some((item) => item.kind === "plugin");
   const hasCreatorMatches = creatorItems.some((item) => item.kind === "creator");
   const hasMatches = hasSkillMatches || hasPluginMatches || hasCreatorMatches;
-  const pluginStartIndex = skillItems.length;
+  const skillStartIndex = pluginItems.length;
   const creatorStartIndex = skillItems.length + pluginItems.length;
 
   return (
@@ -892,7 +902,15 @@ function SearchTypeahead({
             <span>Searching…</span>
           </div>
         ) : null}
-        {hasQuery && !loading && !hasMatches ? (
+        {hasQuery && !loading && skillSearchError ? (
+          <div role="alert">Unable to search skills. Please try again later.</div>
+        ) : null}
+        {hasQuery && !loading && pluginSearchError ? (
+          <div role="alert" className="navbar-search-typeahead-status">
+            Unable to search plugins. Please try again later.
+          </div>
+        ) : null}
+        {hasQuery && !loading && !hasMatches && !pluginSearchError && !skillSearchError ? (
           <div className="navbar-search-typeahead-status">
             No skills, plugins, or creators found for "{query}"
           </div>
@@ -903,30 +921,6 @@ function SearchTypeahead({
             role="listbox"
             aria-label="Search suggestions"
           >
-            {hasSkillMatches ? (
-              <div
-                className="navbar-search-typeahead-section"
-                role="group"
-                aria-labelledby="navbar-search-typeahead-skills-heading"
-              >
-                <div
-                  id="navbar-search-typeahead-skills-heading"
-                  className="navbar-search-typeahead-heading"
-                >
-                  Skills
-                </div>
-                {skillItems.map((item, index) => (
-                  <TypeaheadRow
-                    key={item.key}
-                    active={activeIndex === index}
-                    item={item}
-                    index={index}
-                    onHoverItem={onHoverItem}
-                    onSelectItem={onSelectItem}
-                  />
-                ))}
-              </div>
-            ) : null}
             {hasPluginMatches ? (
               <div
                 className="navbar-search-typeahead-section"
@@ -942,9 +936,33 @@ function SearchTypeahead({
                 {pluginItems.map((item, index) => (
                   <TypeaheadRow
                     key={item.key}
-                    active={activeIndex === pluginStartIndex + index}
+                    active={activeIndex === index}
                     item={item}
-                    index={pluginStartIndex + index}
+                    index={index}
+                    onHoverItem={onHoverItem}
+                    onSelectItem={onSelectItem}
+                  />
+                ))}
+              </div>
+            ) : null}
+            {hasSkillMatches ? (
+              <div
+                className="navbar-search-typeahead-section"
+                role="group"
+                aria-labelledby="navbar-search-typeahead-skills-heading"
+              >
+                <div
+                  id="navbar-search-typeahead-skills-heading"
+                  className="navbar-search-typeahead-heading"
+                >
+                  Skills
+                </div>
+                {skillItems.map((item, index) => (
+                  <TypeaheadRow
+                    key={item.key}
+                    active={activeIndex === skillStartIndex + index}
+                    item={item}
+                    index={skillStartIndex + index}
                     onHoverItem={onHoverItem}
                     onSelectItem={onSelectItem}
                   />
@@ -1114,7 +1132,7 @@ function getTypeaheadRowBody(item: TypeaheadItem) {
       meta: owner ? (
         <TypeaheadPublisherMeta
           owner={owner}
-          official={item.result.plugin.isOfficial}
+          official={item.result.plugin.isOfficial || item.result.plugin.ownerOfficial === true}
           packageName={packageName}
         />
       ) : (

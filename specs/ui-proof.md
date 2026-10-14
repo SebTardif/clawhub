@@ -73,7 +73,9 @@ then escalates to KILL. An exited leader must get a bounded close/reaping wait
 before its group is probed: macOS can report EPERM between exit and close.
 Closed pipes do not prove descendants are gone; after ESRCH never signal that
 numeric group again. Permission denial fails that record without alternate
-signals, while all other groups are still attempted.
+signals, while all other groups are still attempted. KILL is accepted before the
+group disappears: a killed descendant stays in the group as a zombie until init
+reaps it, so proofs of group teardown must poll with a bound, never probe once.
 
 Preserve primary failures alongside cleanup errors. Write redacted diagnostics
 and attempt private-state removal even when shutdown/logging fails. Write
@@ -88,7 +90,7 @@ Focused tests use the real owner with narrow I/O seams and real process-tree
 cleanup without listeners. Avoid dotenv loading and copied launchers:
 
 ```sh
-node --input-type=module -e 'import {startVitest} from "vitest/node"; const ctx=await startVitest("test",["scripts/ui-proof.test.mjs","scripts/ui-proof-backend.test.mjs","scripts/ui-proof-runtime.test.mjs","scripts/ui-proof-publish.test.mjs"],{run:true},{envDir:false});await ctx.close();'
+node --input-type=module -e 'import {startVitest} from "vitest/node"; const ctx=await startVitest("test",["scripts/ui-proof.test.mjs","scripts/ui-proof-backend.test.mjs","scripts/ui-proof-runtime.test.mjs"],{run:true},{envDir:false});await ctx.close();'
 ```
 
 The opt-in smoke **starts servers**; use the approved `preview_start`/server
@@ -104,3 +106,16 @@ dependencies still come from the installed snapshot. It does not certify full-ap
 build/browser behavior; follow it with real ClawHub UI proof. Parent failure tests
 use disposable malformed-source/missing-query/occupied-port fixtures and signals,
 never operator services, and verify no continuation plus complete teardown.
+
+## Publishing evidence
+
+Capture remains local or in the isolated proof runtime. After inspecting the
+final media, attach it directly to the PR through GitHub user attachments using
+`gh pr comment --body-file <comment.md> --attach <media>`. Keep the validation
+summary, exact refs and simulated/untested boundaries in the comment itself.
+Use `.agents/skills/proof-video/SKILL.md` for editing and publication details.
+
+Do not commit proof media/reports to product branches. The branch-publishing
+`proof:publish` command is removed; it previously stored media in `qa-artifacts`
+and rendered raw file links instead of native PR players. The capture runner,
+isolation contract and local raw evidence retention are unchanged.

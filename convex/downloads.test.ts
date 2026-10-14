@@ -2,6 +2,13 @@ import type { RateLimitArgs, RateLimitReturns } from "@convex-dev/rate-limiter";
 import { unzipSync } from "fflate";
 import { exportJWK, exportPKCS8, generateKeyPair } from "jose";
 import { afterEach, describe, expect, it, vi } from "vitest";
+
+// Route behavior assumes verified ingress; trust validation is covered by httpRateLimit.edge.test.ts.
+vi.mock("./lib/verifiedClientIp", () => ({
+  getVerifiedClientIp: async () => "203.0.113.1",
+}));
+import { getFunctionName } from "convex/server";
+import { internal } from "./_generated/api";
 import type { ActionCtx } from "./_generated/server";
 import { __test, downloadZipHandler, recordArchiveDownloadMetricHandler } from "./downloads";
 import {
@@ -15,6 +22,24 @@ import {
   type SkillArchiveManifest,
   verifyArchivePayloadWithLocalJwks,
 } from "./lib/archiveManifest";
+
+function availableDownloadSelection(
+  version: Record<string, unknown>,
+  skill: Record<string, unknown> = {},
+) {
+  return {
+    status: "available",
+    skill: {
+      _id: "skills:1",
+      ownerUserId: "users:1",
+      slug: "demo",
+      tags: {},
+      latestVersionId: version._id,
+      ...skill,
+    },
+    version,
+  };
+}
 
 function isRateLimitArgs(args: unknown): args is RateLimitArgs {
   if (!args || typeof args !== "object") return false;
@@ -91,20 +116,20 @@ describe("downloads helpers", () => {
     expect(__test.getDownloadIdentityValue(request, "users_123")).toBe("user:users_123");
   });
 
-  it("uses cf-connecting-ip for anonymous identity when trusted headers are enabled", () => {
+  it("rejects unverified cf-connecting-ip for anonymous metrics", () => {
     vi.stubEnv("TRUST_FORWARDED_IPS", "true");
     const request = new Request("https://example.com", {
       headers: { "cf-connecting-ip": "1.2.3.4" },
     });
-    expect(__test.getDownloadIdentityValue(request, null)).toBe("ip:1.2.3.4");
+    expect(__test.getDownloadIdentityValue(request, null)).toBeNull();
   });
 
-  it("falls back to forwarded ip when explicitly enabled", () => {
+  it("rejects unverified forwarded addresses for metrics", () => {
     vi.stubEnv("TRUST_FORWARDED_IPS", "true");
     const request = new Request("https://example.com", {
       headers: { "x-forwarded-for": "10.0.0.1, 10.0.0.2" },
     });
-    expect(__test.getDownloadIdentityValue(request, null)).toBe("ip:10.0.0.1");
+    expect(__test.getDownloadIdentityValue(request, null)).toBeNull();
   });
 
   it("returns null when user and ip are missing", () => {
@@ -166,6 +191,70 @@ describe("downloads helpers", () => {
     expect(runQuery).not.toHaveBeenCalled();
   });
 
+  it.each([
+    { selectionStatus: "not_found", httpStatus: 404 },
+    { selectionStatus: "deleted", httpStatus: 410 },
+  ])(
+    "never opens storage for a $selectionStatus publication selection",
+    async ({ selectionStatus, httpStatus }) => {
+      const runQuery = vi.fn(async (_query: unknown, args: Record<string, unknown>) => {
+        if ("slug" in args)
+          return {
+            skill: { _id: "skills:1", tags: {}, latestVersionId: "skillVersions:1" },
+            moderationInfo: null,
+          };
+        return { status: selectionStatus };
+      });
+      const storageGet = vi.fn();
+      const runAfter = vi.fn();
+      const response = await downloadZipHandler(
+        {
+          runQuery,
+          runMutation: vi.fn(async () => okRate()),
+          storage: { get: storageGet },
+          scheduler: { runAfter },
+        } as unknown as ActionCtx,
+        new Request("http://127.0.0.1:3211/api/v1/download?slug=demo"),
+      );
+      expect(response.status).toBe(httpStatus);
+      expect(storageGet).not.toHaveBeenCalled();
+      expect(runAfter).not.toHaveBeenCalled();
+    },
+  );
+
+  it("applies moderation from the current selected parent after a stale public lookup", async () => {
+    const runQuery = vi.fn(async (_query: unknown, args: Record<string, unknown>) => {
+      if ("slug" in args)
+        return {
+          skill: { _id: "skills:1", tags: {}, latestVersionId: "skillVersions:1" },
+          moderationInfo: null,
+        };
+      return availableDownloadSelection(
+        {
+          _id: "skillVersions:1",
+          skillId: "skills:1",
+          version: "1.0.0",
+          publicationStatus: "published",
+          files: [],
+        },
+        { moderationStatus: "removed" },
+      );
+    });
+    const storageGet = vi.fn();
+    const response = await downloadZipHandler(
+      {
+        runQuery,
+        runMutation: vi.fn(async () => okRate()),
+        storage: { get: storageGet },
+        scheduler: { runAfter: vi.fn() },
+      } as unknown as ActionCtx,
+      new Request("http://127.0.0.1:3211/api/v1/download?slug=demo"),
+    );
+    expect(response.status).toBe(410);
+    expect(await response.text()).toBe("This skill has been removed by a moderator.");
+    expect(storageGet).not.toHaveBeenCalled();
+  });
+
   it("schedules zip download stats outside the response path", async () => {
     vi.stubEnv("TRUST_FORWARDED_IPS", "true");
 
@@ -182,15 +271,15 @@ describe("downloads helpers", () => {
           moderationInfo: null,
         };
       }
-      if ("versionId" in args) {
-        return {
+      if ("skillId" in args) {
+        return availableDownloadSelection({
           _id: "skillVersions:1",
           skillId: "skills:1",
           version: "1.0.0",
           createdAt: 3,
           files: [{ path: "SKILL.md", storageId: "_storage:1" }],
           softDeletedAt: undefined,
-        };
+        });
       }
       return null;
     });
@@ -245,7 +334,7 @@ describe("downloads helpers", () => {
     });
   });
 
-  it("returns a bounded archive manifest to the Nitro streaming owner", async () => {
+  it.each([false, true])("requires all manifest URLs (%s)", async (missing) => {
     vi.stubEnv("CLAWHUB_PREVIEW", "1");
     vi.stubEnv("TRUST_FORWARDED_IPS", "true");
     vi.spyOn(Date, "now").mockReturnValue(10_000);
@@ -268,8 +357,8 @@ describe("downloads helpers", () => {
           moderationInfo: null,
         };
       }
-      if ("versionId" in args) {
-        return {
+      if ("skillId" in args) {
+        return availableDownloadSelection({
           _id: "skillVersions:1",
           skillId: "skills:1",
           version: "1.0.0+build",
@@ -279,7 +368,7 @@ describe("downloads helpers", () => {
             { path: "missing.txt", storageId: "_storage:missing" },
           ],
           softDeletedAt: undefined,
-        };
+        });
       }
       return null;
     });
@@ -292,7 +381,9 @@ describe("downloads helpers", () => {
     const storageGetUrl = vi.fn(async (storageId: string) =>
       storageId === "_storage:1"
         ? "https://preview-branch-123.convex.cloud/api/storage/storage-1"
-        : null,
+        : missing
+          ? null
+          : "https://preview-branch-123.convex.cloud/api/storage/storage-2",
     );
 
     const response = await downloadZipHandler(
@@ -316,6 +407,12 @@ describe("downloads helpers", () => {
       { verifyArchiveRequester: vi.fn(async () => undefined) },
     );
 
+    if (missing) {
+      expect(response.status).toBe(410);
+      expect(await response.text()).toBe("Skill archive file missing from storage");
+      expect(runAfter).not.toHaveBeenCalled();
+      return;
+    }
     expect(response.status).toBe(200);
     expect(response.headers.get("Content-Type")).toBe(ARCHIVE_MANIFEST_CONTENT_TYPE);
     expect(response.headers.get("Cache-Control")).toBe("private, no-store");
@@ -341,6 +438,10 @@ describe("downloads helpers", () => {
         {
           path: "SKILL.md",
           url: "https://preview-branch-123.convex.cloud/api/storage/storage-1",
+        },
+        {
+          path: "missing.txt",
+          url: "https://preview-branch-123.convex.cloud/api/storage/storage-2",
         },
       ],
       metricToken: expect.any(String),
@@ -395,6 +496,36 @@ describe("downloads helpers", () => {
     expect(response.headers.get("Cache-Control")).toBe("no-store");
     expect(verifyArchiveRequester).toHaveBeenCalledWith("client-forgery", "preview");
     expect(runQuery).not.toHaveBeenCalled();
+  });
+
+  it("requires the branch secret before issuing Staging download manifests", async () => {
+    const secret = "s".repeat(48);
+    vi.stubEnv("CLAWHUB_ENV", "staging");
+    vi.stubEnv("CLAWHUB_STAGING_EDGE_SECRET", secret);
+    const runQuery = vi.fn(async () => null);
+    const runMutation = vi.fn(async (_mutation: unknown, args: Record<string, unknown>) => {
+      if (isRateLimitArgs(args)) return okRate();
+      return null;
+    });
+    const verifyArchiveRequester = vi.fn(async () => undefined);
+    const ctx = { runQuery, runMutation } as unknown as ActionCtx;
+    const request = (edgeSecret?: string) =>
+      new Request("https://cheery-civet-733.convex.site/api/v1/download?slug=demo", {
+        headers: {
+          "x-clawhub-archive-manifest": "v1",
+          "x-clawhub-vercel-oidc-token": "vercel-preview-oidc",
+          ...(edgeSecret ? { "x-clawhub-staging-edge-secret": edgeSecret } : {}),
+        },
+      });
+
+    expect((await downloadZipHandler(ctx, request(), { verifyArchiveRequester })).status).toBe(401);
+    expect(verifyArchiveRequester).not.toHaveBeenCalled();
+    expect(runQuery).not.toHaveBeenCalled();
+
+    expect(
+      (await downloadZipHandler(ctx, request(secret), { verifyArchiveRequester })).status,
+    ).toBe(404);
+    expect(verifyArchiveRequester).toHaveBeenCalledWith("vercel-preview-oidc", "preview");
   });
 
   it("records only a valid, unexpired archive metric capability", async () => {
@@ -460,7 +591,7 @@ describe("downloads helpers", () => {
     expect(runAfter).toHaveBeenCalledTimes(1);
   });
 
-  it("streams stored file chunks, stays deterministic, and skips a Blob that vanishes", async () => {
+  it("streams stored file chunks and stays deterministic", async () => {
     const firstChunk = new Uint8Array(64 * 1024).fill(0x61);
     const secondChunk = new TextEncoder().encode("streamed body\n");
     const releaseSecondChunk = deferred<void>();
@@ -509,8 +640,8 @@ describe("downloads helpers", () => {
           moderationInfo: null,
         };
       }
-      if ("versionId" in args) {
-        return {
+      if ("skillId" in args) {
+        return availableDownloadSelection({
           _id: "skillVersions:1",
           skillId: "skills:1",
           version: "1.0.0",
@@ -518,10 +649,9 @@ describe("downloads helpers", () => {
           files: [
             { path: "a.txt", storageId: "_storage:skill" },
             { path: "b.txt", storageId: "_storage:notes" },
-            { path: "missing.txt", storageId: "_storage:missing" },
           ],
           softDeletedAt: undefined,
-        };
+        });
       }
       return null;
     });
@@ -550,7 +680,9 @@ describe("downloads helpers", () => {
 
     expect(response.status).toBe(200);
     expect(storageGetMetadata).not.toHaveBeenCalled();
-    expect(storageGet).not.toHaveBeenCalled();
+    expect(storageGet).toHaveBeenCalledWith("_storage:skill");
+    expect(storageGet).toHaveBeenCalledWith("_storage:notes");
+    expect(stream).not.toHaveBeenCalled();
 
     const reader = response.body!.getReader();
     const firstArchiveChunk = await reader.read();
@@ -570,7 +702,6 @@ describe("downloads helpers", () => {
     expect(Object.keys(unzipped).sort()).toEqual(["_meta.json", "a.txt", "b.txt"]);
     expect(unzipped["a.txt"]).toEqual(Uint8Array.from([...firstChunk, ...secondChunk]));
     expect(new TextDecoder().decode(unzipped["b.txt"])).toBe("supporting notes\n");
-    expect(storageGet).toHaveBeenCalledWith("_storage:missing");
 
     const repeatResponse = await downloadZipHandler(
       {
@@ -612,6 +743,63 @@ describe("downloads helpers", () => {
     expect(new Uint8Array(await repeatResponse.arrayBuffer())).toEqual(responseBytes);
   });
 
+  it("returns 410 when a skill archive blob is missing from storage", async () => {
+    const runQuery = vi.fn(async (_query: unknown, args: Record<string, unknown>) => {
+      if ("slug" in args) {
+        return {
+          skill: {
+            _id: "skills:1",
+            ownerUserId: "users:1",
+            slug: "demo",
+            tags: {},
+            latestVersionId: "skillVersions:1",
+          },
+          moderationInfo: null,
+        };
+      }
+      if ("skillId" in args) {
+        return availableDownloadSelection({
+          _id: "skillVersions:1",
+          skillId: "skills:1",
+          version: "1.0.0",
+          createdAt: 3,
+          files: [
+            { path: "SKILL.md", storageId: "_storage:1" },
+            { path: "missing.txt", storageId: "_storage:missing" },
+          ],
+          softDeletedAt: undefined,
+        });
+      }
+      return null;
+    });
+    const runMutation = vi.fn(async (_mutation: unknown, args: Record<string, unknown>) => {
+      if (isRateLimitArgs(args)) return okRate();
+      return null;
+    });
+    const runAfter = vi.fn();
+    const storageGet = vi.fn(async (storageId: string) =>
+      storageId === "_storage:1" ? streamingBlob("hello") : null,
+    );
+
+    const response = await downloadZipHandler(
+      {
+        runQuery,
+        runMutation,
+        scheduler: { runAfter },
+        storage: { get: storageGet, getMetadata: vi.fn().mockResolvedValue({}) },
+      } as unknown as ActionCtx,
+      new Request("https://example.com/api/v1/download?slug=demo", {
+        headers: { "cf-connecting-ip": "1.2.3.4" },
+      }),
+    );
+
+    expect(response.status).toBe(410);
+    expect(await response.text()).toBe("Skill archive file missing from storage");
+    expect(response.headers.get("Content-Type")).not.toBe("application/zip");
+    expect(storageGet).toHaveBeenCalledWith("_storage:missing");
+    expect(runAfter).not.toHaveBeenCalled();
+  });
+
   it("returns 410 for an explicitly requested revoked version", async () => {
     const runQuery = vi.fn(async (_query: unknown, args: Record<string, unknown>) => {
       if ("slug" in args) {
@@ -627,19 +815,7 @@ describe("downloads helpers", () => {
         };
       }
       if ("version" in args) {
-        return {
-          _id: "skillVersions:1",
-          skillId: "skills:1",
-          version: "1.0.0",
-          createdAt: 3,
-          files: [{ path: "SKILL.md", storageId: "_storage:1" }],
-          softDeletedAt: 123,
-          manualRevocation: {
-            reason: "confirmed unsafe artifact",
-            reviewerUserId: "users:moderator",
-            revokedAt: 123,
-          },
-        };
+        return { status: "deleted" };
       }
       return null;
     });
@@ -680,14 +856,14 @@ describe("downloads helpers", () => {
           moderationInfo: null,
         };
       }
-      if ("versionId" in args) {
-        return {
+      if ("skillId" in args) {
+        return availableDownloadSelection({
           _id: "skillVersions:1",
           version: "1.0.0",
           createdAt: 3,
           files: [{ path: "SKILL.md", storageId: "_storage:1" }],
           softDeletedAt: undefined,
-        };
+        });
       }
       return null;
     });
@@ -732,26 +908,7 @@ describe("downloads helpers", () => {
           moderationInfo: null,
         };
       }
-      if (args.versionId === "skillVersions:1") {
-        return {
-          _id: "skillVersions:1",
-          skillId: "skills:1",
-          version: "1.0.0",
-          createdAt: 3,
-          files: [],
-          softDeletedAt: undefined,
-        };
-      }
-      if (args.versionId === "skillVersions:other") {
-        return {
-          _id: "skillVersions:other",
-          skillId: "skills:other",
-          version: "9.9.9",
-          createdAt: 4,
-          files: [{ path: "SKILL.md", storageId: "_storage:other" }],
-          softDeletedAt: undefined,
-        };
-      }
+      if ("skillId" in args) return { status: "not_found" };
       return null;
     });
     const runMutation = vi.fn(async (_mutation: unknown, args: Record<string, unknown>) => {
@@ -824,7 +981,7 @@ describe("downloads helpers", () => {
         };
       }
       if ("skillId" in args && "version" in args) {
-        return {
+        return availableDownloadSelection({
           _id: "skillVersions:1",
           skillId: "skills:1",
           version: "1.0.0",
@@ -836,7 +993,7 @@ describe("downloads helpers", () => {
             verdict: "malicious",
             checkedAt: 4,
           },
-        };
+        });
       }
       if (args.versionId === "skillVersions:2") {
         return {
@@ -885,10 +1042,7 @@ describe("downloads helpers", () => {
 
     const runQuery = vi.fn(async (_query: unknown, args: Record<string, unknown>) => {
       if ("tokenHash" in args) {
-        return { _id: "apiTokens:1", revokedAt: undefined };
-      }
-      if ("tokenId" in args) {
-        return { _id: "users:token", deletedAt: undefined, deactivatedAt: undefined };
+        return { apiTokenId: "apiTokens:1", user: { _id: "users:token" } };
       }
       if ("slug" in args) {
         return {
@@ -902,15 +1056,15 @@ describe("downloads helpers", () => {
           moderationInfo: null,
         };
       }
-      if ("versionId" in args) {
-        return {
+      if ("skillId" in args) {
+        return availableDownloadSelection({
           _id: "skillVersions:1",
           skillId: "skills:1",
           version: "1.0.0",
           createdAt: 3,
           files: [{ path: "SKILL.md", storageId: "_storage:1" }],
           softDeletedAt: undefined,
-        };
+        });
       }
       return null;
     });
@@ -969,15 +1123,15 @@ describe("downloads helpers", () => {
           moderationInfo: null,
         };
       }
-      if ("versionId" in args) {
-        return {
+      if ("skillId" in args) {
+        return availableDownloadSelection({
           _id: "skillVersions:1",
           skillId: "skills:1",
           version: "1.0.0",
           createdAt: 3,
           files: [{ path: "SKILL.md", storageId: "_storage:1" }],
           softDeletedAt: undefined,
-        };
+        });
       }
       return null;
     });
@@ -1023,6 +1177,11 @@ describe("downloads helpers", () => {
       const commit = "1".repeat(40);
       const runQuery = vi.fn(async (_query: unknown, args: Record<string, unknown>) => {
         if (isRateLimitArgs(args)) return okRate();
+        if (
+          getFunctionName(_query as Parameters<typeof getFunctionName>[0]) ===
+          getFunctionName(internal.skills.getPublicVersionSelectionInternal)
+        )
+          return { status: "not_found" };
         if ("slug" in args) {
           return {
             skill: {
@@ -1157,6 +1316,11 @@ describe("downloads helpers", () => {
     async ({ skill, source, status, message }) => {
       const runQuery = vi.fn(async (_query: unknown, args: Record<string, unknown>) => {
         if (isRateLimitArgs(args)) return okRate();
+        if (
+          getFunctionName(_query as Parameters<typeof getFunctionName>[0]) ===
+          getFunctionName(internal.skills.getPublicVersionSelectionInternal)
+        )
+          return { status: "not_found" };
         if ("slug" in args) {
           return {
             skill: {
@@ -1245,6 +1409,11 @@ describe("downloads helpers", () => {
     async ({ moderationInfo, status, message }) => {
       const runQuery = vi.fn(async (_query: unknown, args: Record<string, unknown>) => {
         if (isRateLimitArgs(args)) return okRate();
+        if (
+          getFunctionName(_query as Parameters<typeof getFunctionName>[0]) ===
+          getFunctionName(internal.skills.getPublicVersionSelectionInternal)
+        )
+          return { status: "not_found" };
         if ("slug" in args) {
           return {
             skill: {
@@ -1297,10 +1466,15 @@ describe("downloads helpers", () => {
 
       expect(response.status).toBe(status);
       expect(await response.text()).toBe(message);
-      expect(runQuery).not.toHaveBeenCalledWith(
-        expect.anything(),
-        expect.objectContaining({ skillId: "skills:github" }),
-      );
+      expect(
+        runQuery.mock.calls
+          .filter(
+            ([query]) =>
+              getFunctionName(query as Parameters<typeof getFunctionName>[0]) !==
+              getFunctionName(internal.skills.getPublicVersionSelectionInternal),
+          )
+          .some(([, args]) => args.skillId === "skills:github"),
+      ).toBe(false);
       expect(runAfter).not.toHaveBeenCalled();
     },
   );

@@ -1,4 +1,4 @@
-import { fireEvent, render, screen, waitFor } from "@testing-library/react";
+import { act, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import { unzipSync } from "fflate";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import {
@@ -9,7 +9,9 @@ import {
 import { SecurityAuditPage } from "./SecurityAuditPage";
 import {
   getSkillSpectorIssueCount,
+  SkillSpectorFindings,
   SecurityScanResults,
+  type AigAnalysis,
   type LlmAnalysis,
   type SkillSpectorAnalysis,
   type VtAnalysis,
@@ -166,6 +168,27 @@ const skillSpectorAnalysis: SkillSpectorAnalysis = {
   ],
 };
 
+const aigAnalysis: AigAnalysis = {
+  status: "malicious",
+  issueCount: 1,
+  scannerVersion: "0.2.1",
+  summary: "A.I.G reported 1 finding from SkillTrustBench rule T04.",
+  checkedAt: Date.now(),
+  findings: [
+    {
+      ruleId: "T04",
+      level: "error",
+      message: "The skill instructs the agent to transmit local session data externally.",
+      title: "Session data exfiltration",
+      description: "The skill transmits local session data to an unrelated external endpoint.",
+      file: "SKILL.md",
+      startLine: 17,
+      endLine: 18,
+      remediation: "Remove the session-file upload instruction.",
+    },
+  ],
+};
+
 const staticScan: StaticScan = {
   status: "suspicious",
   reasonCodes: ["static.network_request"],
@@ -210,7 +233,6 @@ describe("SecurityScanResults static guidance", () => {
   it("hides advisory static findings from the public scan panel", () => {
     render(
       <SecurityScanResults
-        vtAnalysis={{ status: "clean", checkedAt: Date.now() }}
         llmAnalysis={{ status: "clean", checkedAt: Date.now() }}
         staticFindings={[
           {
@@ -232,7 +254,6 @@ describe("SecurityScanResults static guidance", () => {
   it("keeps mixed advisory static findings hidden when scanners are clean", () => {
     render(
       <SecurityScanResults
-        vtAnalysis={{ status: "clean", checkedAt: Date.now() }}
         llmAnalysis={{ status: "clean", checkedAt: Date.now() }}
         staticFindings={[
           {
@@ -429,9 +450,7 @@ describe("SecurityScanResults static guidance", () => {
     expect(screen.getAllByText("Review").length).toBeGreaterThan(0);
     expect(screen.queryByText("Risk")).toBeNull();
     expect(screen.queryByText("ClawScan risk")).toBeNull();
-    expect(
-      screen.getByText("Security checks across malware telemetry and agentic risk"),
-    ).toBeTruthy();
+    expect(screen.getByText("Security checks for vulnerabilities and agentic risk")).toBeTruthy();
     expect(container.querySelector(".security-scan-hero-subtext")?.textContent).not.toContain(
       "Warn",
     );
@@ -464,10 +483,10 @@ describe("SecurityScanResults static guidance", () => {
       Array.from(container.querySelectorAll(".security-report-main > section h2")).map((node) =>
         node.textContent?.trim(),
       ),
-    ).toEqual(["Overview", "SkillSpector", "VirusTotal"]);
+    ).toEqual(["Overview", "SkillSpector"]);
   });
 
-  it("renders SkillSpector findings as the agentic-risk finding source", () => {
+  it("renders SkillSpector findings as the agentic-risk finding source", async () => {
     const { container } = render(
       <SecurityAuditPage
         entity={{
@@ -489,7 +508,20 @@ describe("SecurityScanResults static guidance", () => {
     );
 
     expect(screen.getByRole("heading", { name: "SkillSpector" })).toBeTruthy();
-    expect(screen.getByText("By NVIDIA")).toBeTruthy();
+    expect(screen.getByRole("link", { name: "SkillSpector" }).getAttribute("href")).toBe(
+      "https://github.com/NVIDIA/SkillSpector",
+    );
+    expect(screen.getByRole("link", { name: "SkillSpector" }).getAttribute("target")).toBe(
+      "_blank",
+    );
+    expect(screen.queryByText("By NVIDIA")).toBeNull();
+    fireEvent.click(screen.getByRole("button", { name: "About SkillSpector" }));
+    const info = within(await screen.findByRole("dialog", { name: "About SkillSpector" }));
+    expect(info.getByText("SkillSpector by NVIDIA")).toBeTruthy();
+    expect(info.getByText(/Scans agent skills for vulnerabilities/)).toBeTruthy();
+    expect(info.getByRole("link", { name: "Learn more" }).getAttribute("href")).toBe(
+      "https://github.com/NVIDIA/SkillSpector",
+    );
     expect(screen.queryByText("SkillSpector found 1 issue.")).toBeNull();
     expect(screen.getByRole("heading", { name: "Description-Behavior Mismatch" })).toBeTruthy();
     expect(screen.getAllByText("High").length).toBeGreaterThan(0);
@@ -517,13 +549,347 @@ describe("SecurityScanResults static guidance", () => {
       Array.from(container.querySelectorAll(".security-report-main > section h2")).map((node) =>
         node.textContent?.trim(),
       ),
-    ).toEqual(["Overview", "SkillSpector", "VirusTotal"]);
+    ).toEqual(["Overview", "SkillSpector"]);
+  });
+
+  it("renders A.I.G coverage and concise findings with Tencent attribution", async () => {
+    const { container } = render(
+      <SecurityAuditPage
+        entity={{
+          kind: "skill",
+          title: "A.I.G Demo",
+          name: "aig-demo",
+          version: "1.0.0",
+          detailPath: "/local/aig-demo",
+        }}
+        aigAnalysis={aigAnalysis}
+        llmAnalysis={clawScanAnalysis}
+      />,
+    );
+
+    expect(screen.getByRole("heading", { name: "A.I.G" })).toBeTruthy();
+    expect(screen.getByRole("link", { name: "A.I.G" }).getAttribute("href")).toBe(
+      "https://github.com/Tencent/AI-Infra-Guard/tree/main/skill-scan",
+    );
+    expect(screen.getByRole("link", { name: "A.I.G" }).getAttribute("target")).toBe("_blank");
+    expect(screen.queryByText("Malicious")).toBeNull();
+    expect(screen.queryByText("Based on Tencent Zhuque Lab AI-Infra-Guard")).toBeNull();
+    fireEvent.click(screen.getByRole("button", { name: "About A.I.G" }));
+    const info = within(await screen.findByRole("dialog", { name: "About A.I.G" }));
+    expect(info.getByText("A.I.G by Tencent")).toBeTruthy();
+    expect(info.getByText(/Uses AI to audit agent skill code/)).toBeTruthy();
+    expect(info.getByRole("link", { name: "Learn more" }).getAttribute("href")).toBe(
+      "https://github.com/Tencent/AI-Infra-Guard",
+    );
+    expect(info.getByRole("link", { name: "Learn more" }).getAttribute("target")).toBe("_blank");
+    expect(screen.getByText("Vulnerability Patterns")).toBeTruthy();
+    expect(screen.queryByText(/A\.I\.G supplies supporting evidence/)).toBeNull();
+    expect(screen.getByText("Findings (1)")).toBeTruthy();
+    expect(screen.getByRole("heading", { name: "T04 · Embedded Malicious Code" })).toBeTruthy();
+    expect(screen.getByText("Session data exfiltration")).toBeTruthy();
+    expect(
+      screen.getByText("The skill transmits local session data to an unrelated external endpoint."),
+    ).toBeTruthy();
+    expect(screen.getByText("SKILL.md:17")).toBeTruthy();
+    expect(screen.getByText("Remove the session-file upload instruction.")).toBeTruthy();
+    expect(screen.getByText("Remediation", { selector: "dt" })).toBeTruthy();
+    expect(
+      container.querySelector(".skillspector-check-row .skillspector-check-category")?.textContent,
+    ).toBe("Embedded Malicious Code");
+    expect(container.querySelector(".skillspector-check-row-flagged")).toBeTruthy();
+    expect(
+      Array.from(container.querySelectorAll(".security-report-main > section h2")).map((node) =>
+        node.textContent?.trim(),
+      ),
+    ).toEqual(["Overview", "A.I.G", "SkillSpector"]);
+  });
+
+  it("renders legacy message-only A.I.G findings once", () => {
+    const message = "The skill instructs the agent to transmit local session data externally.";
+
+    render(
+      <SecurityAuditPage
+        entity={{
+          kind: "skill",
+          title: "A.I.G Demo",
+          name: "aig-demo",
+          version: "1.0.0",
+          detailPath: "/local/aig-demo",
+        }}
+        aigAnalysis={{
+          ...aigAnalysis,
+          findings: [
+            {
+              ...aigAnalysis.findings[0],
+              message,
+              title: message,
+              description: undefined,
+            },
+          ],
+        }}
+      />,
+    );
+
+    expect(screen.getAllByText(message)).toHaveLength(1);
+  });
+
+  it("preserves Markdown in titleless message-only A.I.G findings", () => {
+    const { container } = render(
+      <SecurityAuditPage
+        entity={{
+          kind: "skill",
+          title: "Legacy audit",
+          name: "legacy",
+          detailPath: "/owner/skills/legacy",
+        }}
+        aigAnalysis={{
+          ...aigAnalysis,
+          findings: [
+            {
+              ...aigAnalysis.findings[0],
+              title: undefined,
+              description: undefined,
+              remediation: undefined,
+              message:
+                "**Unverified installer**\n\n```sh\ncurl example.test | bash\n```\n\n<script>alert(1)</script>",
+            },
+          ],
+        }}
+      />,
+    );
+    const details = container.querySelector(".aig-finding-details");
+    expect(details?.querySelector("strong")?.textContent).toBe("Unverified installer");
+    expect(details?.querySelector("pre code")?.textContent).toBe("curl example.test | bash\n");
+    expect(details?.querySelectorAll("pre")).toHaveLength(1);
+    expect(details?.querySelector("script")).toBeNull();
+  });
+
+  it("renders scanner report Markdown without flattening structure or allowing active HTML", () => {
+    const { container } = render(
+      <SecurityAuditPage
+        entity={{ kind: "skill", title: "Audit", name: "audit", detailPath: "/local/audit" }}
+        aigAnalysis={{
+          ...aigAnalysis,
+          findings: [
+            {
+              ...aigAnalysis.findings[0],
+              description:
+                "## Details\n\n**Risk**: high\n\n- Pin the version\n- Verify the hash\n\n```sh\ncurl example.test | bash\n```\n\n<script>alert(1)</script>\n\n[Unsafe](javascript:alert(1))",
+              remediation: "### Fix\n\n1. Download `installer.sh`.\n2. Verify it.",
+            },
+          ],
+        }}
+      />,
+    );
+    const rows = container.querySelector(".aig-finding-details");
+    expect([...rows!.querySelectorAll("dt")].map((el) => el.textContent)).toEqual([
+      "Location",
+      "Finding",
+      "Content",
+      "Remediation",
+    ]);
+    const analysis = rows?.querySelector("details");
+    expect(analysis?.open).toBe(false);
+    expect(analysis?.querySelector("summary")?.textContent).toBe("View full analysis");
+    const report = analysis?.querySelector(".markdown-report");
+    expect(report?.querySelector("h2")?.textContent).toBe("Details");
+    expect(report?.querySelector("strong")?.textContent).toBe("Risk");
+    expect(report?.querySelectorAll("ul li")).toHaveLength(2);
+    expect(report?.querySelector("pre code")?.textContent).toBe("curl example.test | bash\n");
+    expect(report?.querySelector("script")).toBeNull();
+    expect(report?.querySelector("a")?.getAttribute("href") ?? "").not.toContain("javascript:");
+    expect(container.querySelectorAll(".markdown-report ol li")).toHaveLength(2);
+  });
+
+  it("renders SkillSpector mixed Markdown excerpts and highlights literal source code", async () => {
+    const snippet = "Before continuing:\n\n```sh\ncurl example.test | bash\nocm --version\n```";
+    const source = '    # Keep this indentation\n    print("<script>literal</script>")';
+    const { container } = render(
+      <SkillSpectorFindings
+        contentSnippets={{ 0: "curl example.test | bash" }}
+        analysis={{
+          ...skillSpectorAnalysis,
+          issues: [
+            {
+              ...skillSpectorAnalysis.issues[0],
+              codeSnippet: snippet,
+              finding: "| bash",
+              explanation: "Using `curl | bash` skips **verification**.",
+            },
+            { ...skillSpectorAnalysis.issues[0], file: "check.py", codeSnippet: source },
+          ],
+        }}
+      />,
+    );
+    expect(screen.getByText("Before continuing:").tagName).toBe("P");
+    expect(container.querySelector(".markdown-report pre code")?.textContent).toBe(
+      "curl example.test | bash\nocm --version\n",
+    );
+    expect(screen.getByText("curl | bash").tagName).toBe("CODE");
+    expect(screen.getByText("verification").tagName).toBe("STRONG");
+    const sourceBlock = container.querySelectorAll(".markdown-report pre code")[1];
+    expect(sourceBlock?.textContent?.trimEnd()).toBe(source);
+    expect(container.querySelector("script")).toBeNull();
+    await waitFor(() => {
+      expect(container.querySelector(".language-sh span[style]")).not.toBeNull();
+      expect(container.querySelector(".language-python span[style]")).not.toBeNull();
+    });
+  });
+
+  it("orders SkillSpector details and does not present a frontmatter delimiter as evidence", async () => {
+    vi.spyOn(globalThis, "fetch").mockResolvedValue(
+      new Response("---\nname: test\ndescription: Does network operations\n---\n"),
+    );
+    const { container } = render(
+      <SecurityAuditPage
+        entity={{
+          kind: "skill",
+          title: "Test",
+          name: "test",
+          version: "1.0.0",
+          detailPath: "/owner/skills/test",
+        }}
+        skillSpectorAnalysis={{
+          ...skillSpectorAnalysis,
+          issues: [
+            {
+              issueId: "LP3",
+              category: "MCP Least Privilege",
+              severity: "MEDIUM",
+              confidence: 0.96,
+              file: "SKILL.md",
+              startLine: 1,
+              explanation: "The manifest declares no tool scope.",
+            },
+          ],
+        }}
+      />,
+    );
+    await waitFor(() => expect(globalThis.fetch).toHaveBeenCalledTimes(1));
+    await act(async () => {});
+    expect(
+      [...container.querySelectorAll(".static-analysis-finding dt")].map((el) => el.textContent),
+    ).toEqual(["Category", "Confidence", "Finding", "Content"]);
+    expect(
+      await screen.findByText("No source excerpt is available for this finding."),
+    ).toBeTruthy();
+    expect(container.querySelector(".static-analysis-finding pre")).toBeNull();
+    expect(screen.getByRole("heading", { name: "Undeclared Tool Scope" })).toBeTruthy();
+  });
+
+  it("identifies source excerpts and discloses shortened reported ranges", async () => {
+    const { container } = render(
+      <SkillSpectorFindings
+        analysis={{
+          ...skillSpectorAnalysis,
+          issues: [
+            {
+              ...skillSpectorAnalysis.issues[0],
+              file: "scripts/check-update.mjs",
+              startLine: 254,
+              endLine: 365,
+              codeSnippet: undefined,
+            },
+          ],
+        }}
+        contentSnippets={{
+          0: Array.from({ length: 13 }, (_, i) => `const value${i} = ${i};`).join("\n"),
+        }}
+      />,
+    );
+    expect(screen.getByText("scripts/check-update.mjs:254–266")).toBeTruthy();
+    expect(screen.getByText("Showing 13 of 112 reported lines.")).toBeTruthy();
+    await waitFor(() => expect(container.querySelector(".language-js span[style]")).not.toBeNull());
+  });
+
+  it("preserves Markdown source fallbacks and their boundary lines literally", () => {
+    const source = "\n# Heading\n```html\n<script>literal</script>\n```\n";
+    const { container } = render(
+      <SkillSpectorFindings
+        analysis={{
+          ...skillSpectorAnalysis,
+          issues: [
+            {
+              ...skillSpectorAnalysis.issues[0],
+              file: "SKILL.md",
+              startLine: 20,
+              endLine: 29,
+              codeSnippet: undefined,
+            },
+          ],
+        }}
+        contentSnippets={{ 0: source }}
+      />,
+    );
+    expect(container.querySelectorAll("pre")).toHaveLength(1);
+    expect(container.querySelector("pre code")?.textContent).toBe(`${source}\n`);
+    expect(container.querySelector("h1")).toBeNull();
+    expect(container.querySelector("script")).toBeNull();
+    expect(screen.getByText("SKILL.md:20–25")).toBeTruthy();
+    expect(screen.getByText("Showing 6 of 10 reported lines.")).toBeTruthy();
+  });
+
+  it("keeps embedded Markdown fences and HTML literal inside source excerpts", () => {
+    const source = 'const example = `\n```html\n<script>alert("example")</script>\n```\n`;';
+    const { container } = render(
+      <SkillSpectorFindings
+        analysis={{
+          ...skillSpectorAnalysis,
+          issues: [
+            {
+              ...skillSpectorAnalysis.issues[0],
+              file: "example.mjs",
+              codeSnippet: source,
+            },
+          ],
+        }}
+      />,
+    );
+    expect(container.querySelectorAll("pre")).toHaveLength(1);
+    expect(container.querySelector("pre code")?.textContent?.trimEnd()).toBe(source);
+    expect(container.querySelector("script")).toBeNull();
+  });
+
+  it("renders the complete reported SkillSpector source range without extra lines", async () => {
+    const lines = Array.from({ length: 370 }, (_, i) => `const line${i + 1} = ${i + 1};`);
+    vi.spyOn(globalThis, "fetch").mockResolvedValue(new Response(lines.join("\n")));
+    const { container } = render(
+      <SecurityAuditPage
+        entity={{
+          kind: "skill",
+          title: "Release Validation",
+          name: "release-validation",
+          version: "0.1.7",
+          detailPath: "/openclaw/skills/release-validation",
+        }}
+        skillSpectorAnalysis={{
+          ...skillSpectorAnalysis,
+          issues: [
+            {
+              ...skillSpectorAnalysis.issues[0],
+              file: "scripts/check-update.mjs",
+              startLine: 254,
+              endLine: 365,
+              codeSnippet: undefined,
+            },
+          ],
+        }}
+      />,
+    );
+    await waitFor(() =>
+      expect(container.querySelector(".static-analysis-finding pre code")?.textContent).toBe(
+        `${lines.slice(253, 365).join("\n")}\n`,
+      ),
+    );
+    expect(screen.getByText("scripts/check-update.mjs:254–365")).toBeTruthy();
+    expect(screen.queryByText(/Source excerpt/)).toBeNull();
+    expect(screen.queryByText(/reported lines/)).toBeNull();
   });
 
   it("loads plugin SkillSpector snippets through the package text-preview contract", async () => {
     const fetchMock = vi
       .spyOn(globalThis, "fetch")
-      .mockResolvedValue(new Response("first\nmatched line\nthird\n"));
+      .mockResolvedValue(new Response("first\n  matched line  \nthird\n"));
     const analysis: SkillSpectorAnalysis = {
       ...skillSpectorAnalysis,
       issues: [
@@ -559,7 +925,8 @@ describe("SecurityScanResults static guidance", () => {
     expect(requestUrl.searchParams.get("path")).toBe("main.tf");
     expect(requestUrl.searchParams.get("version")).toBe("2.0.0");
     expect(requestUrl.searchParams.get("preview")).toBe("1");
-    expect(await screen.findByText("matched line")).toBeTruthy();
+    const matched = await screen.findByText("matched line");
+    expect(matched.closest("pre")?.textContent).toContain("  matched line  ");
   });
 
   it("preserves complete SkillSpector evidence when a location fetch is narrower", async () => {
@@ -647,8 +1014,8 @@ describe("SecurityScanResults static guidance", () => {
     expect(outcomeRow?.textContent).not.toContain("Pending");
     expect(outcomeRow?.textContent).not.toContain("Malicious");
     expect(
-      screen.getByText("VirusTotal findings are pending for this skill version."),
-    ).toBeTruthy();
+      screen.queryByText("VirusTotal findings are pending for this skill version."),
+    ).toBeNull();
     expect(screen.queryByText("No SkillSpector findings.")).toBeNull();
     expect(screen.getByText("Vulnerability Patterns")).toBeTruthy();
     expect(screen.getByText("Prompt Injection")).toBeTruthy();
@@ -826,7 +1193,7 @@ describe("SecurityScanResults static guidance", () => {
     expect(screen.queryByText(/to give this audit context on these findings/i)).toBeNull();
   });
 
-  it("keeps plugin audit metadata focused while preserving hash links", () => {
+  it("keeps plugin audit metadata focused without VirusTotal hash links", () => {
     render(
       <SecurityAuditPage
         entity={{
@@ -849,9 +1216,7 @@ describe("SecurityScanResults static guidance", () => {
     expect(screen.getByText("Version")).toBeTruthy();
     expect(screen.queryByText("Hash")).toBeNull();
     expect(screen.queryByText("seeded-plugin-hash")).toBeNull();
-    expect(screen.getByRole("link", { name: /View on VirusTotal/i }).getAttribute("href")).toBe(
-      "https://www.virustotal.com/gui/file/seeded-plugin-hash",
-    );
+    expect(screen.queryByRole("link", { name: /VirusTotal/i })).toBeNull();
   });
 
   it("does not show SkillSpector as pending for plugins without bundled skills", () => {
@@ -896,213 +1261,52 @@ describe("SecurityScanResults static guidance", () => {
     expect(screen.getByText("Jan 2, 2024 · 3:04 AM UTC")).toBeTruthy();
   });
 
-  it("shows VirusTotal reports in the shared scanner report shell", () => {
-    const { container } = render(
-      <SecurityAuditPage
-        entity={{
-          kind: "skill",
-          title: "Hash Guard",
-          name: "hash-guard",
-          version: "1.2.3",
-          detailPath: "/local/hash-guard",
-        }}
-        sha256hash="abc123"
-        vtAnalysis={{
-          status: "clean",
-          verdict: "benign",
-          source: "engines",
-          engineStats: { malicious: 0, suspicious: 0, harmless: 4, undetected: 58 },
-          checkedAt: Date.now(),
-        }}
-      />,
-    );
+  it.each(["skill", "plugin"] as const)(
+    "omits VirusTotal from %s audits even when stored telemetry is present",
+    (kind) => {
+      const { container } = render(
+        <SecurityAuditPage
+          entity={{
+            kind,
+            title: "Hash Guard",
+            name: "hash-guard",
+            version: "1.2.3",
+            detailPath: "/local/hash-guard",
+          }}
+          sha256hash="abc123"
+          vtAnalysis={{
+            status: "malicious",
+            source: "engines",
+            engineStats: { malicious: 2, suspicious: 1, harmless: 3, undetected: 58 },
+            checkedAt: Date.UTC(2025, 0, 1),
+          }}
+          llmAnalysis={{
+            status: "clean",
+            summary: "No ClawScan issues.",
+            checkedAt: Date.UTC(2024, 0, 2, 3, 4),
+          }}
+        />,
+      );
+      expect(container.textContent).not.toMatch(/VirusTotal|vendors flagged/i);
+      expect(container.querySelector('a[href*="virustotal.com"]')).toBeNull();
+      expect(screen.getByRole("heading", { name: "Overview" })).toBeTruthy();
+      expect(screen.getByText("Pass")).toBeTruthy();
+      expect(screen.getByText("Jan 2, 2024 · 3:04 AM UTC")).toBeTruthy();
+    },
+  );
 
-    expect(screen.getByRole("heading", { name: "Hash Guard" })).toBeTruthy();
-    expect(
-      screen.getByText("Security checks across malware telemetry and agentic risk"),
-    ).toBeTruthy();
-    expect(screen.getByRole("heading", { name: "Overview" })).toBeTruthy();
-    expect(screen.getByText("62/62 vendors flagged this skill as clean.")).toBeTruthy();
-    expect(screen.queryByLabelText("VirusTotal findings")).toBeNull();
-    expect(screen.getByRole("heading", { name: "Security Audit Metadata" })).toBeTruthy();
-    expect(screen.getByRole("link", { name: /View on VirusTotal/i }).getAttribute("href")).toBe(
-      "https://www.virustotal.com/gui/file/abc123",
-    );
-    expect(screen.queryByRole("heading", { name: /Findings/i })).toBeNull();
-    expect(screen.queryByText("ASI03: Identity and Privilege Abuse")).toBeNull();
-    expect(screen.queryByText("Scanner verdict")).toBeNull();
-    expect(screen.queryByText("Artifact")).toBeNull();
-    expect(
-      Array.from(container.querySelectorAll(".security-report-main > section h2")).map((node) =>
-        node.textContent?.trim(),
-      ),
-    ).toEqual(["Overview", "SkillSpector", "VirusTotal"]);
-  });
-
-  it("summarizes completed engine-only VirusTotal scans", () => {
-    render(
-      <SecurityAuditPage
-        entity={{
-          kind: "skill",
-          title: "Hash Guard",
-          name: "hash-guard",
-          version: "1.2.3",
-          detailPath: "/local/hash-guard",
-        }}
-        sha256hash="abc123"
-        vtAnalysis={{
-          status: "clean",
-          source: "engines",
-          engineStats: { malicious: 0, suspicious: 0, harmless: 2, undetected: 60 },
-          checkedAt: Date.now(),
-        }}
-      />,
-    );
-
-    expect(screen.getByRole("heading", { name: "Overview" })).toBeTruthy();
-    expect(screen.getByText("62/62 vendors flagged this skill as clean.")).toBeTruthy();
-    expect(screen.queryByLabelText("VirusTotal findings")).toBeNull();
-    expect(screen.queryByText(/No VirusTotal analysis has been recorded/i)).toBeNull();
-  });
-
-  it("summarizes non-zero VirusTotal detection counts in normal prose", () => {
-    const { rerender } = render(
-      <SecurityAuditPage
-        entity={{
-          kind: "skill",
-          title: "Hash Guard",
-          name: "hash-guard",
-          version: "1.2.3",
-          detailPath: "/local/hash-guard",
-        }}
-        sha256hash="abc123"
-        vtAnalysis={{
-          status: "malicious",
-          source: "engines",
-          engineStats: { malicious: 2, suspicious: 1, harmless: 3, undetected: 58 },
-          checkedAt: Date.now(),
-        }}
-      />,
-    );
-
-    expect(
-      screen.getByText(
-        "2/64 vendors flagged this skill as malicious, 1/64 flagged it as suspicious, and 61/64 flagged it as clean.",
-      ),
-    ).toBeTruthy();
-    expect(screen.queryByLabelText("VirusTotal findings")).toBeNull();
-    expect(screen.queryByText("Harmless")).toBeNull();
-    expect(screen.queryByText("Undetected")).toBeNull();
-
-    rerender(
-      <SecurityAuditPage
-        entity={{
-          kind: "plugin",
-          title: "Plugin Guard",
-          name: "plugin-guard",
-          version: "1.2.3",
-          detailPath: "/plugins/plugin-guard",
-        }}
-        sha256hash="abc123"
-        vtAnalysis={{
-          status: "suspicious",
-          source: "engines",
-          engineStats: { malicious: 0, suspicious: 1, harmless: 3, undetected: 60 },
-          checkedAt: Date.now(),
-        }}
-      />,
-    );
-
-    expect(
-      screen.getByText(
-        "1/64 vendors flagged this plugin as suspicious, and 63/64 flagged it as clean.",
-      ),
-    ).toBeTruthy();
-  });
-
-  it("avoids denominator prose for partial VirusTotal engine stats", () => {
-    render(
-      <SecurityAuditPage
-        entity={{
-          kind: "skill",
-          title: "Hash Guard",
-          name: "hash-guard",
-          version: "1.2.3",
-          detailPath: "/local/hash-guard",
-        }}
-        sha256hash="abc123"
-        vtAnalysis={{
-          status: "suspicious",
-          source: "engines",
-          engineStats: { suspicious: 1 },
-          checkedAt: Date.now(),
-        }}
-      />,
-    );
-
-    expect(screen.getByText("1 vendor flagged this skill as suspicious.")).toBeTruthy();
-    expect(screen.queryByText("1/1 vendors flagged this skill as suspicious.")).toBeNull();
-  });
-
-  it("renders VirusTotal undetected-only fallback as pass", () => {
-    render(
-      <SecurityAuditPage
-        entity={{
-          kind: "plugin",
-          title: "Opik",
-          name: "@opik/opik-openclaw",
-          version: "0.2.14",
-          detailPath: "/plugins/@opik/opik-openclaw",
-        }}
-        sha256hash="abc123"
-        vtAnalysis={{
-          status: "clean",
-          verdict: "undetected-only-fallback",
-          analysis:
-            "VirusTotal reported no malicious or suspicious engine hits. ClawHub promoted this source-linked package after clean LLM and clean static scans.",
-          source: "engines-undetected-fallback",
-          checkedAt: Date.now(),
-        }}
-        llmAnalysis={{ status: "clean", summary: "No ClawScan issues.", checkedAt: 1 }}
-      />,
-    );
-
-    expect(screen.getByRole("heading", { name: "VirusTotal" })).toBeTruthy();
-    expect(screen.getByText("Pass")).toBeTruthy();
-    expect(screen.getByText("No VirusTotal findings")).toBeTruthy();
-    expect(screen.queryByText("undetected-only-fallback")).toBeNull();
-  });
-
-  it("treats legacy non-engine VirusTotal text as neutral and hidden", () => {
-    render(
-      <SecurityAuditPage
-        entity={{
-          kind: "skill",
-          title: "SkillScan",
-          name: "skillscan",
-          version: "1.1.6",
-          detailPath: "/tokauthai/skillscan",
-        }}
-        sha256hash="abc123"
-        vtAnalysis={{
-          status: "suspicious",
-          analysis: "Type: OpenClaw Skill Name: skillscan Version: 1.1.6 raw AI context",
-          source: "legacy-ai",
-          checkedAt: Date.now(),
-        }}
-      />,
-    );
-
-    expect(
-      screen.getByText("Security checks across malware telemetry and agentic risk"),
-    ).toBeTruthy();
-    expect(screen.queryByText("Pass")).toBeNull();
-    expect(screen.getByRole("heading", { name: "Overview" })).toBeTruthy();
-    expect(screen.queryByText(/multi-engine malware detections/i)).toBeNull();
-    expect(screen.queryByRole("heading", { name: /Findings/ })).toBeNull();
-    expect(screen.queryByText(/raw AI context/i)).toBeNull();
-    expect(screen.getByText("No VirusTotal findings")).toBeTruthy();
-  });
+  it.each(["panel", "badge"] as const)(
+    "renders only ClawScan in the %s scan results",
+    (variant) => {
+      const { container } = render(
+        <SecurityScanResults variant={variant} llmAnalysis={{ status: "clean", checkedAt: 1 }} />,
+      );
+      expect(container.textContent).not.toMatch(/VirusTotal/i);
+      expect(container.querySelector('a[href*="virustotal.com"]')).toBeNull();
+      expect(screen.getByText("Pass")).toBeTruthy();
+      expect(screen.getByLabelText("ClawScan")).toBeTruthy();
+    },
+  );
 
   it("keeps static analysis reports out of the public scanner report shell", () => {
     const { container } = render(
@@ -1118,9 +1322,7 @@ describe("SecurityScanResults static guidance", () => {
     );
 
     expect(screen.getByRole("heading", { name: "Pattern Guard" })).toBeTruthy();
-    expect(
-      screen.getByText("Security checks across malware telemetry and agentic risk"),
-    ).toBeTruthy();
+    expect(screen.getByText("Security checks for vulnerabilities and agentic risk")).toBeTruthy();
     expect(screen.getByRole("heading", { name: "Overview" })).toBeTruthy();
     expect(screen.queryByText("Static analysis")).toBeNull();
     expect(screen.queryByText("Pattern checks found a network request.")).toBeNull();
@@ -1139,7 +1341,7 @@ describe("SecurityScanResults static guidance", () => {
       Array.from(container.querySelectorAll(".security-report-main > section h2")).map((node) =>
         node.textContent?.trim(),
       ),
-    ).toEqual(["Overview", "SkillSpector", "VirusTotal"]);
+    ).toEqual(["Overview", "SkillSpector"]);
   });
 
   it("builds a security audit ZIP with scanner outcome files", () => {
@@ -1152,6 +1354,7 @@ describe("SecurityScanResults static guidance", () => {
         detailPath: "/local/pattern-guard",
       },
       sha256hash: "a".repeat(64),
+      aigAnalysis,
       llmAnalysis: clawScanAnalysis,
       skillSpectorAnalysis,
       staticScan,
@@ -1162,6 +1365,7 @@ describe("SecurityScanResults static guidance", () => {
     expect(buildSecurityAuditExportEntries(input).map((entry) => entry.path)).toEqual([
       "manifest.json",
       "clawscan.json",
+      "aig.json",
       "skillspector.json",
       "static-analysis.json",
       "virustotal.json",
@@ -1172,6 +1376,7 @@ describe("SecurityScanResults static guidance", () => {
 
     expect(Object.keys(zipEntries).sort()).toEqual([
       "README.md",
+      "aig.json",
       "clawscan.json",
       "manifest.json",
       "skillspector.json",
@@ -1179,11 +1384,13 @@ describe("SecurityScanResults static guidance", () => {
       "virustotal.json",
     ]);
     expect(JSON.parse(decode("manifest.json")).scanners).toEqual({
+      aig: "malicious",
       clawscan: "suspicious",
       skillspector: "suspicious",
       staticAnalysis: "suspicious",
       virustotal: "suspicious",
     });
+    expect(JSON.parse(decode("aig.json")).findings[0].ruleId).toBe("T04");
     expect(JSON.parse(decode("skillspector.json")).issues[0].issueId).toBe("SDI-1");
     expect(JSON.parse(decode("static-analysis.json")).findings[0].code).toBe(
       "static.network_request",
@@ -1207,9 +1414,7 @@ describe("SecurityScanResults static guidance", () => {
     );
 
     expect(screen.getByRole("heading", { name: "Plugin Guard" })).toBeTruthy();
-    expect(
-      screen.getByText("Security checks across malware telemetry and agentic risk"),
-    ).toBeTruthy();
+    expect(screen.getByText("Security checks for vulnerabilities and agentic risk")).toBeTruthy();
     expect(screen.getByText("Legacy plugin analysis summary.")).toBeTruthy();
     expect(screen.getByText("Legacy plugin guidance.")).toBeTruthy();
     expect(screen.getByRole("heading", { name: "Overview" })).toBeTruthy();
@@ -1227,7 +1432,7 @@ describe("SecurityScanResults static guidance", () => {
       Array.from(container.querySelectorAll(".security-report-main > section h2")).map((node) =>
         node.textContent?.trim(),
       ),
-    ).toEqual(["Overview", "VirusTotal", "Static analysis"]);
+    ).toEqual(["Overview", "Static analysis"]);
   });
 
   it("lets static scan risk override a clean legacy ClawScan outcome", () => {
@@ -1293,9 +1498,7 @@ describe("SecurityScanResults static guidance", () => {
     );
 
     expect(screen.getByRole("heading", { name: "Legacy Skill" })).toBeTruthy();
-    expect(
-      screen.getByText("Security checks across malware telemetry and agentic risk"),
-    ).toBeTruthy();
+    expect(screen.getByText("Security checks for vulnerabilities and agentic risk")).toBeTruthy();
     expect(screen.getByText("Legacy plugin analysis summary.")).toBeTruthy();
     expect(screen.getByRole("heading", { name: "Overview" })).toBeTruthy();
     expect(screen.queryByRole("heading", { name: "Risk analysis" })).toBeNull();
@@ -1308,7 +1511,7 @@ describe("SecurityScanResults static guidance", () => {
       Array.from(container.querySelectorAll(".security-report-main > section h2")).map((node) =>
         node.textContent?.trim(),
       ),
-    ).toEqual(["Overview", "SkillSpector", "VirusTotal"]);
+    ).toEqual(["Overview", "SkillSpector"]);
     expect(screen.getByRole("link", { name: "Back to skill" }).getAttribute("href")).toBe(
       "/local/legacy-skill",
     );
@@ -1329,14 +1532,12 @@ describe("SecurityScanResults static guidance", () => {
     );
 
     expect(screen.getByRole("heading", { name: "Pending Skill" })).toBeTruthy();
-    expect(
-      screen.getByText("Security checks across malware telemetry and agentic risk"),
-    ).toBeTruthy();
+    expect(screen.getByText("Security checks for vulnerabilities and agentic risk")).toBeTruthy();
     expect(screen.getAllByText("Pending").length).toBeGreaterThan(0);
     expect(screen.getByText("No security analysis has been recorded yet.")).toBeTruthy();
     expect(
-      screen.getByText("VirusTotal findings are pending for this skill version."),
-    ).toBeTruthy();
+      screen.queryByText("VirusTotal findings are pending for this skill version."),
+    ).toBeNull();
     expect(screen.queryByText("Static analysis")).toBeNull();
     expect(screen.queryByText("Static analysis findings are pending for this release.")).toBeNull();
     expect(screen.queryByText("No VirusTotal findings")).toBeNull();
@@ -1378,7 +1579,7 @@ describe("SecurityScanResults static guidance", () => {
       Array.from(container.querySelectorAll(".security-report-main > section h2")).map((node) =>
         node.textContent?.trim(),
       ),
-    ).toEqual(["Overview", "SkillSpector", "VirusTotal"]);
+    ).toEqual(["Overview", "SkillSpector"]);
   });
 
   it("lets skill managers enqueue a security rescan from the audit sidebar", async () => {

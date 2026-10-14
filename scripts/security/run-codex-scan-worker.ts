@@ -1,15 +1,18 @@
-import { spawn } from "node:child_process";
 import { mkdirSync, readFileSync } from "node:fs";
-import { appendFile, mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { appendFile, lstat, mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
-import { basename, dirname, join, resolve, sep } from "node:path";
+import { basename, dirname, extname, join, resolve, sep } from "node:path";
 import { pathToFileURL } from "node:url";
+import { isDeepStrictEqual } from "node:util";
 import { ConvexHttpClient } from "convex/browser";
 import { api } from "../../convex/_generated/api";
 import type { Id } from "../../convex/_generated/dataModel";
+import { endorAnalysisSchema, type EndorAnalysis } from "../../convex/lib/endorAnalysis";
 import { parseLlmEvalResponse, type LlmEvalDimension } from "../../convex/lib/securityPrompt";
+import { readWorkerAssignment } from "../../packages/clawhub-admin/src/scanAssignments";
 import { assertCodexWorkerExecutionAllowed, resolveCodexWorkerHome } from "../codex-worker-guard";
 import { materializeVerifiedArtifactFiles } from "../lib/artifactMaterialization";
+import { CommandFailure, runWorkerCommand } from "../lib/runWorkerCommand";
 import { createWorkerLogger } from "../lib/workerLogger";
 import {
   maskGitHubActionsSecret,
@@ -18,6 +21,13 @@ import {
   redactWorkerPublicText,
   safeWorkerArtifactPathLabel,
 } from "../lib/workerRedaction";
+import { writeClawHubEndorProfile } from "./clawHubEndorProfile";
+import {
+  EndorContainerCleanupError,
+  isEndorPluginScanEnabled,
+  runEndorPluginScan,
+  type EndorCommandDiagnostic,
+} from "./run-endor-plugin-scan";
 import {
   calculateSecurityScanWorkerHealthSummary,
   renderSecurityScanWorkerSummaryMarkdown,
@@ -26,6 +36,7 @@ import {
 } from "./security-scan-worker-summary";
 
 export type ClaimedJob = {
+  scannerReportsUploadUrl?: string | null;
   job: {
     _id: string;
     leaseToken: string;
@@ -92,6 +103,28 @@ export type SkillSpectorAnalysis = {
   checkedAt: number;
 };
 
+export type AigFinding = {
+  ruleId: string;
+  level: string;
+  message: string;
+  title?: string;
+  description?: string;
+  file?: string;
+  startLine?: number;
+  endLine?: number;
+  remediation?: string;
+};
+
+export type AigAnalysis = {
+  status: string;
+  issueCount: number;
+  findings: AigFinding[];
+  scannerVersion?: string;
+  summary?: string;
+  error?: string;
+  checkedAt: number;
+};
+
 type SkillSpectorScannerResult = {
   applicable: boolean;
   error?: string;
@@ -114,7 +147,7 @@ type BundledSkillSpectorScanInput = {
   scanPath: string;
 };
 
-type ClawScanCommandDiagnostic = {
+export type ClawScanCommandDiagnostic = {
   args?: string[];
   artifactPath?: string;
   exitCode?: number | null;
@@ -130,6 +163,7 @@ type ClawScanCommandDiagnostic = {
       verdict?: string;
     };
     scanners?: {
+      aigStatus?: string;
       skillspectorStatus?: string;
       staticStatus?: string;
     };
@@ -140,9 +174,11 @@ type JobDiagnosticInput = {
   clawscan?: ClawScanCommandDiagnostic;
   completedAt: number;
   diagnosticsRoot?: string;
+  endor?: EndorCommandDiagnostic;
   error?: string;
   job: ClaimedJob;
   llmAnalysis?: unknown;
+  aigAnalysis?: unknown;
   runId?: string;
   skillSpectorAnalysis?: unknown;
   startedAt: number;
@@ -155,17 +191,46 @@ type ProcessJobResult = {
   completed: boolean;
   hardFailed: boolean;
   retryableFailed: boolean;
+  workerMustStop?: boolean;
 };
 
 const DEFAULT_BATCH_LIMIT = 4;
 const DEFAULT_MAX_RUNTIME_MS = 40 * 60 * 1000;
 const DEFAULT_CLAWSCAN_TIMEOUT_MS = 20 * 60 * 1000;
-const REQUIRED_CLAWHUB_SCANNERS = ["clawscan-static", "skillspector"];
+const REQUIRED_CLAWHUB_SCANNERS = ["clawscan-static", "skillspector", "aig"];
+const REQUIRED_CLAWHUB_PACKAGE_SCANNERS = ["clawscan-static", "skillspector"];
+const CHILD_RUNTIME_ENV_KEYS = [
+  "PATH",
+  "LANG",
+  "LC_ALL",
+  "LC_CTYPE",
+  "TZ",
+  "SYSTEMROOT",
+  "SystemRoot",
+  "WINDIR",
+  "COMSPEC",
+  "PATHEXT",
+] as const;
+// ClawScan's judge and scanners require these provider settings. The pinned scanner
+// process is the trust boundary; never add worker tokens or ambient endpoints.
+const SCANNER_PROVIDER_ENV_KEYS = [
+  "CODEX_API_KEY",
+  "DEFAULT_BASE_URL",
+  "DEFAULT_MODEL",
+  "LLM_API_KEY",
+  "OPENAI_API_KEY",
+  "REASONING_EFFORT",
+  "SKILLSPECTOR_MODEL",
+  "SKILLSPECTOR_REASONING_EFFORT",
+] as const;
 const MAX_DIAGNOSTIC_TEXT_CHARS = 20_000;
 const MAX_STORED_SKILLSPECTOR_ISSUES = 25;
 const MAX_STORED_SKILLSPECTOR_TEXT_CHARS = 2_000;
 const MAX_STORED_SKILLSPECTOR_SHORT_TEXT_CHARS = 512;
+const MAX_STORED_AIG_FINDINGS = 25;
+const AIG_UNSAFE_BYTECODE_EXTENSIONS = new Set([".pyc", ".pyd", ".pyo"]);
 const DEFAULT_LEASE_MS = 60 * 60 * 1000;
+const ENDOR_SCAN_FAILED_REASON = "Endor analysis failed. Request a rescan to try again.";
 const logger = createWorkerLogger({ name: "security-scan-worker" });
 
 const root = resolve(new URL("../..", import.meta.url).pathname);
@@ -386,11 +451,16 @@ const DIAGNOSTIC_PUBLIC_TEXT_PATHS = new Set([
   "clawscanmapping.judge.verdict",
   "clawscanmapping.judge.promptsha256",
   "clawscanmapping.judge.outputschemasha256",
+  "clawscanmapping.scanners.aigstatus",
   "clawscanmapping.scanners.skillspectorstatus",
   "clawscanmapping.scanners.staticstatus",
   "llmanalysis.confidence",
   "llmanalysis.status",
   "llmanalysis.verdict",
+  "aiganalysis.findings.*.level",
+  "aiganalysis.findings.*.ruleid",
+  "aiganalysis.scannerversion",
+  "aiganalysis.status",
   "skillspectoranalysis.issues.*.issueid",
   "skillspectoranalysis.issues.*.severity",
   "skillspectoranalysis.recommendation",
@@ -612,11 +682,28 @@ function sanitizedJobForArtifactContext(job: ClaimedJob["job"]) {
 }
 
 function sanitizedTargetForArtifactContext(target: ClaimedJob["target"]) {
-  const { clawpackUrl, files, job: _job, ...safeTarget } = target;
+  const { clawpackUrl, files, job: _job, release, ...safeTarget } = target;
+  // Use only this run's injected Endor result in the judge context.
+  const { endorAnalysis: _storedEndorAnalysis, ...currentRelease } = release ?? {};
   return {
     ...safeTarget,
+    ...(release ? { release: currentRelease } : {}),
     files: files?.map(({ url: _url, ...file }) => file),
     clawpackUrl: Boolean(clawpackUrl),
+  };
+}
+
+function artifactMetadata(job: ClaimedJob) {
+  return {
+    job: sanitizedJobForArtifactContext(job.job),
+    target: sanitizedTargetForArtifactContext(job.target),
+    policy: {
+      virusTotal: "telemetry-only; never final classifier; do not hide solely from VT",
+      maliciousSignalHold:
+        "if non-VT malicious signals held the artifact, Codex decides whether to release or hide",
+      openclawPluginTrust:
+        "plugins under @openclaw owned by the OpenClaw publisher are trusted unless artifact evidence proves malicious behavior",
+    },
   };
 }
 
@@ -638,7 +725,11 @@ async function writeDiagnosticText(
       : options?.structured === false
         ? redactDiagnosticText(value, options.maxChars)
         : redactCompleteDiagnosticText(value, rootKey);
-  await writeFile(join(jobDir, fileName), redacted.endsWith("\n") ? redacted : `${redacted}\n`);
+  const bounded =
+    options?.structured !== false && options?.maxChars !== undefined
+      ? redactDiagnosticText(redacted, options.maxChars)
+      : redacted;
+  await writeFile(join(jobDir, fileName), bounded.endsWith("\n") ? bounded : `${bounded}\n`);
   return fileName;
 }
 
@@ -652,12 +743,14 @@ export async function writeJobDiagnostic(input: JobDiagnosticInput) {
     "clawscan.stdout.redacted.log",
     input.clawscan?.stdout,
     "clawscanStdout",
+    { maxChars: MAX_DIAGNOSTIC_TEXT_CHARS },
   );
   const clawscanStderrPath = await writeDiagnosticText(
     jobDir,
     "clawscan.stderr.redacted.log",
     input.clawscan?.stderr,
     "clawscanStderr",
+    { maxChars: MAX_DIAGNOSTIC_TEXT_CHARS },
   );
   const clawscanArtifactPath = await writeDiagnosticText(
     jobDir,
@@ -680,6 +773,20 @@ export async function writeJobDiagnostic(input: JobDiagnosticInput) {
           rawArtifact: input.clawscan.rawArtifact,
         })
       : [];
+  const endorStdoutPath = await writeDiagnosticText(
+    jobDir,
+    "endor.stdout.redacted.log",
+    input.endor?.stdout,
+    "endorStdout",
+    { maxChars: MAX_DIAGNOSTIC_TEXT_CHARS },
+  );
+  const endorStderrPath = await writeDiagnosticText(
+    jobDir,
+    "endor.stderr.redacted.log",
+    input.endor?.stderr,
+    "endorStderr",
+    { maxChars: MAX_DIAGNOSTIC_TEXT_CHARS },
+  );
 
   const diagnostic = {
     completedAt: input.completedAt,
@@ -694,6 +801,7 @@ export async function writeJobDiagnostic(input: JobDiagnosticInput) {
       waitForVtUntil: input.job.job.waitForVtUntil,
     },
     llmAnalysis: redactDiagnosticValue(input.llmAnalysis, ["llmAnalysis"]),
+    aigAnalysis: redactDiagnosticValue(input.aigAnalysis, ["aigAnalysis"]),
     runId: input.runId,
     clawscan: input.clawscan
       ? {
@@ -720,6 +828,16 @@ export async function writeJobDiagnostic(input: JobDiagnosticInput) {
       stderrPath: clawscanStderrPath,
       stdoutPath: clawscanStdoutPath,
     },
+    endorResult: input.endor
+      ? {
+          args: input.endor.args,
+          error: input.endor.error ? redactDiagnosticText(input.endor.error) : undefined,
+          exitCode: input.endor.exitCode,
+          stderrPath: endorStderrPath,
+          stdoutPath: endorStdoutPath,
+          timedOut: input.endor.timedOut,
+        }
+      : undefined,
   };
 
   await writeFile(join(jobDir, "diagnostic.json"), `${JSON.stringify(diagnostic, null, 2)}\n`);
@@ -747,18 +865,10 @@ async function download(url: string, artifact: { kind: "file" | "clawpack"; path
 
 export async function writeArtifactWorkspace(job: ClaimedJob, workspace: string) {
   await mkdir(join(workspace, "artifact"), { recursive: true });
-  const metadata = {
-    job: sanitizedJobForArtifactContext(job.job),
-    target: sanitizedTargetForArtifactContext(job.target),
-    policy: {
-      virusTotal: "telemetry-only; never final classifier; do not hide solely from VT",
-      maliciousSignalHold:
-        "if non-VT malicious signals held the artifact, Codex decides whether to release or hide",
-      openclawPluginTrust:
-        "plugins under @openclaw owned by the OpenClaw publisher are trusted unless artifact evidence proves malicious behavior",
-    },
-  };
-  await writeFile(join(workspace, "metadata.json"), `${JSON.stringify(metadata, null, 2)}\n`);
+  await writeFile(
+    join(workspace, "metadata.json"),
+    `${JSON.stringify(artifactMetadata(job), null, 2)}\n`,
+  );
 
   await materializeVerifiedArtifactFiles({
     artifactRoot: join(workspace, "artifact"),
@@ -808,43 +918,24 @@ async function fileExists(path: string) {
   }
 }
 
-function codexEnv() {
-  const env = { ...process.env };
+function codexEnv(workspace: string) {
+  const env: NodeJS.ProcessEnv = {
+    NO_COLOR: "1",
+    SKILLSPECTOR_PROVIDER: process.env.SKILLSPECTOR_PROVIDER || "openai",
+    TEMP: workspace,
+    TMP: workspace,
+    TMPDIR: workspace,
+  };
+  for (const key of [...CHILD_RUNTIME_ENV_KEYS, ...SCANNER_PROVIDER_ENV_KEYS]) {
+    const value = process.env[key];
+    if (value !== undefined) env[key] = value;
+  }
   const codexHome = resolveCodexWorkerHome(process.env, LOCAL_CODEX_HOME);
   if (codexHome) {
     mkdirSync(codexHome, { recursive: true });
     env.CODEX_HOME = codexHome;
   }
-  delete env.GH_TOKEN;
-  delete env.GITHUB_TOKEN;
-  delete env.CONVEX_DEPLOY_KEY;
-  delete env.SECURITY_SCAN_WORKER_TOKEN;
-  delete env.HOMEBREW_GITHUB_API_TOKEN;
-  env.NO_COLOR = "1";
-  env.SKILLSPECTOR_PROVIDER = env.SKILLSPECTOR_PROVIDER || "openai";
   return env;
-}
-
-class CommandFailure extends Error {
-  exitCode: number | null;
-  stderr: string;
-  stdout: string;
-  timedOut: boolean;
-
-  constructor(
-    message: string,
-    exitCode: number | null,
-    stdout: string,
-    stderr: string,
-    timedOut: boolean,
-  ) {
-    super(message);
-    this.name = "CommandFailure";
-    this.exitCode = exitCode;
-    this.stdout = stdout;
-    this.stderr = stderr;
-    this.timedOut = timedOut;
-  }
 }
 
 async function runCommand(
@@ -852,67 +943,13 @@ async function runCommand(
   args: string[],
   options: { cwd: string; input?: string; omitEnv?: string[]; timeoutMs: number },
 ) {
-  return await new Promise<{ stdout: string; stderr: string }>((resolvePromise, reject) => {
-    const env = codexEnv();
-    for (const name of options.omitEnv ?? []) delete env[name];
-    const child = spawn(command, args, {
-      cwd: options.cwd,
-      detached: process.platform !== "win32",
-      env,
-      stdio: ["pipe", "pipe", "pipe"],
-    });
-    let stdout = "";
-    let stderr = "";
-    let timedOut = false;
-    let forceKillTimeout: NodeJS.Timeout | undefined;
-    const killProcessTree = (signal: NodeJS.Signals) => {
-      if (process.platform !== "win32" && child.pid) {
-        try {
-          process.kill(-child.pid, signal);
-          return;
-        } catch {
-          // The process group may already have exited; fall back to the direct child.
-        }
-      }
-      child.kill(signal);
-    };
-    const timeout = setTimeout(() => {
-      timedOut = true;
-      killProcessTree("SIGTERM");
-      forceKillTimeout = setTimeout(() => killProcessTree("SIGKILL"), 10_000);
-      forceKillTimeout.unref();
-    }, options.timeoutMs);
-    child.stdout.on("data", (chunk) => {
-      stdout += String(chunk);
-    });
-    child.stderr.on("data", (chunk) => {
-      stderr += String(chunk);
-    });
-    child.on("error", (error) => {
-      clearTimeout(timeout);
-      if (timedOut) killProcessTree("SIGKILL");
-      if (forceKillTimeout) clearTimeout(forceKillTimeout);
-      reject(error);
-    });
-    child.on("close", (code) => {
-      clearTimeout(timeout);
-      if (timedOut) killProcessTree("SIGKILL");
-      if (forceKillTimeout) clearTimeout(forceKillTimeout);
-      if (code === 0) resolvePromise({ stdout, stderr });
-      else {
-        reject(
-          new CommandFailure(
-            `${command} ${timedOut ? "timed out" : `exited ${code}`}; see redacted stdout/stderr diagnostics`,
-            code,
-            stdout,
-            stderr,
-            timedOut,
-          ),
-        );
-      }
-    });
-    if (options.input) child.stdin.end(options.input);
-    else child.stdin.end();
+  const env = codexEnv(options.cwd);
+  for (const name of options.omitEnv ?? []) delete env[name];
+  return await runWorkerCommand(command, args, {
+    cwd: options.cwd,
+    env,
+    input: options.input,
+    timeoutMs: options.timeoutMs,
   });
 }
 
@@ -1153,6 +1190,236 @@ export function normalizeSkillSpectorAnalysis(
   };
 }
 
+function normalizeAigPrediction(value: unknown) {
+  if (typeof value !== "string") return undefined;
+  const normalized = value.trim().toLowerCase();
+  if (["clean", "benign", "safe", "pass", "passed"].includes(normalized)) return "clean";
+  if (["malicious", "unsafe", "block", "blocked"].includes(normalized)) return "malicious";
+  if (["suspicious", "review", "warning", "warn"].includes(normalized)) return "suspicious";
+  return undefined;
+}
+
+function aigPredictionFromProperties(value: unknown) {
+  const properties = asRecord(value);
+  if (!properties) return undefined;
+  for (const key of ["prediction", "verdict", "judgment", "status"]) {
+    const prediction = normalizeAigPrediction(properties[key]);
+    if (prediction) return prediction;
+  }
+  return undefined;
+}
+
+function sarifMessageText(value: unknown) {
+  if (typeof value === "string") return value.trim() || undefined;
+  return readString(asRecord(value) ?? {}, ["text", "markdown"]);
+}
+
+function aigResultMessage(result: Record<string, unknown>, ruleName?: string) {
+  const message = asRecord(result.message);
+  const title =
+    readString(message ?? {}, ["text", "markdown"]) ??
+    readString(result, ["message"]) ??
+    ruleName ??
+    readString(result, ["ruleId", "rule_id"]) ??
+    "A.I.G reported a security finding.";
+  const description =
+    readString(asRecord(result.properties) ?? {}, ["description"]) ??
+    readString(result, ["description"]);
+  if (!description || description === title) return title;
+  return /[.!?]$/.test(title) ? `${title} ${description}` : `${title}: ${description}`;
+}
+
+function aigResultTitle(result: Record<string, unknown>, ruleName?: string) {
+  const message = asRecord(result.message);
+  return (
+    readString(message ?? {}, ["text", "markdown"]) ??
+    readString(result, ["message"]) ??
+    ruleName ??
+    readString(result, ["ruleId", "rule_id"]) ??
+    "A.I.G reported a security finding."
+  );
+}
+
+function aigResultDescription(result: Record<string, unknown>) {
+  return (
+    readString(asRecord(result.properties) ?? {}, ["description"]) ??
+    readString(result, ["description"])
+  );
+}
+
+function readSarifLineNumber(region: Record<string, unknown>, keys: string[]) {
+  const value = readNumber(region, keys);
+  return typeof value === "number" && Number.isSafeInteger(value) && value > 0 ? value : undefined;
+}
+
+function normalizeAigFinding(
+  input: unknown,
+  index: number,
+  ruleNames: ReadonlyMap<string, string>,
+): AigFinding | null {
+  const result = asRecord(input);
+  if (!result) return null;
+  const ruleId = readString(result, ["ruleId", "rule_id"]) ?? `AIG-${index + 1}`;
+  const location = Array.isArray(result.locations) ? asRecord(result.locations[0]) : undefined;
+  const physicalLocation = asRecord(location?.physicalLocation);
+  const artifactLocation = asRecord(physicalLocation?.artifactLocation);
+  const region = asRecord(physicalLocation?.region);
+  const properties = asRecord(result.properties);
+  const firstFix = Array.isArray(result.fixes) ? asRecord(result.fixes[0]) : undefined;
+  const remediation =
+    readString(properties ?? {}, ["remediation", "recommendation", "mitigation", "fix"]) ??
+    sarifMessageText(firstFix?.description) ??
+    sarifMessageText(firstFix?.message);
+  const title = truncateStoredSkillSpectorText(aigResultTitle(result, ruleNames.get(ruleId)));
+  const description = truncateStoredSkillSpectorText(aigResultDescription(result));
+  return {
+    ruleId:
+      truncateStoredSkillSpectorText(ruleId, MAX_STORED_SKILLSPECTOR_SHORT_TEXT_CHARS) ??
+      `AIG-${index + 1}`,
+    level:
+      truncateStoredSkillSpectorText(
+        readString(result, ["level"]) ?? readString(properties ?? {}, ["severity"]),
+        MAX_STORED_SKILLSPECTOR_SHORT_TEXT_CHARS,
+      ) ?? "warning",
+    message:
+      truncateStoredSkillSpectorText(aigResultMessage(result, ruleNames.get(ruleId))) ??
+      "A.I.G reported a security finding.",
+    ...(title ? { title } : {}),
+    ...(description ? { description } : {}),
+    file: truncateStoredSkillSpectorText(
+      readString(artifactLocation ?? {}, ["uri", "path"]),
+      MAX_STORED_SKILLSPECTOR_SHORT_TEXT_CHARS,
+    ),
+    startLine: readSarifLineNumber(region ?? {}, ["startLine", "start_line"]),
+    endLine: readSarifLineNumber(region ?? {}, ["endLine", "end_line"]),
+    remediation: truncateStoredSkillSpectorText(remediation),
+  };
+}
+
+export function normalizeAigAnalysis(raw: string, checkedAt = Date.now()): AigAnalysis {
+  const parsed = JSON.parse(raw) as unknown;
+  const document = asRecord(parsed);
+  if (!document || readString(document, ["version"]) !== "2.1.0" || !Array.isArray(document.runs)) {
+    return {
+      status: "error",
+      issueCount: 0,
+      findings: [],
+      error: "A.I.G returned invalid SARIF 2.1.0 output.",
+      checkedAt,
+    };
+  }
+
+  if (document.runs.length === 0) {
+    return {
+      status: "error",
+      issueCount: 0,
+      findings: [],
+      error: "A.I.G SARIF output did not contain a run.",
+      checkedAt,
+    };
+  }
+  const runs: Record<string, unknown>[] = [];
+  for (const rawRun of document.runs) {
+    const run = asRecord(rawRun);
+    const driver = asRecord(asRecord(run?.tool)?.driver);
+    if (!run || readString(driver ?? {}, ["name"]) !== "aig-skill-scan") continue;
+    if (!Array.isArray(run.results)) {
+      return {
+        status: "error",
+        issueCount: 0,
+        findings: [],
+        error: "A.I.G SARIF output did not contain a valid aig-skill-scan run.",
+        checkedAt,
+      };
+    }
+    if (
+      Array.isArray(run.invocations) &&
+      run.invocations.some((invocation) => asRecord(invocation)?.executionSuccessful === false)
+    ) {
+      return {
+        status: "error",
+        issueCount: 0,
+        findings: [],
+        error: "A.I.G SARIF output reported an unsuccessful invocation.",
+        checkedAt,
+      };
+    }
+    runs.push(run);
+  }
+  if (runs.length === 0) {
+    return {
+      status: "error",
+      issueCount: 0,
+      findings: [],
+      error: "A.I.G SARIF output did not contain a valid aig-skill-scan run.",
+      checkedAt,
+    };
+  }
+  const ruleNames = new Map<string, string>();
+  let scannerVersion: string | undefined;
+  const rawResults: unknown[] = [];
+  let prediction = aigPredictionFromProperties(document.properties);
+
+  for (const run of runs) {
+    const driver = asRecord(asRecord(run.tool)?.driver);
+    scannerVersion ??= readString(driver ?? {}, ["version", "semanticVersion"]);
+    const rules = Array.isArray(driver?.rules) ? driver.rules : [];
+    for (const rawRule of rules) {
+      const rule = asRecord(rawRule);
+      if (!rule) continue;
+      const id = readString(rule, ["id"]);
+      const name = readString(rule, ["name", "shortDescription"]);
+      if (id && name) ruleNames.set(id, name);
+    }
+    prediction ??= aigPredictionFromProperties(run.properties);
+    if (Array.isArray(run.results)) rawResults.push(...run.results);
+  }
+
+  for (const rawResult of rawResults) {
+    prediction ??= aigPredictionFromProperties(asRecord(rawResult)?.properties);
+  }
+  if (!prediction) {
+    prediction = rawResults.length > 0 ? "suspicious" : "clean";
+  }
+
+  if (rawResults.some((result) => !asRecord(result))) {
+    return {
+      status: "error",
+      issueCount: 0,
+      findings: [],
+      error: "A.I.G SARIF output contained a malformed result.",
+      checkedAt,
+    };
+  }
+
+  const findings = rawResults
+    .slice(0, MAX_STORED_AIG_FINDINGS)
+    .map((result, index) => normalizeAigFinding(result, index, ruleNames))
+    .filter((finding): finding is AigFinding => Boolean(finding));
+  const issueCount = rawResults.length;
+  return {
+    status: prediction,
+    issueCount,
+    findings,
+    scannerVersion: truncateStoredSkillSpectorText(
+      scannerVersion,
+      MAX_STORED_SKILLSPECTOR_SHORT_TEXT_CHARS,
+    ),
+    summary: `A.I.G reported ${issueCount} ${issueCount === 1 ? "finding" : "findings"}.`,
+    checkedAt,
+  };
+}
+
+export function assertAigFilePathsHaveNoCompiledPython(filePaths: readonly string[]) {
+  for (const filePath of filePaths) {
+    if (AIG_UNSAFE_BYTECODE_EXTENSIONS.has(extname(filePath).toLowerCase())) {
+      throw new Error(
+        "A.I.G 0.2.1 cannot safely inspect packaged Python bytecode; remove .pyc, .pyo, and .pyd files before publishing (CVE-2026-84809).",
+      );
+    }
+  }
+}
+
 function verdictToStatus(verdict: string) {
   return verdict === "benign" ? "clean" : verdict;
 }
@@ -1213,7 +1480,7 @@ function bundledSkillRootsForJob(job: ClaimedJob) {
 
 export async function resolveBundledSkillSpectorScanInputs(workspace: string, job: ClaimedJob) {
   if (job.job.targetKind !== "packageRelease") return [];
-  const packageRoot = await resolveClawScanTarget(workspace, job);
+  const packageRoot = await resolveScanArtifactRoot(workspace, job);
   const artifactRoot = resolve(workspace, packageRoot);
   return bundledSkillRootsForJob(job)
     .map((rootPath) => {
@@ -1402,10 +1669,15 @@ async function runBundledSkillSpector(
   return aggregateSkillSpectorAnalyses(analyses);
 }
 
-const REQUIRED_CLAWHUB_RESULT_KEYS = [
-  ...CLAWHUB_OUTPUT_SCHEMA_CONTRACT.requiredResultKeys,
-  "artifact_inspection",
-];
+async function prepareBundledSkillSpector(job: ClaimedJob, workspace: string) {
+  const scanInputs = await resolveBundledSkillSpectorScanInputs(workspace, job);
+  const resultPath = join(workspace, "skillspector-aggregate.json");
+  const result = await runBundledSkillSpector(workspace, scanInputs);
+  await writeFile(resultPath, `${JSON.stringify(result, null, 2)}\n`, "utf8");
+  return resultPath;
+}
+
+const REQUIRED_CLAWHUB_RESULT_KEYS = CLAWHUB_OUTPUT_SCHEMA_CONTRACT.requiredResultKeys;
 const REQUIRED_CLAWHUB_DIMENSION_KEYS = CLAWHUB_OUTPUT_SCHEMA_CONTRACT.requiredDimensionKeys;
 const REQUIRED_CLAWHUB_DIMENSION_FIELD_KEYS =
   CLAWHUB_OUTPUT_SCHEMA_CONTRACT.requiredDimensionFieldKeys;
@@ -1548,10 +1820,19 @@ function readClawScanScannerStatuses(
   return scannerStatuses;
 }
 
-function clawScanDiagnosticMapping(artifact: Record<string, unknown>) {
+function requiredClawHubScanners(targetKind: ClaimedJob["job"]["targetKind"]) {
+  return targetKind === "packageRelease"
+    ? REQUIRED_CLAWHUB_PACKAGE_SCANNERS
+    : REQUIRED_CLAWHUB_SCANNERS;
+}
+
+function clawScanDiagnosticMapping(
+  artifact: Record<string, unknown>,
+  scannerSet = REQUIRED_CLAWHUB_SCANNERS,
+) {
   const judge = asRecord(artifact.judge);
   const result = asRecord(judge?.result);
-  const scannerStatuses = readClawScanScannerStatuses(artifact);
+  const scannerStatuses = readClawScanScannerStatuses(artifact, scannerSet);
   return {
     judge: {
       outputSchemaSha256: readString(judge ?? {}, ["outputSchemaSha256", "outputSchemaSHA"]),
@@ -1560,13 +1841,18 @@ function clawScanDiagnosticMapping(artifact: Record<string, unknown>) {
       verdict: readString(result ?? {}, ["verdict"]),
     },
     scanners: {
+      aigStatus: scannerStatuses.aig,
       skillspectorStatus: scannerStatuses.skillspector,
       staticStatus: scannerStatuses["clawscan-static"],
     },
   };
 }
 
-function validateClawScanArtifactForClawHubProfile(artifact: Record<string, unknown>) {
+function validateClawScanArtifactForClawHubProfile(
+  artifact: Record<string, unknown>,
+  scannerSet = REQUIRED_CLAWHUB_SCANNERS,
+  endorAnalysis?: EndorAnalysis,
+) {
   const schemaVersion = readString(artifact, ["schemaVersion"]);
   if (schemaVersion !== "clawscan-run-v1") {
     throw new Error(`ClawScan artifact schemaVersion was ${schemaVersion ?? "missing"}`);
@@ -1576,9 +1862,10 @@ function validateClawScanArtifactForClawHubProfile(artifact: Record<string, unkn
     throw new Error(`ClawScan artifact profile was ${profile ?? "missing"}`);
   }
 
-  const scannerStatuses = readClawScanScannerStatuses(artifact);
+  const scannerStatuses = readClawScanScannerStatuses(artifact, scannerSet);
   const allowedScannerStatuses: Record<string, Set<string>> = {
     "clawscan-static": new Set(["completed"]),
+    aig: new Set(["completed"]),
     skillspector: new Set(["completed"]),
   };
   for (const [scanner, status] of Object.entries(scannerStatuses)) {
@@ -1605,6 +1892,16 @@ function validateClawScanArtifactForClawHubProfile(artifact: Record<string, unkn
   }
 
   const scanners = asRecord(artifact.scanners);
+  if (endorAnalysis) {
+    const endor = asRecord(scanners?.endor);
+    if (readString(endor ?? {}, ["status"]) !== "completed") {
+      throw new Error("ClawScan Endor evidence was not supplied to the judge");
+    }
+    const parsedEndor = endorAnalysisSchema.safeParse(endor?.raw);
+    if (!parsedEndor.success || !isDeepStrictEqual(parsedEndor.data, endorAnalysis)) {
+      throw new Error("ClawScan Endor evidence did not match the prepared analysis");
+    }
+  }
   const skillSpector = asRecord(scanners?.skillspector);
   if (!skillSpector || skillSpector.raw === undefined) {
     throw new Error("ClawScan skillspector scanner output was missing");
@@ -1613,11 +1910,30 @@ function validateClawScanArtifactForClawHubProfile(artifact: Record<string, unkn
     typeof skillSpector.raw === "string" ? skillSpector.raw : JSON.stringify(skillSpector.raw);
 
   const checkedAt = artifactCompletedAtMs(artifact);
+  let aigAnalysis: AigAnalysis | undefined;
+  let rawAig: string | undefined;
+  if (scannerSet.includes("aig")) {
+    const aig = asRecord(scanners?.aig);
+    if (!aig || aig.raw === undefined) {
+      throw new Error("ClawScan aig scanner output was missing");
+    }
+    rawAig = typeof aig.raw === "string" ? aig.raw : JSON.stringify(aig.raw);
+    aigAnalysis = normalizeAigAnalysis(rawAig, checkedAt);
+    if (aigAnalysis.status === "error") {
+      throw new Error(aigAnalysis.error ?? "A.I.G returned unusable scanner output");
+    }
+  }
 
   return {
+    aigAnalysis,
     llmAnalysis: toStoredLlmAnalysis(parsed, checkedAt),
-    mapping: clawScanDiagnosticMapping(artifact),
+    mapping: clawScanDiagnosticMapping(artifact, scannerSet),
     skillSpectorAnalysis: normalizeSkillSpectorAnalysis(rawSkillSpector, checkedAt),
+    scannerReportsJson: JSON.stringify({
+      checkedAt,
+      aig: rawAig ? (JSON.parse(rawAig) as unknown) : null,
+      skillspector: JSON.parse(rawSkillSpector) as unknown,
+    }),
   };
 }
 
@@ -1625,25 +1941,47 @@ export async function runClawScan(
   job: ClaimedJob,
   workspace: string,
   onDiagnostic: (diagnostic: Partial<ClawScanCommandDiagnostic>) => void,
+  endorAnalysis?: EndorAnalysis,
+  preparedSkillSpectorPath?: string,
 ) {
   const command = process.env.CODEX_SECURITY_SCAN_CLAWSCAN_COMMAND ?? "clawscan";
   const artifactPath = join(workspace, "clawscan-artifact.json");
   const target = await resolveClawScanTarget(workspace, job);
+  const scannerSet = requiredClawHubScanners(job.job.targetKind);
+  if (scannerSet.includes("aig")) {
+    assertAigFilePathsHaveNoCompiledPython(job.target.files?.map((file) => file.path) ?? []);
+  }
   const args = [target, "--profile", "clawhub"];
+  if (endorAnalysis) {
+    const configPath = await writeClawHubEndorProfile(workspace, schemaPath);
+    const endorResultPath = join(workspace, "endor-analysis.json");
+    const contextPath = join(workspace, "clawhub-endor-context.json");
+    await writeFile(endorResultPath, `${JSON.stringify(endorAnalysis)}\n`, "utf8");
+    // ClawScan writes only context.metadata into the judge's metadata.json.
+    await writeFile(contextPath, JSON.stringify({ metadata: artifactMetadata(job) }), "utf8");
+    args.push(
+      "--config",
+      configPath,
+      "--context",
+      contextPath,
+      "--scanner-result",
+      `endor=${endorResultPath}`,
+    );
+  }
   if (job.job.targetKind === "packageRelease") {
     // SkillSpector only understands skills. ClawHub owns the plugin manifest
     // boundary, so never let ClawScan fall back to scanning the whole package.
-    const scanInputs = await resolveBundledSkillSpectorScanInputs(workspace, job);
-    const skillSpectorResultPath = join(workspace, "skillspector-aggregate.json");
-    const skillSpectorResult = await runBundledSkillSpector(workspace, scanInputs);
-    await writeFile(
-      skillSpectorResultPath,
-      `${JSON.stringify(skillSpectorResult, null, 2)}\n`,
-      "utf8",
-    );
+    const skillSpectorResultPath =
+      preparedSkillSpectorPath ?? (await prepareBundledSkillSpector(job, workspace));
     args.push("--scanner-result", `skillspector=${skillSpectorResultPath}`);
   }
   args.push("--output", artifactPath);
+  const sandbox = process.env.CODEX_SECURITY_SCAN_CLAWSCAN_SANDBOX?.trim();
+  if (sandbox) {
+    args.push("--sandbox", sandbox);
+    const sandboxImage = process.env.CODEX_SECURITY_SCAN_CLAWSCAN_SANDBOX_IMAGE?.trim();
+    if (sandbox === "docker" && sandboxImage) args.push("--sandbox-image", sandboxImage);
+  }
   onDiagnostic({ args: [command, ...args], artifactPath });
 
   const captureArtifact = async () => {
@@ -1657,7 +1995,7 @@ export async function runClawScan(
       return undefined;
     }
     const artifact = asRecord(parsedArtifact);
-    if (artifact) onDiagnostic({ mapping: clawScanDiagnosticMapping(artifact) });
+    if (artifact) onDiagnostic({ mapping: clawScanDiagnosticMapping(artifact, scannerSet) });
     return artifact;
   };
 
@@ -1688,12 +2026,12 @@ export async function runClawScan(
   const artifact = await captureArtifact();
   if (!artifact) throw new Error("ClawScan did not emit a valid JSON artifact");
 
-  const mapped = validateClawScanArtifactForClawHubProfile(artifact);
+  const mapped = validateClawScanArtifactForClawHubProfile(artifact, scannerSet, endorAnalysis);
   onDiagnostic({ mapping: mapped.mapping });
   return mapped;
 }
 
-async function resolveClawScanTarget(workspace: string, job: ClaimedJob) {
+async function resolveScanArtifactRoot(workspace: string, job: ClaimedJob) {
   if (job.job.targetKind === "packageRelease") {
     const packageRoot = join(workspace, "artifact", "package");
     if (await fileExists(join(packageRoot, "package.json"))) return "./artifact/package";
@@ -1701,18 +2039,36 @@ async function resolveClawScanTarget(workspace: string, job: ClaimedJob) {
   return "./artifact";
 }
 
+export async function resolveClawScanTarget(workspace: string, job: ClaimedJob) {
+  const root = await resolveScanArtifactRoot(workspace, job);
+  const manifests = ["SKILL.md", "openclaw.plugin.json"];
+  const present = await Promise.all(
+    manifests.map(async (name) =>
+      (await lstat(join(workspace, root, name)).catch(() => null))?.isFile(),
+    ),
+  );
+  // ClawScan rejects dual-manifest directories. An explicit manifest selects the
+  // claimed kind while ClawScan still scans the entire dual-layout directory.
+  return present.every(Boolean)
+    ? `${root}/${manifests[job.job.targetKind === "packageRelease" ? 1 : 0]}`
+    : root;
+}
+
 export function scanHealthClassification(input: {
   clawscan: ClawScanCommandDiagnostic;
+  endor?: EndorCommandDiagnostic;
   errorMessage?: string;
   status: "completed" | "failed";
 }) {
-  const timedOut = Boolean(input.clawscan.timedOut);
+  const timedOut = Boolean(input.clawscan.timedOut || input.endor?.timedOut);
   const scannerStatuses = Object.values(input.clawscan.mapping?.scanners ?? {}).filter(
     (status): status is string => Boolean(status),
   );
   let scannerStageFailed = scannerStatuses.some(
     (status) => status !== "completed" && status !== "missing",
   );
+  // processJob records an Endor error for every failed run, including exits and timeouts.
+  scannerStageFailed ||= Boolean(input.endor?.error);
   const judgeStatus = input.clawscan.mapping?.judge?.status;
   let judgeStageFailed = Boolean(judgeStatus && judgeStatus !== "completed");
   scannerStageFailed ||= /ClawScan scanner/i.test(input.errorMessage ?? "");
@@ -1744,25 +2100,89 @@ export async function processJob(
   const workspace = await mkdtemp(join(tmpdir(), `clawhub-codex-scan-${basename(job.job._id)}-`));
   const startedAt = Date.now();
   const clawscan: ClawScanCommandDiagnostic = {};
+  const endor: EndorCommandDiagnostic = {};
   let errorMessage: string | undefined;
   let scanCompletedAt: number | undefined;
   let llmAnalysis: StoredLlmAnalysis | undefined;
+  let aigAnalysis: AigAnalysis | undefined;
   let skillSpectorAnalysis: SkillSpectorAnalysis | undefined;
+  let endorAnalysis: EndorAnalysis | undefined;
+  let preserveWorkspaceForEndorCleanup = false;
   let status: JobDiagnosticInput["status"] = "failed";
   try {
     await writeArtifactWorkspace(job, workspace);
-    const mapped = await runClawScan(job, workspace, (next) => {
-      Object.assign(clawscan, next);
-    });
+    const shouldRunEndor = job.job.targetKind === "packageRelease" && isEndorPluginScanEnabled();
+    const [endorResult, skillSpectorResult] = await Promise.allSettled([
+      shouldRunEndor
+        ? runEndorPluginScan({
+            workspace,
+            onDiagnostic: (next) => {
+              Object.assign(endor, next);
+            },
+          })
+        : Promise.resolve(undefined),
+      job.job.targetKind === "packageRelease"
+        ? prepareBundledSkillSpector(job, workspace)
+        : Promise.resolve(undefined),
+    ]);
+    if (endorResult.status === "fulfilled") {
+      endorAnalysis = endorResult.value;
+    } else {
+      const { reason } = endorResult;
+      endor.error = sanitizeWorkerErrorMessage(
+        reason instanceof Error ? reason.message : String(reason),
+      );
+      if (reason instanceof EndorContainerCleanupError) {
+        preserveWorkspaceForEndorCleanup = true;
+        throw reason;
+      }
+      endorAnalysis = {
+        status: "failed",
+        checkedAt: Date.now(),
+        reason: ENDOR_SCAN_FAILED_REASON,
+      };
+    }
+    if (skillSpectorResult.status === "rejected") throw skillSpectorResult.reason;
+    const mapped = await runClawScan(
+      job,
+      workspace,
+      (next) => {
+        Object.assign(clawscan, next);
+      },
+      endorAnalysis,
+      skillSpectorResult.value,
+    );
     llmAnalysis = mapped.llmAnalysis;
+    aigAnalysis = mapped.aigAnalysis;
     skillSpectorAnalysis = mapped.skillSpectorAnalysis;
     if (!llmAnalysis) throw new Error("Security scan did not produce llmAnalysis");
+    // A signed upload URL advertises support after the separately deployed
+    // backend updates. Upload directly to storage to avoid action argument limits.
+    let scannerReportsStorageId: string | undefined;
+    if (job.scannerReportsUploadUrl) {
+      const uploaded = await fetch(job.scannerReportsUploadUrl, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: mapped.scannerReportsJson,
+      });
+      if (!uploaded.ok) throw new Error(`Scanner report upload failed (${uploaded.status})`);
+      const uploadResult = asRecord(await uploaded.json());
+      if (typeof uploadResult?.storageId !== "string" || !uploadResult.storageId) {
+        throw new Error("Scanner report upload did not return a storage ID");
+      }
+      scannerReportsStorageId = uploadResult.storageId;
+    }
     await client.action(api.securityScan.completeCodexScanJob, {
       token,
       jobId: job.job._id as Id<"securityScanJobs">,
       leaseToken: job.job.leaseToken,
       llmAnalysis,
+      aigAnalysis,
       skillSpectorAnalysis,
+      ...(endorAnalysis ? { endorAnalysis } : {}),
+      ...(scannerReportsStorageId
+        ? { scannerReportsStorageId: scannerReportsStorageId as Id<"_storage"> }
+        : {}),
       runId: process.env.GITHUB_RUN_ID,
     });
     scanCompletedAt = Date.now();
@@ -1781,6 +2201,7 @@ export async function processJob(
     );
     const health = scanHealthClassification({
       clawscan,
+      endor,
       status: "completed",
     });
     onHealth?.({
@@ -1791,6 +2212,7 @@ export async function processJob(
     });
     return { completed: true, hardFailed: false, retryableFailed: false };
   } catch (error) {
+    const workerMustStop = error instanceof EndorContainerCleanupError;
     errorMessage = sanitizeWorkerErrorMessage(
       error instanceof Error ? error.message : String(error),
     );
@@ -1815,6 +2237,7 @@ export async function processJob(
     const completedAt = Date.now();
     const health = scanHealthClassification({
       clawscan,
+      endor,
       errorMessage,
       status: "failed",
     });
@@ -1825,8 +2248,9 @@ export async function processJob(
     });
     return {
       completed: false,
-      hardFailed: !failResult?.retry,
-      retryableFailed: Boolean(failResult?.retry),
+      hardFailed: workerMustStop || !failResult?.retry,
+      retryableFailed: !workerMustStop && Boolean(failResult?.retry),
+      ...(workerMustStop ? { workerMustStop: true } : {}),
     };
   } finally {
     try {
@@ -1834,9 +2258,11 @@ export async function processJob(
         completedAt: Date.now(),
         clawscan,
         diagnosticsRoot,
+        endor: Object.keys(endor).length > 0 ? endor : undefined,
         error: errorMessage,
         job,
         llmAnalysis,
+        aigAnalysis,
         runId: process.env.GITHUB_RUN_ID,
         skillSpectorAnalysis,
         startedAt,
@@ -1854,8 +2280,29 @@ export async function processJob(
         "security scan diagnostic write failed",
       );
     }
-    await rm(workspace, { recursive: true, force: true });
+    if (preserveWorkspaceForEndorCleanup) {
+      logger.error(
+        {
+          event: "security_scan_endor_workspace_preserved_after_cleanup_failure",
+          jobId: job.job._id,
+        },
+        "preserving Endor workspace because container removal was not confirmed",
+      );
+    } else {
+      await rm(workspace, { recursive: true, force: true });
+    }
   }
+}
+
+function isTransientClaimError(error: unknown) {
+  if (!(error instanceof Error)) return false;
+  // Convex hides internal failures behind this message. Authentication and
+  // validation errors are deliberately not retried here.
+  return (
+    /(?:^|\] )Server Error$/.test(error.message.trim()) ||
+    /socket connection was closed unexpectedly|network connection was lost/i.test(error.message) ||
+    (error instanceof TypeError && /fetch failed/i.test(error.message))
+  );
 }
 
 export async function runContinuouslyRefilledWorkerPool<TJob>(options: {
@@ -1870,14 +2317,21 @@ export async function runContinuouslyRefilledWorkerPool<TJob>(options: {
   const active = new Set<Promise<ProcessJobResult>>();
   const sleepImpl = options.sleep ?? sleep;
   let queueDrained = false;
+  let workerMustStop = false;
   let totalClaimed = 0;
   let totalCompleted = 0;
   let totalFailed = 0;
   let totalRetryableFailed = 0;
   let totalClaimFailures = 0;
+  let consecutiveClaimFailures = 0;
 
-  while (active.size > 0 || (!queueDrained && options.canClaim(totalClaimed))) {
-    while (active.size < options.concurrency && !queueDrained && options.canClaim(totalClaimed)) {
+  while (active.size > 0 || (!workerMustStop && !queueDrained && options.canClaim(totalClaimed))) {
+    while (
+      active.size < options.concurrency &&
+      !workerMustStop &&
+      !queueDrained &&
+      options.canClaim(totalClaimed)
+    ) {
       const remainingJobs =
         options.maxJobs === undefined
           ? options.concurrency - active.size
@@ -1897,7 +2351,16 @@ export async function runContinuouslyRefilledWorkerPool<TJob>(options: {
       } catch (error) {
         totalClaimFailures += 1;
         totalFailed += 1;
-        queueDrained = true;
+        consecutiveClaimFailures += 1;
+        const retry =
+          !workerMustStop &&
+          isTransientClaimError(error) &&
+          consecutiveClaimFailures <= 3 &&
+          options.canClaim(totalClaimed);
+        const retryDelayMs = retry
+          ? 1000 * 2 ** (consecutiveClaimFailures - 1) + Math.floor(Math.random() * 500)
+          : null;
+        queueDrained = !retry;
         const message = error instanceof Error ? error.message : String(error);
         logger.error(
           {
@@ -1905,33 +2368,50 @@ export async function runContinuouslyRefilledWorkerPool<TJob>(options: {
             publicReason: sanitizeWorkerErrorMessage(message),
             requested: remainingJobs,
             scannerPhase: "claim",
+            retryDelayMs,
+            consecutiveClaimFailures,
           },
           "failed to claim security scan jobs",
         );
+        if (retryDelayMs !== null) {
+          // Already leased jobs continue running. A new claim never replaces or
+          // retries a terminal scan; an unobserved lease uses normal expiry.
+          await sleepImpl(retryDelayMs);
+          continue;
+        }
         break;
       }
 
+      consecutiveClaimFailures = 0;
       totalClaimed += claimedCount;
       if (claimedCount < remainingJobs) {
         queueDrained = true;
       }
       for (const job of jobs) {
-        const task = options.processClaimedJob(job).catch((error) => {
-          const message = error instanceof Error ? error.message : String(error);
-          logger.error(
-            {
-              event: "security_scan_unhandled_process_failure",
-              publicReason: sanitizeWorkerErrorMessage(message),
-              scannerPhase: "process",
-            },
-            "security scan job escaped worker error handling",
-          );
-          return {
-            completed: false,
-            hardFailed: true,
-            retryableFailed: false,
-          };
-        });
+        const task = options
+          .processClaimedJob(job)
+          .catch((error) => {
+            const message = error instanceof Error ? error.message : String(error);
+            logger.error(
+              {
+                event: "security_scan_unhandled_process_failure",
+                publicReason: sanitizeWorkerErrorMessage(message),
+                scannerPhase: "process",
+              },
+              "security scan job escaped worker error handling",
+            );
+            return {
+              completed: false,
+              hardFailed: true,
+              retryableFailed: false,
+              workerMustStop: true,
+            };
+          })
+          .then((result) => {
+            // Stop claims when any job settles fatally, before accounting picks a winner.
+            if (result.workerMustStop) workerMustStop = true;
+            return result;
+          });
         active.add(task);
       }
       if (jobs.length === 0 && queueDrained) break;
@@ -1948,6 +2428,7 @@ export async function runContinuouslyRefilledWorkerPool<TJob>(options: {
       if (active.size > 0 || !queueDrained) continue;
     }
 
+    if (workerMustStop) break;
     const maxJobsReached = options.maxJobs !== undefined && totalClaimed >= options.maxJobs;
     if (queueDrained && !maxJobsReached && options.idlePollMs && options.canClaim(totalClaimed)) {
       await sleepImpl(options.idlePollMs);
@@ -2010,6 +2491,21 @@ async function main() {
     await sleep(sharedShardIndex * 250);
   }
 
+  let assignedJobIds = readWorkerAssignment(
+    process.env.CODEX_SECURITY_SCAN_ASSIGNED_JOBS,
+    lane,
+    process.env.CODEX_SECURITY_SCAN_SHARD,
+    Number(process.env.CODEX_SECURITY_SCAN_SHARED_WORKERS || "9"),
+  );
+  logger.info(
+    {
+      event: "security_scan_assignment",
+      mode: assignedJobIds === undefined ? "queue" : "assigned",
+      assignedJobs: assignedJobIds?.length,
+      workerId,
+    },
+    "security scan job assignment",
+  );
   const stats = await runContinuouslyRefilledWorkerPool({
     concurrency: batchLimit,
     maxJobs,
@@ -2021,7 +2517,14 @@ async function main() {
         lane,
         limit,
         leaseMs,
+        assignedJobIds: assignedJobIds as Id<"securityScanJobs">[] | undefined,
       })) as ClaimedJobLease[];
+      // Stop reading running/completed jobs during refills. Automatic retries remain
+      // on the same backend IDs and are picked up by a later local dispatch.
+      if (assignedJobIds !== undefined) {
+        const claimed = new Set(leases.map((lease) => lease._id));
+        assignedJobIds = assignedJobIds.filter((id) => !claimed.has(id));
+      }
       const hydrated = await Promise.all(
         leases.map(async (lease) => {
           try {

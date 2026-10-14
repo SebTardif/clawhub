@@ -37,6 +37,7 @@ vi.mock("../convex/client", () => ({
 
 vi.mock("../../convex/_generated/api", () => ({
   api: {
+    featuredSkills: { listPublic: "featuredSkills:listPublic" },
     packages: { listPublicNewPluginsPage: "packages:listPublicNewPluginsPage" },
     skills: { listPublicPageV4: "skills:listPublicPageV4" },
     search: { searchNativeSkills: "search:searchNativeSkills" },
@@ -89,8 +90,8 @@ describe("HomeListingSection", () => {
       .getByRole("group", { name: "Content type" })
       .querySelectorAll("button");
     expect(Array.from(contentTypeButtons, (button) => button.textContent)).toEqual([
-      "Skills",
       "Plugins",
+      "Skills",
     ]);
     expect(screen.getByRole("button", { name: "Skills" }).getAttribute("aria-pressed")).toBe(
       "true",
@@ -99,8 +100,8 @@ describe("HomeListingSection", () => {
       "true",
     );
     expect(screen.getAllByRole("tab").map((tab) => tab.textContent)).toEqual([
-      "Trending",
       "Featured",
+      "Trending",
       "Official",
       "New",
     ]);
@@ -117,7 +118,7 @@ describe("HomeListingSection", () => {
     expect(screen.queryByText("17")).toBeNull();
     expect(screen.queryByText("3")).toBeNull();
     expect(screen.getByText("Downloads")).toBeTruthy();
-    expect(screen.getAllByLabelText("Downloads")).toHaveLength(2);
+    expect(screen.getAllByLabelText("24-hour downloads")).toHaveLength(2);
     expect(screen.queryByText("24h installs")).toBeNull();
     expect(screen.queryByLabelText("24-hour installs")).toBeNull();
     expect(screen.queryByText("9K")).toBeNull();
@@ -129,7 +130,7 @@ describe("HomeListingSection", () => {
     expect(screen.queryByRole("button", { name: "Grid view" })).toBeNull();
   });
 
-  it("identifies skills.sh rows without presenting upstream installs as downloads", async () => {
+  it("shows upstream lifetime counts next to the skills.sh badge", async () => {
     const external = {
       ...makeTrending("reddit-automation", "reddit-automation", 0, 12_345, 0),
       id: "skills-sh:doany-skills/skills/reddit-automation",
@@ -161,11 +162,11 @@ describe("HomeListingSection", () => {
 
     expect(screen.getByText("@doany-skills")).toBeTruthy();
     const sourceBadge = screen.getByText("skills.sh");
-    const source = screen.getByLabelText("Source");
+    const source = sourceBadge.parentElement!;
     expect(source.firstElementChild).toBe(sourceBadge);
     expect(sourceBadge.getAttribute("title")).toBeNull();
-    expect(source.textContent).toBe("skills.sh");
-    expect(screen.queryByText("12.3k")).toBeNull();
+    expect(source.textContent).toBe("skills.sh12.3k");
+    expect(screen.getByLabelText("skills.sh lifetime installs").textContent).toBe("12.3k");
 
     fireEvent.pointerMove(sourceBadge);
     expect((await screen.findByRole("tooltip")).textContent).toBe("Synced from skills.sh");
@@ -203,7 +204,7 @@ describe("HomeListingSection", () => {
 
     const sourceBadge = screen.getByText("skills.sh");
     expect(sourceBadge.getAttribute("title")).toBeNull();
-    expect(screen.getByLabelText("Source").textContent).toBe("skills.sh");
+    expect(sourceBadge.parentElement?.textContent).toBe("skills.sh—");
   });
 
   it("searches within the canonical Trending feed without changing source or order", async () => {
@@ -275,10 +276,9 @@ describe("HomeListingSection", () => {
     );
     expect(screen.queryByText("24-hour Trending unavailable")).toBeNull();
     await waitFor(() =>
-      expect(convexQueryMock).toHaveBeenCalledWith(
-        "skills:listPublicPageV4",
-        expect.objectContaining({ highlightedOnly: true }),
-      ),
+      expect(convexQueryMock).toHaveBeenCalledWith("featuredSkills:listPublic", {
+        query: undefined,
+      }),
     );
   });
 
@@ -289,6 +289,8 @@ describe("HomeListingSection", () => {
     });
 
     render(<HomeListingSection />);
+    fireEvent.click(screen.getByRole("button", { name: "Skills" }));
+    fireEvent.click(screen.getByRole("tab", { name: "Trending" }));
 
     await waitFor(() => expect(screen.queryByRole("tab", { name: "Trending" })).toBeNull());
     expect(screen.getAllByRole("tab").map((tab) => tab.textContent)).toEqual([
@@ -301,9 +303,11 @@ describe("HomeListingSection", () => {
     );
     expect(screen.queryByText("24-hour Trending unavailable")).toBeNull();
     expect(fetchCanonicalTrendingPageMock).not.toHaveBeenCalled();
-    expect(convexQueryMock).toHaveBeenCalledWith(
-      "skills:listPublicPageV4",
-      expect.objectContaining({ highlightedOnly: true }),
+    // The Featured request runs in the effect after the tab change commits.
+    await waitFor(() =>
+      expect(convexQueryMock).toHaveBeenCalledWith("featuredSkills:listPublic", {
+        query: undefined,
+      }),
     );
   });
 
@@ -328,7 +332,7 @@ describe("HomeListingSection", () => {
     expect(screen.getByText(/eligible activity in the current 24-hour window/i)).toBeTruthy();
   });
 
-  it("defaults Plugins to Featured, preserves explicit New, and returns to Skills Trending", async () => {
+  it("defaults Plugins to Featured, preserves explicit New, and returns to Skills Featured", async () => {
     render(<HomeListingSection initialListing={initialTrending([])} />);
 
     fireEvent.click(screen.getByRole("button", { name: "Plugins" }));
@@ -338,10 +342,10 @@ describe("HomeListingSection", () => {
     );
     expect(screen.getAllByRole("tab").map((tab) => tab.textContent)).toEqual([
       "Featured",
+      "Trending",
       "Official",
       "New",
     ]);
-    expect(screen.queryByRole("tab", { name: "Trending" })).toBeNull();
     expect(screen.queryByRole("tab", { name: "Top" })).toBeNull();
     await waitFor(() =>
       expect(fetchPluginCatalogMock).toHaveBeenCalledWith(
@@ -359,7 +363,7 @@ describe("HomeListingSection", () => {
     expect(screen.getByRole("tab", { name: "New" }).getAttribute("aria-selected")).toBe("true");
 
     fireEvent.click(screen.getByRole("button", { name: "Skills" }));
-    expect(screen.getByRole("tab", { name: "Trending" }).getAttribute("aria-selected")).toBe(
+    expect(screen.getByRole("tab", { name: "Featured" }).getAttribute("aria-selected")).toBe(
       "true",
     );
   });
@@ -380,10 +384,9 @@ describe("HomeListingSection", () => {
 
     fireEvent.click(screen.getByRole("tab", { name: "Featured" }));
     await waitFor(() => {
-      expect(convexQueryMock).toHaveBeenCalledWith(
-        "skills:listPublicPageV4",
-        expect.objectContaining({ highlightedOnly: true, numItems: 40 }),
-      );
+      expect(convexQueryMock).toHaveBeenCalledWith("featuredSkills:listPublic", {
+        query: undefined,
+      });
     });
 
     fireEvent.click(screen.getByRole("tab", { name: "Official" }));

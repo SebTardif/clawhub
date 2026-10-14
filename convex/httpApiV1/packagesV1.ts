@@ -1,14 +1,21 @@
 import {
   ApiRoutes,
+  ApiV1PackageScanBatchRequestSchema,
+  ApiV1PackageScanBatchStatusRequestSchema,
+  ApiV1PackageCategoriesBatchRequestSchema,
+  ApiV1PackageCategoriesBatchResponseSchema,
   ApiV1PackageOfficialMigrationListResponseSchema,
   ApiV1PackageOfficialMigrationResponseSchema,
   ApiV1PackageValidationReportPageSchema,
   ApiV1PackageModerationStatusResponseSchema,
   ApiV1PackageSecurityResponseSchema,
+  ApiV1PackageVersionPublicationResponseSchema,
+  ApiV1PluginDetailResponseSchema,
   PackageHardDeleteRequestSchema,
   PackageAppealResolveRequestSchema,
   PackageAppealRequestSchema,
   PackageOfficialMigrationUpsertRequestSchema,
+  PACKAGE_CATEGORY_BATCH_LIMIT,
   PackageRepairNameRequestSchema,
   PackageRepairRuntimeIdRequestSchema,
   PackageReportRequestSchema,
@@ -19,10 +26,15 @@ import {
   PackageTrustedPublisherUpsertRequestSchema,
   PublishTokenMintRequestSchema,
   formatSecurityAuditOverview,
+  aggregateAuditVerdict,
   normalizeContentType,
+  isClawCategorySlug,
   isPluginCategorySlug,
-  PLUGIN_CATEGORY_DEFINITIONS,
   parseArk,
+  type ApiV1PackageCategoriesBatchRequest,
+  type ApiV1PackageSecurityResponse,
+  type ApiV1PluginOverviewResponse,
+  type PackageListItem,
   type PackagePublishMetadata,
   type PackageAppealListStatus,
   type PackageModerationQueueStatus,
@@ -37,8 +49,8 @@ import type { ActionCtx } from "../_generated/server";
 import { buildDownloadMetricArgs, getDownloadIdentity } from "../downloadMetrics";
 import { getOptionalActiveAuthUserIdFromAction } from "../lib/access";
 import { getOptionalApiTokenUserId, requireApiTokenUser } from "../lib/apiTokenAuth";
+import { recordCatalogSearchObservation } from "../lib/catalogSearchObservations";
 import { parseClawPack, sha256Base64, sha256Hex } from "../lib/clawpack";
-import { experimentalClawsEnabled } from "../lib/experimentalClaws";
 import {
   fetchGitHubRepositoryIdentity,
   verifyGitHubActionsTrustedPublishJwt,
@@ -54,6 +66,8 @@ import {
   getPackageTrustReasons,
   resolvePackageReleaseScanStatus,
 } from "../lib/packageSecurity";
+import { getPluginDiscoveryCategories } from "../lib/pluginDiscovery";
+import type { PublicPublisher } from "../lib/public";
 import {
   getClawPackSizeError,
   getPackageMultipartSizeError,
@@ -70,9 +84,9 @@ import {
   getPublicSkillVersionAccessBlock,
   getPublicSkillVersionDownloadBlock,
   getSkillFileModerationInfoFromSkill,
-  isSkillVersionForSkill,
 } from "../lib/skillFileAccess";
 import { isMacJunkPath } from "../lib/skills";
+import type { PublicSkillVersionSelection } from "../lib/skills/publicVersions";
 import {
   buildDeterministicPackageZip,
   buildMergedExportZip,
@@ -80,13 +94,14 @@ import {
   type MergedExportManifestEntry,
 } from "../lib/skillZip";
 import { generateToken, hashToken } from "../lib/tokens";
+import { managedMcpV1Handler } from "./managedMcpV1";
 import {
   MAX_RAW_FILE_BYTES,
   getPathSegments,
   json,
   parsePackagePathSegments,
   publicApiOrigin,
-  resolveTagsBatch,
+  resolvePublicSkillVersions,
   requireApiTokenUserOrResponse,
   requireAdminOrResponse,
   requireModeratorOrResponse,
@@ -120,6 +135,8 @@ const internalRefs = internal as unknown as {
     getByNameForViewerInternal: unknown;
     hasMissingRecommendationScoresInternal: unknown;
     listPluginExportPageInternal: unknown;
+    listPluginOverviewCategoryInternal: unknown;
+    listPluginDiscoveryCategoryInternal: unknown;
     listPluginValidationReportPageInternal: unknown;
     listPageForViewerInternal: unknown;
     searchForViewerInternal: unknown;
@@ -128,6 +145,7 @@ const internalRefs = internal as unknown as {
     hardDeleteForAdminInternal: unknown;
     getTrustedPublisherByPackageIdInternal: unknown;
     getVersionByNameForViewerInternal: unknown;
+    resolveVersionCategoriesBatchInternal: unknown;
     getVersionSecurityByNameForViewerInternal: unknown;
     publishPackageForUserInternal: unknown;
     publishPackageForTrustedPublisherInternal: unknown;
@@ -136,9 +154,9 @@ const internalRefs = internal as unknown as {
     deleteTrustedPublisherForUserInternal: unknown;
     deleteOwnedReleaseForUserInternal: unknown;
     restoreOwnedReleaseForUserInternal: unknown;
-    getReleasesByIdsInternal: unknown;
-    getReleaseByPackageAndVersionInternal: unknown;
-    getReleaseByIdInternal: unknown;
+    getTagsForViewerInternal: unknown;
+    getReleaseForViewerInternal: unknown;
+    getPublicReleaseSelectionsInternal: unknown;
     insertAuditLogInternal: unknown;
     recordPackageDownloadInternal: unknown;
     recordPackageInstallInternal: unknown;
@@ -172,14 +190,15 @@ const internalRefs = internal as unknown as {
     getSkillBySlugInternal: unknown;
     hasMissingPackageCatalogRecommendationScoresInternal: unknown;
     searchPackageCatalogForHttpInternal: unknown;
-    getVersionByIdInternal: unknown;
-    getVersionBySkillAndVersionInternal: unknown;
+    getPublicVersionSelectionInternal: unknown;
   };
   publishers: {
     getByHandleInternal: unknown;
   };
   securityScan: {
     requestPackageRescanForUserInternal: unknown;
+    enqueueBulkPackageRescanBatchForAdminInternal: unknown;
+    getBulkPackageRescanBatchStatusForAdminInternal: unknown;
   };
   publishAttempts: {
     getPackagePublishAttemptStatusInternal: unknown;
@@ -325,12 +344,7 @@ async function getOptionalViewerUserIdForRequest(ctx: ActionCtx, request: Reques
   }
 }
 
-const PACKAGE_FAMILY_VALUES = ["skill", "code-plugin", "bundle-plugin"] as const;
-const PACKAGE_FAMILY_VALUES_WITH_CLAWS = [...PACKAGE_FAMILY_VALUES, "claw"] as const;
-
-function publicPackageFamilyValues() {
-  return experimentalClawsEnabled() ? PACKAGE_FAMILY_VALUES_WITH_CLAWS : PACKAGE_FAMILY_VALUES;
-}
+const PACKAGE_FAMILY_VALUES = ["skill", "code-plugin", "bundle-plugin", "claw"] as const;
 const PLUGIN_EXPORT_FAMILY_VALUES = ["code-plugin", "bundle-plugin"] as const;
 const PACKAGE_CHANNEL_VALUES = ["official", "community", "private"] as const;
 const PACKAGE_LIST_SORT_VALUES = [
@@ -367,6 +381,12 @@ function resolvePluginCategoryFilter(value: string | undefined): PluginCategoryS
   return LEGACY_PLUGIN_CATEGORY_FILTER_ALIASES[
     value as keyof typeof LEGACY_PLUGIN_CATEGORY_FILTER_ALIASES
   ];
+}
+
+function resolvePackageCategoryFilter(value: string | undefined, family: string | undefined) {
+  if (!value) return undefined;
+  if (family === "claw") return value === "other" || isClawCategorySlug(value) ? value : undefined;
+  return resolvePluginCategoryFilter(value);
 }
 
 function parseExcludedScanStatuses(value: string | null) {
@@ -522,6 +542,7 @@ type SkillVersionLike = {
     contentType?: string;
   }>;
   softDeletedAt?: number;
+  publicationStatus?: "pending" | "published" | "blocked";
 };
 
 type ReleaseLike = {
@@ -546,6 +567,7 @@ type ReleaseLike = {
   sha256hash?: string;
   vtAnalysis?: Doc<"packageReleases">["vtAnalysis"];
   skillSpectorAnalysis?: Doc<"packageReleases">["skillSpectorAnalysis"];
+  endorAnalysis?: Doc<"packageReleases">["endorAnalysis"];
   llmAnalysis?: Doc<"packageReleases">["llmAnalysis"];
   staticScan?: Doc<"packageReleases">["staticScan"];
   manualModeration?: Doc<"packageReleases">["manualModeration"];
@@ -561,6 +583,8 @@ type ReleaseLike = {
   npmUnpackedSize?: number;
   npmFileCount?: number;
   softDeletedAt?: number;
+  ownerDeletedAt?: number;
+  publicationStatus?: "pending" | "published" | "blocked";
 };
 
 type PluginExportFamily = (typeof PLUGIN_EXPORT_FAMILY_VALUES)[number];
@@ -607,11 +631,6 @@ type AdminRepairPackageLike = Pick<
 >;
 
 type RepairOwnerPublisherLike = Pick<Doc<"publishers">, "_id" | "handle" | "deletedAt">;
-
-function toVisibleRelease(release: ReleaseLike | null) {
-  if (!release || ("softDeletedAt" in release && release.softDeletedAt !== undefined)) return null;
-  return release;
-}
 
 function toPublicTrustedPublisher(trustedPublisher: PackageTrustedPublisherLike | null) {
   if (!trustedPublisher) return null;
@@ -680,6 +699,34 @@ function toReleaseArtifact(release: ReleaseLike, packageName?: string) {
   };
 }
 
+function toPackageVersionResponse(release: ReleaseLike, packageName: string) {
+  const scanStatus = resolvePackageReleaseScanStatus(release);
+  const verification = release.verification ? { ...release.verification, scanStatus } : null;
+  return {
+    version: release.version,
+    createdAt: release.createdAt,
+    changelog: release.changelog,
+    distTags: release.distTags ?? [],
+    files: release.files.map((file) => ({
+      path: file.path,
+      size: file.size,
+      sha256: file.sha256,
+      contentType: file.contentType,
+    })),
+    compatibility: release.compatibility ?? null,
+    pluginManifestSummary: release.pluginManifestSummary ?? null,
+    clawManifestSummary: release.clawManifestSummary ?? null,
+    verification,
+    artifact: toReleaseArtifact(release, packageName),
+    sha256hash: release.sha256hash ?? null,
+    vtAnalysis: release.vtAnalysis ?? null,
+    skillSpectorAnalysis: release.skillSpectorAnalysis ?? null,
+    ...(release.endorAnalysis ? { endorAnalysis: release.endorAnalysis } : {}),
+    llmAnalysis: release.llmAnalysis ?? null,
+    staticScan: release.staticScan ?? null,
+  };
+}
+
 function toPackageReleaseSecurityResponse(params: {
   request: Request;
   pkg: PublicPackageDocLike;
@@ -692,6 +739,7 @@ function toPackageReleaseSecurityResponse(params: {
   if (packageBlockedFromDownload) reasons.push("package:malicious");
   return {
     overview: formatSecurityAuditOverview({ llmAnalysis: params.release.llmAnalysis }),
+    verdict: aggregateAuditVerdict(params.release),
     securityAuditUrl: buildPackageSecurityAuditUrl(
       params.request,
       params.pkg.name,
@@ -711,6 +759,7 @@ function toPackageReleaseSecurityResponse(params: {
       ...(params.release.npmShasum ? { npmShasum: params.release.npmShasum } : {}),
       ...(params.release.npmTarballName ? { npmTarballName: params.release.npmTarballName } : {}),
       createdAt: params.release.createdAt,
+      ...(params.release.endorAnalysis ? { endorAnalysis: params.release.endorAnalysis } : {}),
     },
     trust: {
       scanStatus,
@@ -844,40 +893,25 @@ async function streamClawPackRelease(
 
 async function resolvePackageTags(
   ctx: ActionCtx,
-  tags: Record<string, Id<"packageReleases">>,
+  pkg: Pick<PublicPackageDocLike, "_id" | "name">,
+  viewerUserId?: Id<"users">,
 ): Promise<Record<string, string>> {
-  const releaseIds = Object.values(tags);
-  if (releaseIds.length === 0) return {};
-  const releases = await runQueryRef<ReleaseLike[]>(
-    ctx,
-    internalRefs.packages.getReleasesByIdsInternal,
-    {
-      releaseIds,
-    },
-  );
-  const byId = new Map(releases.map((release) => [release._id, release.version]));
-  return Object.fromEntries(
-    Object.entries(tags)
-      .map(([tag, releaseId]) => [tag, byId.get(releaseId)])
-      .filter((entry): entry is [string, string] => Boolean(entry[1])),
-  );
+  return await runQueryRef(ctx, internalRefs.packages.getTagsForViewerInternal, {
+    name: pkg.name,
+    packageId: pkg._id,
+    viewerUserId,
+  });
 }
 
-type CatalogListItem = {
-  name: string;
-  displayName: string;
-  family: "skill" | "code-plugin" | "bundle-plugin" | "claw";
-  runtimeId?: string | null;
-  channel: "official" | "community" | "private";
-  isOfficial: boolean;
-  summary?: string | null;
-  ownerHandle?: string | null;
-  createdAt: number;
-  updatedAt: number;
-  latestVersion?: string | null;
-  featuredAt?: number;
-  verificationTier?: string | null;
-  stats?: { downloads: number; installs: number; stars: number; versions: number };
+type CatalogListItem = PackageListItem & {
+  ownerOfficial?: boolean;
+};
+
+type PluginOverviewItem = CatalogListItem & {
+  featured?: boolean;
+  featuredRank?: number;
+  trending?: boolean;
+  trendingRank?: number;
 };
 
 type CatalogSearchEntry = {
@@ -1179,7 +1213,7 @@ function compareCatalogItemsForSort(
   return compareCatalogItems(a, b);
 }
 
-function compareCatalogSearchEntries(a: CatalogSearchEntry, b: CatalogSearchEntry) {
+export function compareCatalogSearchEntries(a: CatalogSearchEntry, b: CatalogSearchEntry) {
   return (
     Number(
       isCuratedSearchResult({
@@ -1246,10 +1280,9 @@ async function resolveSkillTags(
   ctx: ActionCtx,
   skillId: Id<"skills">,
   tags: Record<string, Id<"skillVersions">>,
-  latestVersion?: SkillVersionLike | null,
 ): Promise<Record<string, string>> {
-  const [resolved] = await resolveTagsBatch(ctx, [tags], [latestVersion], [skillId]);
-  return resolved ?? {};
+  const [resolved] = await resolvePublicSkillVersions(ctx, [{ skillId, tags }]);
+  return resolved.tags;
 }
 
 function isSkillOfficial(skill: SkillPackageDocLike) {
@@ -1285,6 +1318,24 @@ function toSkillPackageDetail(
           handle: owner.handle ?? null,
           displayName: owner.displayName ?? null,
           image: owner.image ?? null,
+        }
+      : null,
+  };
+}
+
+function toPackageMetadataResponse(
+  pkg: PublicPackageDocLike,
+  owner: PublicPublisher | null,
+  tags: Record<string, string>,
+) {
+  return {
+    package: { ...toPackageDetailResponsePackage(pkg), tags },
+    owner: owner
+      ? {
+          handle: owner.handle ?? null,
+          displayName: owner.displayName ?? null,
+          image: owner.image ?? null,
+          official: owner.official === true,
         }
       : null,
   };
@@ -1334,12 +1385,34 @@ function bytesToArrayBuffer(bytes: Uint8Array) {
   return copy.buffer;
 }
 
+async function storeRequestPackageBlob(
+  ctx: ActionCtx,
+  requestStorageIds: Set<Id<"_storage">>,
+  blob: Blob,
+) {
+  const storageId = await ctx.storage.store(blob);
+  requestStorageIds.add(storageId);
+  return storageId;
+}
+
+async function settlePackageFileStores(stores: Array<Promise<StoredPackagePublishFile>>) {
+  // A rejected store does not cancel its siblings. Wait before reclaiming their blobs.
+  const results = await Promise.allSettled(stores);
+  return results.map((result) => {
+    if (result.status === "rejected") throw result.reason;
+    return result.value;
+  });
+}
+
 async function storeClawPackFile(
   ctx: ActionCtx,
   entry: { path: string; bytes: Uint8Array },
+  requestStorageIds: Set<Id<"_storage">>,
 ): Promise<StoredPackagePublishFile> {
   const contentType = defaultStoredPackageContentType();
-  const storageId = await ctx.storage.store(
+  const storageId = await storeRequestPackageBlob(
+    ctx,
+    requestStorageIds,
     new Blob([bytesToArrayBuffer(entry.bytes)], { type: contentType }),
   );
   return {
@@ -1360,12 +1433,17 @@ const CLAWPACK_STORE_BATCH_FILES = 16;
 async function storeClawPackFiles(
   ctx: ActionCtx,
   entries: Array<{ path: string; bytes: Uint8Array }>,
+  requestStorageIds: Set<Id<"_storage">>,
 ) {
   const files: StoredPackagePublishFile[] = [];
   let batch: Array<{ path: string; bytes: Uint8Array }> = [];
   let batchBytes = 0;
   const flush = async () => {
-    files.push(...(await Promise.all(batch.map((entry) => storeClawPackFile(ctx, entry)))));
+    files.push(
+      ...(await settlePackageFileStores(
+        batch.map((entry) => storeClawPackFile(ctx, entry, requestStorageIds)),
+      )),
+    );
     batch = [];
     batchBytes = 0;
   };
@@ -1384,13 +1462,16 @@ async function storeClawPackFiles(
 async function storeUploadedPackageFile(
   ctx: ActionCtx,
   entry: File,
+  requestStorageIds: Set<Id<"_storage">>,
 ): Promise<StoredPackagePublishFile> {
   if (entry.size > MAX_PUBLISH_FILE_BYTES) {
     throw new Error(getPublishFileSizeError(entry.name));
   }
   const buffer = new Uint8Array(await entry.arrayBuffer());
   const contentType = normalizeContentType(entry.type) ?? defaultStoredPackageContentType();
-  const storageId = await ctx.storage.store(
+  const storageId = await storeRequestPackageBlob(
+    ctx,
+    requestStorageIds,
     new Blob([bytesToArrayBuffer(buffer)], { type: contentType }),
   );
   return {
@@ -1473,6 +1554,7 @@ async function buildPackagePublishRequestFromClawPack(
   parsed: ParsedPackageClawPack,
   artifactBytes: Uint8Array,
   artifactStorageId: Id<"_storage">,
+  requestStorageIds: Set<Id<"_storage">>,
 ): Promise<ServerPackagePublishRequest> {
   if (parsed.unpackedSize > MAX_PUBLISH_TOTAL_BYTES) {
     throw new Error(getPublishTotalSizeError("package"));
@@ -1489,7 +1571,7 @@ async function buildPackagePublishRequestFromClawPack(
     npmUnpackedSize: parsed.unpackedSize,
     npmFileCount: parsed.fileCount,
   };
-  const files = await storeClawPackFiles(ctx, parsed.entries);
+  const files = await storeClawPackFiles(ctx, parsed.entries, requestStorageIds);
   return { ...metadata, files, artifact };
 }
 
@@ -1540,6 +1622,7 @@ async function parseMultipartPackagePublish(
   ctx: ActionCtx,
   auth: PackagePublishAuth,
   request: Request,
+  requestStorageIds: Set<Id<"_storage">>,
 ): Promise<ServerPackagePublishRequest> {
   const form = await request.formData();
   for (const field of form.keys()) {
@@ -1559,10 +1642,6 @@ async function parseMultipartPackagePublish(
     parsedPayload,
     "Package publish payload",
   );
-  if (metadata.family === "claw" && !experimentalClawsEnabled()) {
-    throw new Error("Experimental Claw publication is disabled");
-  }
-
   const tarballPart = getTarballPart(form);
   const fileParts = getFileParts(
     form,
@@ -1588,6 +1667,7 @@ async function parseMultipartPackagePublish(
         parsed,
         artifactBytes,
         tarballPart.storageId,
+        requestStorageIds,
       );
     }
 
@@ -1607,7 +1687,9 @@ async function parseMultipartPackagePublish(
     const artifactBytes = new Uint8Array(await tarballEntry.arrayBuffer());
     const parsed = await parseClawPack(artifactBytes);
     assertClawPackPublicationIdentity(metadata, parsed);
-    const artifactStorageId = await ctx.storage.store(
+    const artifactStorageId = await storeRequestPackageBlob(
+      ctx,
+      requestStorageIds,
       new Blob([bytesToArrayBuffer(artifactBytes)], { type: "application/octet-stream" }),
     );
     return await buildPackagePublishRequestFromClawPack(
@@ -1616,6 +1698,7 @@ async function parseMultipartPackagePublish(
       parsed,
       artifactBytes,
       artifactStorageId,
+      requestStorageIds,
     );
   }
 
@@ -1630,8 +1713,8 @@ async function parseMultipartPackagePublish(
   }
 
   const packageFileParts = fileParts.filter((entry) => !isMacJunkPath(entry.name));
-  const files = await Promise.all(
-    packageFileParts.map((entry) => storeUploadedPackageFile(ctx, entry)),
+  const files = await settlePackageFileStores(
+    packageFileParts.map((entry) => storeUploadedPackageFile(ctx, entry, requestStorageIds)),
   );
   if (files.length === 0) throw new Error("files required");
   return { ...metadata, files };
@@ -1654,7 +1737,7 @@ async function listPackages(
   const viewerUserId = await getOptionalViewerUserIdForRequest(ctx, request);
   const limit = Math.max(1, Math.min(toOptionalNumber(url.searchParams.get("limit")) ?? 25, 100));
   const rawCursor = url.searchParams.get("cursor");
-  const familyParam = parseEnumQueryParam(url.searchParams, "family", publicPackageFamilyValues());
+  const familyParam = parseEnumQueryParam(url.searchParams, "family", PACKAGE_FAMILY_VALUES);
   if (!familyParam.ok) return text(familyParam.message, 400, rate.headers);
   const channelParam = parseEnumQueryParam(url.searchParams, "channel", PACKAGE_CHANNEL_VALUES);
   if (!channelParam.ok) return text(channelParam.message, 400, rate.headers);
@@ -1666,9 +1749,12 @@ async function listPackages(
   if (!highlightedOnlyParam.ok) return text(highlightedOnlyParam.message, 400, rate.headers);
   const sortParam = parseEnumQueryParam(url.searchParams, "sort", PACKAGE_LIST_SORT_VALUES);
   if (!sortParam.ok) return text(sortParam.message, 400, rate.headers);
+  const effectiveFamily = family ?? familyParam.value;
   const rawCategory = url.searchParams.get("category")?.trim() || undefined;
-  const category = resolvePluginCategoryFilter(rawCategory);
+  const category = resolvePackageCategoryFilter(rawCategory, effectiveFamily);
   const topic = url.searchParams.get("topic")?.trim().toLowerCase() || undefined;
+  const curated = parseBooleanQueryParam(url.searchParams, "curated");
+  if (!curated.ok) return text(curated.message, 400, rate.headers);
   const officialFirst = parseBooleanQueryParam(url.searchParams, "officialFirst");
   if (!officialFirst.ok) return text(officialFirst.message, 400, rate.headers);
   const excludedScanStatuses = parseExcludedScanStatuses(url.searchParams.get("excludeScanStatus"));
@@ -1676,9 +1762,12 @@ async function listPackages(
     return text(excludedScanStatuses.message, 400, rate.headers);
   }
   if (rawCategory && !category) {
-    return text("Invalid plugin category", 400, rate.headers);
+    return text(
+      effectiveFamily === "claw" ? "Invalid Claw category" : "Invalid plugin category",
+      400,
+      rate.headers,
+    );
   }
-  const effectiveFamily = family ?? familyParam.value;
   const includeSkills = options?.includeSkills ?? effectiveFamily === undefined;
   const highlightedOnly = featured.value === true || highlightedOnlyParam.value === true;
   const pluginDefaultSort =
@@ -1690,12 +1779,7 @@ async function listPackages(
       : options?.defaultSort;
   const isLegacyInstallSortRequest = sortParam.value === "installs";
   const effectiveSort = normalizePublicPackageSort(sortParam.value ?? pluginDefaultSort);
-  if (
-    category &&
-    (effectiveFamily === "skill" ||
-      effectiveFamily === "claw" ||
-      (!effectiveFamily && includeSkills))
-  ) {
+  if (category && (effectiveFamily === "skill" || (!effectiveFamily && includeSkills))) {
     return text(
       "Plugin category is only supported for plugin package endpoints",
       400,
@@ -1706,6 +1790,47 @@ async function listPackages(
     return text(
       "Trending sort is only supported for plugin package endpoints; use /api/v1/skills?sort=trending for skills.",
       400,
+      rate.headers,
+    );
+  }
+
+  if (curated.value) {
+    if (
+      !category ||
+      includeSkills ||
+      (effectiveFamily &&
+        effectiveFamily !== "code-plugin" &&
+        effectiveFamily !== "bundle-plugin") ||
+      highlightedOnly ||
+      effectiveSort !== "downloads" ||
+      officialFirst.value
+    ) {
+      return text(
+        "Curated discovery requires a plugin category, downloads sort, and no featured or officialFirst filter",
+        400,
+        rate.headers,
+      );
+    }
+    const result = await runQueryRef<{
+      page: CatalogListItem[];
+      isDone: boolean;
+      continueCursor: string;
+    }>(ctx, internalRefs.packages.listPluginDiscoveryCategoryInternal, {
+      category: resolvePluginCategoryFilter(rawCategory),
+      family: effectiveFamily,
+      channel: channelParam.value,
+      isOfficial: isOfficial.value,
+      topic,
+      excludedScanStatuses: excludedScanStatuses.value,
+      paginationOpts: { cursor: rawCursor, numItems: limit },
+    });
+    return json(
+      {
+        items: result.page,
+        nextCursor: result.isDone ? null : result.continueCursor,
+        categories: getPluginDiscoveryCategories().filter((entry) => entry.slug === category),
+      },
+      200,
       rate.headers,
     );
   }
@@ -2241,13 +2366,26 @@ export async function exportPluginsV1Handler(ctx: ActionCtx, request: Request) {
 
   try {
     logContext.phase = "load_releases";
-    const releases = await chunkedParallel(result.page, 100, (digest) =>
-      digest.latestReleaseId
-        ? runQueryRef<ReleaseLike | null>(ctx, internalRefs.packages.getReleaseByIdInternal, {
-            releaseId: digest.latestReleaseId,
-          })
-        : Promise.resolve(null),
-    );
+    const releases: Array<ReleaseLike | null> = [];
+    // Each query rechecks current parents and release visibility after the digest read.
+    // Keep full-document batches small enough for Convex's transaction read budget.
+    for (let offset = 0; offset < result.page.length; offset += 5) {
+      const page = result.page.slice(offset, offset + 5);
+      const selections = page.flatMap((digest) =>
+        digest.latestReleaseId
+          ? [{ packageId: digest.packageId, releaseId: digest.latestReleaseId }]
+          : [],
+      );
+      const selected = await runQueryRef<Array<ReleaseLike | null>>(
+        ctx,
+        internalRefs.packages.getPublicReleaseSelectionsInternal,
+        { selections },
+      );
+      let index = 0;
+      releases.push(
+        ...page.map((digest) => (digest.latestReleaseId ? (selected[index++] ?? null) : null)),
+      );
+    }
     logContext.releaseCount = releases.filter(Boolean).length;
     const exportableReleases: Array<ReleaseLike | null> = Array.from(
       { length: result.page.length },
@@ -2270,21 +2408,14 @@ export async function exportPluginsV1Handler(ctx: ActionCtx, request: Request) {
       if (!digest.latestReleaseId || !release) {
         exportErrors.push({
           package: digest.name,
-          error: `release not found (latestReleaseId: ${digest.latestReleaseId ?? "null"})`,
+          error: "release not available",
         });
         continue;
       }
       if (!isReleaseForPackage(release, digest)) {
         exportErrors.push({
           package: digest.name,
-          error: `release not found (latestReleaseId: ${digest.latestReleaseId})`,
-        });
-        continue;
-      }
-      if (release.softDeletedAt) {
-        exportErrors.push({
-          package: digest.name,
-          error: `release not available (latestReleaseId: ${digest.latestReleaseId})`,
+          error: "release not available",
         });
         continue;
       }
@@ -2494,16 +2625,94 @@ export async function listPluginsV1Handler(ctx: ActionCtx, request: Request) {
   });
 }
 
-export async function listPluginCategoriesV1Handler(_ctx: ActionCtx, _request: Request) {
-  return json({
-    categories: PLUGIN_CATEGORY_DEFINITIONS.map((category, order) => ({
-      slug: category.slug,
-      label: category.label,
-      description: category.description,
-      icon: category.icon,
-      order,
-    })),
+const PLUGIN_OVERVIEW_SECTION_SIZE = 8;
+const PLUGIN_OVERVIEW_FAMILIES = ["code-plugin", "bundle-plugin"] as const;
+
+function mergePluginOverviewItem(
+  items: Map<string, PluginOverviewItem>,
+  item: CatalogListItem,
+  options: {
+    category?: string;
+    featuredRank?: number;
+    trendingRank?: number;
+  },
+) {
+  const existing = items.get(item.name);
+  const categories = [
+    ...new Set([...(existing?.categories ?? []), ...(item.categories ?? []), options.category]),
+  ].filter((category): category is string => Boolean(category));
+  const featuredRank = existing?.featuredRank ?? options.featuredRank;
+  const trendingRank = existing?.trendingRank ?? options.trendingRank;
+  items.set(item.name, {
+    ...(existing ?? item),
+    ...(categories.length > 0 ? { categories } : {}),
+    ...(featuredRank === undefined ? {} : { featured: true, featuredRank }),
+    ...(trendingRank === undefined ? {} : { trending: true, trendingRank }),
   });
+}
+
+export async function listPluginOverviewV1Handler(ctx: ActionCtx, request: Request) {
+  const rate = await applyRateLimit(ctx, request, "read");
+  if (!rate.ok) return rate.response;
+
+  const page = async (args: { highlightedOnly?: boolean; sort?: "trending" }) =>
+    await runQueryRef<{
+      page: CatalogListItem[];
+      isDone: boolean;
+      continueCursor: string;
+    }>(ctx, internalRefs.packages.listPageForViewerInternal, {
+      ...(args.highlightedOnly || args.sort === "trending"
+        ? { families: [...PLUGIN_OVERVIEW_FAMILIES] }
+        : {}),
+      ...args,
+      paginationOpts: { cursor: null, numItems: PLUGIN_OVERVIEW_SECTION_SIZE },
+    });
+
+  const categories = getPluginDiscoveryCategories(true);
+  // One bounded fanout replaces one public HTTP request per home-page shelf.
+  const [featured, trending, ...categoryPages] = await Promise.all([
+    page({ highlightedOnly: true }),
+    page({ sort: "trending" }),
+    ...categories.map((category) =>
+      runQueryRef<CatalogListItem[]>(
+        ctx,
+        internalRefs.packages.listPluginOverviewCategoryInternal,
+        {
+          category: category.slug,
+          numItems: PLUGIN_OVERVIEW_SECTION_SIZE,
+        },
+      ),
+    ),
+  ]);
+  const items = new Map<string, PluginOverviewItem>();
+  for (const [featuredRank, item] of featured.page.entries()) {
+    mergePluginOverviewItem(items, item, { featuredRank });
+  }
+  for (const [trendingRank, item] of trending.page.entries()) {
+    mergePluginOverviewItem(items, item, { trendingRank });
+  }
+  for (const [index, result] of categoryPages.entries()) {
+    const category = categories[index];
+    for (const item of result) {
+      mergePluginOverviewItem(items, item, { category: category.slug });
+    }
+  }
+
+  const response: ApiV1PluginOverviewResponse = {
+    categories,
+    items: [...items.values()],
+  };
+  return json(
+    response,
+    200,
+    mergeHeaders(rate.headers, {
+      "Cache-Control": "public, max-age=60, s-maxage=300, stale-while-revalidate=3600",
+    }),
+  );
+}
+
+export async function listPluginCategoriesV1Handler(_ctx: ActionCtx, _request: Request) {
+  return json({ categories: getPluginDiscoveryCategories() });
 }
 
 export async function listCodePluginsV1Handler(ctx: ActionCtx, request: Request) {
@@ -2521,24 +2730,34 @@ export async function publishPackageV1Handler(ctx: ActionCtx, request: Request) 
   const auth = await requirePackagePublishAuthOrResponse(ctx, request, rate.headers);
   if (!auth.ok) return auth.response;
 
+  const requestStorageIds = new Set<Id<"_storage">>();
+  let publicationOwnsCleanup = false;
   try {
     const contentType = request.headers.get("content-type") ?? "";
     if (!contentType.includes("multipart/form-data")) {
       return text("Package publish requires multipart/form-data", 415, rate.headers);
     }
-    const payload = await parseMultipartPackagePublish(ctx, auth.auth, request);
+    const payload = await parseMultipartPackagePublish(ctx, auth.auth, request, requestStorageIds);
+    // After dispatch, only the action can know whether a release adopted these blobs.
+    // An ambiguous RPC failure is not authority for HTTP cleanup.
+    publicationOwnsCleanup = true;
     const result =
       auth.auth.kind === "user"
         ? await runActionRef(ctx, internalRefs.packages.publishPackageForUserInternal, {
             actorUserId: auth.auth.userId,
             payload,
+            requestStorageIds: [...requestStorageIds],
           })
         : await runActionRef(ctx, internalRefs.packages.publishPackageForTrustedPublisherInternal, {
             publishTokenId: auth.auth.publishToken._id,
             payload,
+            requestStorageIds: [...requestStorageIds],
           });
     return json(result, 200, rate.headers);
   } catch (error) {
+    if (!publicationOwnsCleanup) {
+      await Promise.allSettled([...requestStorageIds].map((id) => ctx.storage.delete(id)));
+    }
     return packagePublishErrorToResponse(error, rate.headers);
   }
 }
@@ -2841,6 +3060,105 @@ export async function mintPublishTokenV1Handler(ctx: ActionCtx, request: Request
 
 export async function packagesPostRouterV1Handler(ctx: ActionCtx, request: Request) {
   const segments = getPathSegments(request, "/api/v1/packages/");
+  if (segments[0] === "-" && segments[1] === "managed-mcp")
+    return managedMcpV1Handler(ctx, request, segments);
+  if (
+    segments[0] === "-" &&
+    segments[1] === "scan" &&
+    segments[2] === "batch" &&
+    (segments.length === 3 || (segments.length === 4 && segments[3] === "status"))
+  ) {
+    const rate = await applyRateLimit(ctx, request, "write");
+    if (!rate.ok) return rate.response;
+    const auth = await requireApiTokenUserOrResponse(ctx, request, rate.headers);
+    if (!auth.ok) return auth.response;
+    const admin = requireAdminOrResponse(auth.user, rate.headers);
+    if (!admin.ok) return admin.response;
+    try {
+      if (segments[3] === "status") {
+        const body = parseArk(
+          ApiV1PackageScanBatchStatusRequestSchema,
+          await request.json(),
+          "Package scan batch status payload",
+        );
+        const result = await runQueryRef(
+          ctx,
+          internalRefs.securityScan.getBulkPackageRescanBatchStatusForAdminInternal,
+          {
+            actorUserId: auth.userId,
+            jobIds: body.jobIds,
+          },
+        );
+        return json(result, 200, rate.headers);
+      }
+      const body = parseArk(
+        ApiV1PackageScanBatchRequestSchema,
+        await request.json(),
+        "Package scan batch payload",
+      );
+      const result = await runMutationRef(
+        ctx,
+        internalRefs.securityScan.enqueueBulkPackageRescanBatchForAdminInternal,
+        {
+          ...body,
+          actorUserId: auth.userId,
+        },
+      );
+      return json(result, 200, rate.headers);
+    } catch (error) {
+      if (error instanceof SyntaxError) return text("Invalid JSON", 400, rate.headers);
+      return packageOperationErrorToResponse(error, rate.headers, "Package bulk rescan failed");
+    }
+  }
+
+  if (segments[0] === "categories:batch" && segments.length === 1) {
+    const rate = await applyRateLimit(ctx, request, "read");
+    if (!rate.ok) return rate.response;
+
+    let body: ApiV1PackageCategoriesBatchRequest;
+    try {
+      body = parseArk(
+        ApiV1PackageCategoriesBatchRequestSchema,
+        await request.json(),
+        "Package category batch payload",
+      );
+      if (body.packages.length > PACKAGE_CATEGORY_BATCH_LIMIT) {
+        throw new Error(
+          `Package category batches are limited to ${PACKAGE_CATEGORY_BATCH_LIMIT} packages`,
+        );
+      }
+      if (
+        body.packages.some(
+          ({ name, version }) =>
+            !name.trim() || !version.trim() || tryNormalizePackageName(name) === null,
+        )
+      ) {
+        throw new Error("Package names and versions must be non-empty valid package identities");
+      }
+    } catch (error) {
+      return text(
+        error instanceof Error ? error.message : "Invalid package category batch payload",
+        400,
+        rate.headers,
+      );
+    }
+
+    try {
+      const packages = await runQueryRef<
+        Array<{ name: string; version: string; categories: string[] | null }>
+      >(ctx, internalRefs.packages.resolveVersionCategoriesBatchInternal, {
+        packages: body.packages,
+      });
+      const response = parseArk(
+        ApiV1PackageCategoriesBatchResponseSchema,
+        { packages },
+        "Package category batch response",
+      );
+      return json(response, 200, rate.headers);
+    } catch {
+      return text("Internal Server Error", 500, rate.headers);
+    }
+  }
   if (segments[0] === "migrations" && segments.length === 1) {
     const rate = await applyRateLimit(ctx, request, "write");
     if (!rate.ok) return rate.response;
@@ -3582,40 +3900,51 @@ export async function packagesDeleteRouterV1Handler(ctx: ActionCtx, request: Req
 
 async function getReleaseForRequest(
   ctx: ActionCtx,
-  pkg: Pick<PublicPackageDocLike, "_id" | "tags" | "latestReleaseId">,
+  pkg: Pick<PublicPackageDocLike, "_id" | "name">,
   request: Request,
+  viewerUserId?: Id<"users">,
 ): Promise<ReleaseLike | null> {
   const url = new URL(request.url);
-  const versionParam = url.searchParams.get("version")?.trim();
-  const tagParam = url.searchParams.get("tag")?.trim();
-
-  if (versionParam) {
-    return toVisibleRelease(
-      await runQueryRef<ReleaseLike | null>(
-        ctx,
-        internalRefs.packages.getReleaseByPackageAndVersionInternal,
-        {
-          packageId: pkg._id,
-          version: versionParam,
-        },
-      ),
-    );
-  }
-  if (tagParam) {
-    const releaseId = pkg.tags[tagParam];
-    if (!releaseId) return null;
-    return toVisibleRelease(
-      await runQueryRef<ReleaseLike | null>(ctx, internalRefs.packages.getReleaseByIdInternal, {
-        releaseId,
-      }),
-    );
-  }
-  if (!pkg.latestReleaseId) return null;
-  return toVisibleRelease(
-    await runQueryRef<ReleaseLike | null>(ctx, internalRefs.packages.getReleaseByIdInternal, {
-      releaseId: pkg.latestReleaseId,
-    }),
+  const snapshot = await runQueryRef<{ release: ReleaseLike } | null>(
+    ctx,
+    internalRefs.packages.getReleaseForViewerInternal,
+    {
+      name: pkg.name,
+      packageId: pkg._id,
+      version: url.searchParams.get("version")?.trim() || undefined,
+      tag: url.searchParams.get("tag")?.trim() || undefined,
+      viewerUserId,
+    },
   );
+  return snapshot?.release ?? null;
+}
+
+async function packageFileResponse(
+  ctx: ActionCtx,
+  release: ReleaseLike,
+  path: string,
+  preview: boolean,
+  headers: HeadersInit,
+) {
+  const securityBlock = getReleaseSecurityBlock(release);
+  if (securityBlock) return text(securityBlock.message, securityBlock.status, headers);
+  const file = resolvePackageFilePath(release, path);
+  if (!file) return text("File not found", 404, headers);
+  const maxBytes = preview ? MAX_RAW_FILE_BYTES : MAX_PUBLISH_FILE_BYTES;
+  if (file.size > maxBytes) return text("File too large", 413, headers);
+  const blob = await ctx.storage.get(file.storageId);
+  if (!blob) return text("File not found", 404, headers);
+  const responseParams = {
+    blob,
+    path: file.path,
+    contentType: file.contentType,
+    sha256: file.sha256,
+    size: file.size,
+    headers: headers,
+  };
+  return preview
+    ? await safeStoredFilePreviewResponse(responseParams)
+    : await safeStoredFileResponse(responseParams);
 }
 
 function isReadmeVariantPath(path: string) {
@@ -3735,60 +4064,45 @@ async function getUnavailableSkillPackageVersionBlock(
   );
   if (!skill || skill.softDeletedAt) return null;
 
-  const version = (await runQueryRef(ctx, internalRefs.skills.getVersionBySkillAndVersionInternal, {
-    skillId: skill._id,
-    version: versionName,
-  })) as SkillVersionLike | null;
-  if (!version || !isSkillVersionForSkill(version, skill._id)) return null;
-  if (version.softDeletedAt) return { status: 410, message: "Version not available" };
-
+  const selection = await runQueryRef<PublicSkillVersionSelection>(
+    ctx,
+    internalRefs.skills.getPublicVersionSelectionInternal,
+    { skillId: skill._id, version: versionName },
+  );
+  if (selection.status === "deleted") return { status: 410, message: "Version not available" };
+  if (selection.status !== "available") return null;
   return getPublicSkillVersionAccessBlock(
-    getSkillFileModerationInfoFromSkill(skill),
-    version._id,
-    skill.latestVersionId ?? skill.tags?.latest,
+    getSkillFileModerationInfoFromSkill(selection.skill),
+    selection.version._id,
+    selection.skill.latestVersionId ?? selection.skill.tags?.latest,
   );
 }
 
 async function getSkillVersionForRequest(
   ctx: ActionCtx,
-  skill: Pick<SkillPackageDocLike, "_id" | "latestVersionId" | "tags">,
+  skill: Pick<SkillPackageDocLike, "_id">,
   request: Request,
 ) {
   const url = new URL(request.url);
-  const versionParam = url.searchParams.get("version")?.trim();
-  const tagParam = url.searchParams.get("tag")?.trim();
-
-  if (versionParam) {
-    const version = (await runQueryRef(
-      ctx,
-      internalRefs.skills.getVersionBySkillAndVersionInternal,
-      {
-        skillId: skill._id,
-        version: versionParam,
-      },
-    )) as SkillVersionLike | null;
-    return isSkillVersionForSkill(version, skill._id) ? version : null;
-  }
-  if (tagParam) {
-    const versionId = skill.tags[tagParam];
-    if (!versionId) return null;
-    const version = (await runQueryRef(ctx, internalRefs.skills.getVersionByIdInternal, {
-      versionId,
-    })) as SkillVersionLike | null;
-    return isSkillVersionForSkill(version, skill._id) ? version : null;
-  }
-  const latestVersionId = skill.latestVersionId ?? skill.tags.latest;
-  if (!latestVersionId) return null;
-  const version = (await runQueryRef(ctx, internalRefs.skills.getVersionByIdInternal, {
-    versionId: latestVersionId,
-  })) as SkillVersionLike | null;
-  return isSkillVersionForSkill(version, skill._id) ? version : null;
+  return await runQueryRef<PublicSkillVersionSelection>(
+    ctx,
+    internalRefs.skills.getPublicVersionSelectionInternal,
+    {
+      skillId: skill._id,
+      version: url.searchParams.get("version")?.trim() || undefined,
+      tag: url.searchParams.get("tag")?.trim() || undefined,
+    },
+  );
 }
 
 async function searchPackages(
   ctx: ActionCtx,
   request: Request,
-  options?: { includeSkills?: boolean; pluginFamilies?: Array<"code-plugin" | "bundle-plugin"> },
+  options?: {
+    includeSkills?: boolean;
+    pluginFamilies?: Array<"code-plugin" | "bundle-plugin">;
+    recordPluginSearch?: boolean;
+  },
 ) {
   const rate = await applyRateLimit(ctx, request, "read");
   if (!rate.ok) return rate.response;
@@ -3798,7 +4112,7 @@ async function searchPackages(
   const queryText = url.searchParams.get("q")?.trim() ?? "";
   if (!queryText) return text("Missing q query parameter", 400, rate.headers);
   const limit = Math.max(1, Math.min(toOptionalNumber(url.searchParams.get("limit")) ?? 20, 100));
-  const familyParam = parseEnumQueryParam(url.searchParams, "family", publicPackageFamilyValues());
+  const familyParam = parseEnumQueryParam(url.searchParams, "family", PACKAGE_FAMILY_VALUES);
   if (!familyParam.ok) return text(familyParam.message, 400, rate.headers);
   const channelParam = parseEnumQueryParam(url.searchParams, "channel", PACKAGE_CHANNEL_VALUES);
   if (!channelParam.ok) return text(channelParam.message, 400, rate.headers);
@@ -3817,19 +4131,23 @@ async function searchPackages(
   ) {
     return text("Invalid createdAfter", 400, rate.headers);
   }
+  const family = familyParam.value;
   const rawCategory = url.searchParams.get("category")?.trim() || undefined;
-  const category = resolvePluginCategoryFilter(rawCategory);
+  const category = resolvePackageCategoryFilter(rawCategory, family);
   const topic = url.searchParams.get("topic")?.trim().toLowerCase() || undefined;
   const excludedScanStatuses = parseExcludedScanStatuses(url.searchParams.get("excludeScanStatus"));
   if (!excludedScanStatuses.ok) {
     return text(excludedScanStatuses.message, 400, rate.headers);
   }
   if (rawCategory && !category) {
-    return text("Invalid plugin category", 400, rate.headers);
+    return text(
+      family === "claw" ? "Invalid Claw category" : "Invalid plugin category",
+      400,
+      rate.headers,
+    );
   }
-  const family = familyParam.value;
   const includeSkills = options?.includeSkills ?? family === undefined;
-  if (category && (family === "skill" || family === "claw" || (!family && includeSkills))) {
+  if (category && (family === "skill" || (!family && includeSkills))) {
     return text(
       "Plugin category is only supported for plugin package endpoints",
       400,
@@ -3940,11 +4258,34 @@ async function searchPackages(
       .sort(compareCatalogSearchEntries)
       .slice(0, limit);
   }
-  return json({ results: results.map(toPublicCatalogSearchEntry) }, 200, rate.headers);
+  const publicResults = results.map(toPublicCatalogSearchEntry);
+  if (
+    options?.recordPluginSearch &&
+    !request.signal.aborted &&
+    (!family || family === "code-plugin" || family === "bundle-plugin")
+  ) {
+    await recordCatalogSearchObservation(ctx, request, {
+      artifactKind: "plugin",
+      query: queryText,
+      category,
+      topic,
+      filtered: Boolean(
+        category ||
+        topic ||
+        highlightedOnly ||
+        isOfficial.value !== undefined ||
+        createdAfter !== undefined,
+      ),
+      officialResults: publicResults.map((entry) => entry.package.isOfficial === true),
+    });
+  }
+  return json({ results: publicResults }, 200, rate.headers);
 }
 
 export async function packagesGetRouterV1Handler(ctx: ActionCtx, request: Request) {
   const segments = getPathSegments(request, "/api/v1/packages/");
+  if (segments[0] === "-" && segments[1] === "managed-mcp")
+    return managedMcpV1Handler(ctx, request, segments);
   if (segments.length === 0) return text("Not found", 404);
   if (segments[0] === "search" && segments.length === 1) {
     return await searchPackages(ctx, request, { includeSkills: true });
@@ -4120,6 +4461,50 @@ export async function packagesGetRouterV1Handler(ctx: ActionCtx, request: Reques
   if (!normalizedPackageName) return text("Package not found", 404, rate.headers);
 
   const viewerUserId = await getOptionalViewerUserIdForRequest(ctx, request);
+  if (packageSegments[0] === "detail" && packageSegments.length === 1) {
+    const version = new URL(request.url).searchParams.get("version")?.trim() || undefined;
+    const snapshot = await ctx.runQuery(internal.packages.getPluginDetailForViewerInternal, {
+      name: normalizedPackageName,
+      viewerUserId: viewerUserId ?? undefined,
+      version,
+    });
+    if (!snapshot) return text("Package not found", 404, rate.headers);
+    const release = snapshot.release;
+    if (version && !release) return text("Version not found", 404, rate.headers);
+    let readme: string | null = null;
+    let security: ApiV1PackageSecurityResponse | null = null;
+    if (release) {
+      const preview = await packageFileResponse(ctx, release, "README.md", true, rate.headers);
+      if (preview.ok) readme = await preview.text();
+      else if (![403, 404, 415, 423].includes(preview.status)) return preview;
+      try {
+        security = parseArk(
+          ApiV1PackageSecurityResponseSchema,
+          toPackageReleaseSecurityResponse({ request, pkg: snapshot.package, release }),
+          "Package security response",
+        );
+      } catch {
+        // Security is optional in the detail view; malformed historical scan
+        // metadata must not hide an otherwise readable package and README.
+      }
+    }
+    const { publicDownloadBlocked: _publicDownloadBlocked, ...pkg } = snapshot.package;
+    return json(
+      parseArk(
+        ApiV1PluginDetailResponseSchema,
+        {
+          ...toPackageMetadataResponse(pkg, snapshot.owner, snapshot.tags),
+          versions: snapshot.versions,
+          version: release ? toPackageVersionResponse(release, pkg.name) : null,
+          readme,
+          security,
+        },
+        "Plugin detail response",
+      ),
+      200,
+      rate.headers,
+    );
+  }
   if (
     packageSegments[0] === "versions" &&
     packageSegments[1] &&
@@ -4148,6 +4533,25 @@ export async function packagesGetRouterV1Handler(ctx: ActionCtx, request: Reques
     return json(parsed, 200, rate.headers);
   }
 
+  if (
+    packageSegments[0] === "versions" &&
+    packageSegments[1] &&
+    packageSegments[2] === "publication" &&
+    packageSegments.length === 3
+  ) {
+    const result = await ctx.runQuery(internal.packages.getVersionPublicationStateInternal, {
+      name: normalizedPackageName,
+      version: packageSegments[1],
+      viewerUserId: viewerUserId ?? undefined,
+    });
+    if ("error" in result) return text(result.error, 404, rate.headers);
+    return json(
+      parseArk(ApiV1PackageVersionPublicationResponseSchema, result, "Package publication state"),
+      200,
+      rate.headers,
+    );
+  }
+
   const ownerHandle = getOwnerHandleParam(request);
   const isExactVersionRequest =
     packageSegments[0] === "versions" && packageSegments[1] && packageSegments.length === 2;
@@ -4157,7 +4561,7 @@ export async function packagesGetRouterV1Handler(ctx: ActionCtx, request: Reques
   })) as {
     package: PublicPackageDocLike | null;
     latestRelease: ReleaseLike | null;
-    owner: { _id: Id<"users">; handle?: string; displayName?: string; image?: string } | null;
+    owner: PublicPublisher | null;
   } | null;
   const skillDetail = detail?.package
     ? null
@@ -4195,36 +4599,15 @@ export async function packagesGetRouterV1Handler(ctx: ActionCtx, request: Reques
           skillDetail.skill,
           skillDetail.latestVersion,
           skillDetail.owner,
-          await resolveSkillTags(
-            ctx,
-            skillDetail.skill._id,
-            skillDetail.skill.tags,
-            skillDetail.latestVersion,
-          ),
+          await resolveSkillTags(ctx, skillDetail.skill._id, skillDetail.skill.tags),
         ),
         200,
         rate.headers,
       );
     }
-    const tags = await resolvePackageTags(ctx, publicPackage!.tags);
+    const tags = await resolvePackageTags(ctx, publicPackage!, viewerUserId ?? undefined);
 
-    return json(
-      {
-        package: {
-          ...toPackageDetailResponsePackage(publicPackage!),
-          tags,
-        },
-        owner: packageOwner
-          ? {
-              handle: packageOwner.handle ?? null,
-              displayName: packageOwner.displayName ?? null,
-              image: packageOwner.image ?? null,
-            }
-          : null,
-      },
-      200,
-      rate.headers,
-    );
+    return json(toPackageMetadataResponse(publicPackage!, packageOwner, tags), 200, rate.headers);
   }
 
   if (packageSegments[0] === "trusted-publisher" && packageSegments.length === 1) {
@@ -4358,21 +4741,17 @@ export async function packagesGetRouterV1Handler(ctx: ActionCtx, request: Reques
 
   if (packageSegments[0] === "versions" && packageSegments[1]) {
     if (skillDetail?.skill) {
-      const version = (await runQueryRef(
+      const selection = await runQueryRef<PublicSkillVersionSelection>(
         ctx,
-        internalRefs.skills.getVersionBySkillAndVersionInternal,
-        {
-          skillId: skillDetail.skill._id,
-          version: packageSegments[1],
-        },
-      )) as SkillVersionLike | null;
-      if (!version || version.softDeletedAt) return text("Version not found", 404, rate.headers);
-      const effectiveLatestVersionId =
-        skillDetail.skill.latestVersionId ?? skillDetail.skill.tags?.latest;
+        internalRefs.skills.getPublicVersionSelectionInternal,
+        { skillId: skillDetail.skill._id, version: packageSegments[1] },
+      );
+      if (selection.status !== "available") return text("Version not found", 404, rate.headers);
+      const { skill, version } = selection;
       const moderationBlock = getPublicSkillVersionAccessBlock(
-        skillDetail.moderationInfo,
+        getSkillFileModerationInfoFromSkill(skill),
         version._id,
-        effectiveLatestVersionId,
+        skill.latestVersionId ?? skill.tags?.latest,
       );
       if (moderationBlock)
         return text(moderationBlock.message, moderationBlock.status, rate.headers);
@@ -4414,10 +4793,6 @@ export async function packagesGetRouterV1Handler(ctx: ActionCtx, request: Reques
       },
     )) as { package: PublicPackageDocLike; version: ReleaseLike } | null;
     if (!result) return text("Version not found", 404, rate.headers);
-    const scanStatus = resolvePackageReleaseScanStatus(result.version);
-    const verification = result.version.verification
-      ? { ...result.version.verification, scanStatus }
-      : null;
     return json(
       {
         package: {
@@ -4425,28 +4800,7 @@ export async function packagesGetRouterV1Handler(ctx: ActionCtx, request: Reques
           displayName: result.package.displayName,
           family: result.package.family,
         },
-        version: {
-          version: result.version.version,
-          createdAt: result.version.createdAt,
-          changelog: result.version.changelog,
-          distTags: result.version.distTags ?? [],
-          files: result.version.files.map((file) => ({
-            path: file.path,
-            size: file.size,
-            sha256: file.sha256,
-            contentType: file.contentType,
-          })),
-          compatibility: result.version.compatibility ?? null,
-          pluginManifestSummary: result.version.pluginManifestSummary ?? null,
-          clawManifestSummary: result.version.clawManifestSummary ?? null,
-          verification,
-          artifact: toReleaseArtifact(result.version, result.package.name),
-          sha256hash: result.version.sha256hash ?? null,
-          vtAnalysis: result.version.vtAnalysis ?? null,
-          skillSpectorAnalysis: result.version.skillSpectorAnalysis ?? null,
-          llmAnalysis: result.version.llmAnalysis ?? null,
-          staticScan: result.version.staticScan ?? null,
-        },
+        version: toPackageVersionResponse(result.version, result.package.name),
       },
       200,
       rate.headers,
@@ -4459,14 +4813,13 @@ export async function packagesGetRouterV1Handler(ctx: ActionCtx, request: Reques
     if (!path) return text("Missing path", 400, rate.headers);
     const preview = requestUrl.searchParams.get("preview") === "1";
     if (skillDetail?.skill) {
-      const version = await getSkillVersionForRequest(ctx, skillDetail.skill, request);
-      if (!version || version.softDeletedAt) return text("Version not found", 404, rate.headers);
-      const effectiveLatestVersionId =
-        skillDetail.skill.latestVersionId ?? skillDetail.skill.tags?.latest;
+      const selection = await getSkillVersionForRequest(ctx, skillDetail.skill, request);
+      if (selection.status !== "available") return text("Version not found", 404, rate.headers);
+      const { skill, version } = selection;
       const moderationBlock = getPublicSkillVersionDownloadBlock(
-        skillDetail.moderationInfo,
+        getSkillFileModerationInfoFromSkill(skill),
         version,
-        effectiveLatestVersionId,
+        skill.latestVersionId ?? skill.tags?.latest,
       );
       if (moderationBlock)
         return text(moderationBlock.message, moderationBlock.status, rate.headers);
@@ -4497,27 +4850,14 @@ export async function packagesGetRouterV1Handler(ctx: ActionCtx, request: Reques
         headers: rate.headers,
       });
     }
-    const release = await getReleaseForRequest(ctx, publicPackage!, request);
+    const release = await getReleaseForRequest(
+      ctx,
+      publicPackage!,
+      request,
+      viewerUserId ?? undefined,
+    );
     if (!release) return text("Version not found", 404, rate.headers);
-    const securityBlock = getReleaseSecurityBlock(release);
-    if (securityBlock) return text(securityBlock.message, securityBlock.status, rate.headers);
-    const file = resolvePackageFilePath(release, path);
-    if (!file) return text("File not found", 404, rate.headers);
-    const maxBytes = preview ? MAX_RAW_FILE_BYTES : MAX_PUBLISH_FILE_BYTES;
-    if (file.size > maxBytes) return text("File too large", 413, rate.headers);
-    const blob = await ctx.storage.get(file.storageId);
-    if (!blob) return text("File not found", 404, rate.headers);
-    const responseParams = {
-      blob,
-      path: file.path,
-      contentType: file.contentType,
-      sha256: file.sha256,
-      size: file.size,
-      headers: rate.headers,
-    };
-    return preview
-      ? await safeStoredFilePreviewResponse(responseParams)
-      : await safeStoredFileResponse(responseParams);
+    return packageFileResponse(ctx, release, path, preview, rate.headers);
   }
 
   if (packageSegments[0] === "download") {
@@ -4537,7 +4877,12 @@ export async function packagesGetRouterV1Handler(ctx: ActionCtx, request: Reques
         headers: mergeHeaders(rate.headers, { Location: url.toString() }, corsHeaders()),
       });
     }
-    const release = await getReleaseForRequest(ctx, publicPackage!, request);
+    const release = await getReleaseForRequest(
+      ctx,
+      publicPackage!,
+      request,
+      viewerUserId ?? undefined,
+    );
     if (!release) return text("Version not found", 404, rate.headers);
     const securityBlock = getReleaseSecurityBlock(release);
     if (securityBlock) return text(securityBlock.message, securityBlock.status, rate.headers);
@@ -4680,7 +5025,7 @@ export async function npmMirrorGetHandler(ctx: ActionCtx, request: Request) {
   })) as {
     package: PublicPackageDocLike | null;
     latestRelease: ReleaseLike | null;
-    owner: { _id: Id<"users">; handle?: string; displayName?: string; image?: string } | null;
+    owner: PublicPublisher | null;
   } | null;
   if (!detail?.package) return text("Package not found", 404, rate.headers);
 
@@ -4741,6 +5086,7 @@ export async function pluginsGetRouterV1Handler(ctx: ActionCtx, request: Request
     return await searchPackages(ctx, request, {
       includeSkills: false,
       pluginFamilies: ["code-plugin", "bundle-plugin"],
+      recordPluginSearch: true,
     });
   }
   return text("Not found", 404);

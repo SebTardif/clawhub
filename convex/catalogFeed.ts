@@ -11,7 +11,6 @@ import {
   EXPERIMENTAL_CLAW_FEED_SCHEMA_VERSION,
   serializeCatalogFeed,
   serializeExperimentalClawFeed,
-  type CatalogFeedEntry,
   type CatalogFeedPluginEntry,
   type CatalogFeedSkillEntry,
   type ExperimentalClawFeedEntry,
@@ -23,10 +22,11 @@ import { internalAction, internalMutation, internalQuery } from "./_generated/se
 import type { QueryCtx } from "./_generated/server";
 import { isSkillHighlighted } from "./lib/badges";
 import { sha256Hex } from "./lib/clawpack";
-import { experimentalClawsEnabled } from "./lib/experimentalClaws";
+import { isOpenClawClawName, isOpenClawClawPublisher } from "./lib/experimentalClaws";
 import { isPublicSkillDoc } from "./lib/globalStats";
 import { isOfficialPublisher } from "./lib/officialPublishers";
 import { getPackageReleaseArtifactSha256 } from "./lib/packageArtifacts";
+import { isPublishedPackageRelease } from "./lib/packageReleaseVisibility";
 import { isPackageBlockedFromPublic, resolvePackageReleaseScanStatus } from "./lib/packageSecurity";
 import { getOwnerPublisher } from "./lib/publishers";
 import { isSecurityScanStatusCompletedNonBlocked } from "./lib/securityScanPolicy";
@@ -52,6 +52,27 @@ type CatalogFeedPublicationResult = {
   publishedAt: number;
   entryCount: number;
 };
+type CatalogFeedPage<T> = {
+  entries: T[];
+  isDone: boolean;
+  continueCursor: string;
+};
+
+async function collectFeedPages<T>(
+  readPage: (cursor: string | null) => Promise<CatalogFeedPage<T>>,
+): Promise<T[]> {
+  const entries: T[] = [];
+  let cursor: string | null = null;
+  while (true) {
+    const page = await readPage(cursor);
+    entries.push(...page.entries);
+    if (entries.length > MAX_CATALOG_FEED_ENTRIES) {
+      throw new Error(`Catalog feed exceeds ${MAX_CATALOG_FEED_ENTRIES} entries`);
+    }
+    if (page.isDone) return entries;
+    cursor = page.continueCursor;
+  }
+}
 
 function appendEntriesWithinFeedLimit<T>(target: T[], entries: T[]) {
   const remaining = MAX_CATALOG_FEED_ENTRIES - target.length;
@@ -140,7 +161,7 @@ async function buildEntry(
 ): Promise<CatalogFeedPluginEntry | ExperimentalClawFeedEntry | null> {
   if (pkg.softDeletedAt || pkg.channel !== "official" || !pkg.latestReleaseId) return null;
   const release = await ctx.db.get(pkg.latestReleaseId);
-  if (!release || release.packageId !== pkg._id || release.softDeletedAt) return null;
+  if (!isPublishedPackageRelease(release, pkg._id)) return null;
 
   // Keep ClawHub on RFC 19's canonical feed entry shape. OpenClaw's staged
   // consumer must land its legacy-catalog adapter before this URL is enabled.
@@ -154,6 +175,12 @@ async function buildEntry(
     ownerUserId: pkg.ownerUserId,
   });
   if (!(await isOfficialPublisher(ctx, owner))) return null;
+  if (
+    pkg.family === "claw" &&
+    (!isOpenClawClawName(pkg.normalizedName) || !isOpenClawClawPublisher(owner))
+  ) {
+    return null;
+  }
   const publisherId = owner?.handle?.trim();
   if (!publisherId) return null;
 
@@ -222,32 +249,25 @@ async function buildEntry(
   };
 }
 
-async function listFamilyEntries(
+async function listFamilyEntryPage(
   ctx: CatalogQueryCtx,
   family: (typeof CATALOG_FEED_FAMILIES)[number] | typeof CATALOG_CLAW_FAMILY,
+  cursor: string | null,
 ) {
   const entries: Array<CatalogFeedPluginEntry | ExperimentalClawFeedEntry> = [];
-  let cursor: string | null = null;
+  const page = await ctx.db
+    .query("packages")
+    .withIndex("by_active_family_official_downloads", (q) =>
+      q.eq("softDeletedAt", undefined).eq("family", family).eq("isOfficial", true),
+    )
+    .order("desc")
+    .paginate({ cursor, numItems: CATALOG_FEED_PAGE_SIZE });
 
-  while (true) {
-    const page = await ctx.db
-      .query("packages")
-      .withIndex("by_active_family_official_downloads", (q) =>
-        q.eq("softDeletedAt", undefined).eq("family", family).eq("isOfficial", true),
-      )
-      .order("desc")
-      .paginate({ cursor, numItems: CATALOG_FEED_PAGE_SIZE });
-
-    for (const pkg of page.page) {
-      const entry = await buildEntry(ctx, pkg);
-      if (entry) entries.push(entry);
-      if (entries.length > MAX_CATALOG_FEED_ENTRIES) {
-        throw new Error(`Catalog feed exceeds ${MAX_CATALOG_FEED_ENTRIES} entries`);
-      }
-    }
-    if (page.isDone) return entries;
-    cursor = page.continueCursor;
+  for (const pkg of page.page) {
+    const entry = await buildEntry(ctx, pkg);
+    if (entry) entries.push(entry);
   }
+  return { entries, isDone: page.isDone, continueCursor: page.continueCursor };
 }
 
 async function buildSkillEntry(
@@ -415,25 +435,27 @@ export const listOfficialPublisherPage = internalQuery({
 export const listOfficialEntries = internalQuery({
   args: {
     family: v.union(v.literal("code-plugin"), v.literal("bundle-plugin")),
+    cursor: v.union(v.string(), v.null()),
   },
   handler: async (ctx, args) => {
-    const entries = await listFamilyEntries(ctx, args.family);
-    if (entries.some((entry) => entry.type !== "plugin")) {
+    const page = await listFamilyEntryPage(ctx, args.family, args.cursor);
+    if (page.entries.some((entry) => entry.type !== "plugin")) {
       throw new Error("Plugin feed projection returned a mismatched entry type");
     }
-    return entries as CatalogFeedPluginEntry[];
+    return { ...page, entries: page.entries as CatalogFeedPluginEntry[] };
   },
 });
 
 export const listOfficialClawEntries = internalQuery({
-  args: {},
-  handler: async (ctx) => {
-    if (!experimentalClawsEnabled()) return [];
-    const entries = await listFamilyEntries(ctx, CATALOG_CLAW_FAMILY);
-    if (entries.some((entry) => entry.type !== "claw")) {
+  args: {
+    cursor: v.union(v.string(), v.null()),
+  },
+  handler: async (ctx, args) => {
+    const page = await listFamilyEntryPage(ctx, CATALOG_CLAW_FAMILY, args.cursor);
+    if (page.entries.some((entry) => entry.type !== "claw")) {
       throw new Error("Claw feed projection returned a mismatched entry type");
     }
-    return entries as ExperimentalClawFeedEntry[];
+    return { ...page, entries: page.entries as ExperimentalClawFeedEntry[] };
   },
 });
 
@@ -532,7 +554,38 @@ export const storeClawPublication = internalMutation({
     entries: v.array(clawFeedEntryValidator),
   },
   handler: async (ctx, args) => {
-    if (!experimentalClawsEnabled()) throw new Error("Experimental Claw feeds are disabled");
+    if (
+      args.entries.some(
+        (entry) =>
+          !isOpenClawClawName(entry.id) ||
+          entry.publisher.id !== "openclaw" ||
+          entry.publisher.trust !== "official" ||
+          entry.install.candidates.length === 0 ||
+          entry.install.candidates.some(
+            (candidate) => candidate.package !== entry.id || candidate.version !== entry.version,
+          ),
+      )
+    ) {
+      throw new Error("Experimental Claw feed entries must be published by @openclaw");
+    }
+    const owner = args.entries.length
+      ? await ctx.db
+          .query("publishers")
+          .withIndex("by_active_kind_handle", (q) =>
+            q
+              .eq("deletedAt", undefined)
+              .eq("deactivatedAt", undefined)
+              .eq("kind", "org")
+              .eq("handle", "openclaw"),
+          )
+          .unique()
+      : null;
+    if (
+      args.entries.length &&
+      (!isOpenClawClawPublisher(owner) || !(await isOfficialPublisher(ctx, owner)))
+    ) {
+      throw new Error("Experimental Claw feed publisher is unavailable");
+    }
     const latest = await ctx.db
       .query("catalogFeedPublications")
       .withIndex("by_feed", (q) => q.eq("feedId", EXPERIMENTAL_CLAW_FEED_ID))
@@ -557,6 +610,9 @@ export const storeClawPublication = internalMutation({
       payload,
       payloadSha256,
       publishedAt,
+      clawPolicyVersion: 1 as const,
+      clawEntryCount: args.entries.length,
+      clawPublisherId: owner?._id,
     };
     const publicationId = latest
       ? (await ctx.db.patch(latest._id, publication), latest._id)
@@ -578,14 +634,12 @@ export const publish = internalAction({
   },
   handler: async (ctx, args): Promise<CatalogFeedPublicationResult[]> => {
     const generatedAt = new Date().toISOString();
-    const familyEntries: CatalogFeedEntry[][] = await Promise.all(
-      CATALOG_FEED_FAMILIES.map(async (family) => {
-        const entries: CatalogFeedEntry[] = await ctx.runQuery(
-          internal.catalogFeed.listOfficialEntries,
-          { family },
-        );
-        return entries;
-      }),
+    const familyEntries: CatalogFeedPluginEntry[][] = await Promise.all(
+      CATALOG_FEED_FAMILIES.map((family) =>
+        collectFeedPages<CatalogFeedPluginEntry>((cursor) =>
+          ctx.runQuery(internal.catalogFeed.listOfficialEntries, { family, cursor }),
+        ),
+      ),
     );
     const entries = familyEntries.flat();
     if (entries.length > MAX_CATALOG_FEED_ENTRIES) {
@@ -646,16 +700,10 @@ export const publish = internalAction({
         entries: skillEntries.sort((left, right) => left.id.localeCompare(right.id)),
       },
     );
-    if (!experimentalClawsEnabled()) {
-      return [pluginResult, skillsResult];
-    }
-    const clawEntries: ExperimentalClawFeedEntry[] = await ctx.runQuery(
-      internal.catalogFeed.listOfficialClawEntries,
-      {},
-    );
-    if (clawEntries.length > MAX_CATALOG_FEED_ENTRIES) {
-      throw new Error(`Catalog feed exceeds ${MAX_CATALOG_FEED_ENTRIES} entries`);
-    }
+    const clawEntries: ExperimentalClawFeedEntry[] =
+      await collectFeedPages<ExperimentalClawFeedEntry>((cursor) =>
+        ctx.runQuery(internal.catalogFeed.listOfficialClawEntries, { cursor }),
+      );
     const clawsResult: CatalogFeedPublicationResult = await ctx.runMutation(
       internal.catalogFeed.storeClawPublication,
       {
@@ -677,9 +725,24 @@ export const getLatestPublication = internalQuery({
       v.literal(PROMOTIONS_FEED_ID),
     ),
   },
-  handler: async (ctx, args) =>
-    await ctx.db
+  handler: async (ctx, args) => {
+    const publication = await ctx.db
       .query("catalogFeedPublications")
       .withIndex("by_feed", (q) => q.eq("feedId", args.feedId))
-      .unique(),
+      .unique();
+    if (args.feedId !== EXPERIMENTAL_CLAW_FEED_ID || !publication) return publication;
+    if (
+      publication.clawPolicyVersion !== 1 ||
+      publication.clawEntryCount === undefined ||
+      !Number.isSafeInteger(publication.clawEntryCount) ||
+      publication.clawEntryCount < 0
+    ) {
+      return null;
+    }
+    if (publication.clawEntryCount === 0) return publication;
+    if (!publication.clawPublisherId) return null;
+    const owner = await ctx.db.get(publication.clawPublisherId);
+    if (!isOpenClawClawPublisher(owner) || !(await isOfficialPublisher(ctx, owner))) return null;
+    return publication;
+  },
 });

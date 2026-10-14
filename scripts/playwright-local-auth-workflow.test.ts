@@ -6,6 +6,7 @@ import { parse as parseYaml } from "yaml";
 type WorkflowStep = {
   name?: string;
   run?: string;
+  with?: { path?: string; key?: string };
 };
 
 describe("playwright local-auth workflow", () => {
@@ -37,9 +38,19 @@ describe("playwright local-auth workflow", () => {
       ),
     ).toBe(false);
 
+    expect(
+      job.strategy?.matrix?.include?.find((entry) => entry.name === "profile-context")?.specs,
+    ).toContain("e2e/local-auth/skill-hero-metadata.pw.test.ts");
+
     const localAuthStep = job.steps.find((step) => step.name === "Local-auth browser e2e");
     expect(localAuthStep?.run).toContain("/sys/fs/cgroup/cpu.stat");
     expect(localAuthStep?.run).toContain("/proc/pressure/memory");
     expect(localAuthStep?.run).toContain("trap report_runner_pressure EXIT");
+
+    const npmCacheStep = job.steps.find(
+      (step) => step.name === "Cache npm packages for local Convex external dependencies",
+    );
+    expect(npmCacheStep?.with?.path).toBe("~/.npm");
+    expect(npmCacheStep?.with?.key).toContain("local-auth-npm");
   });
 });

@@ -15,6 +15,7 @@ import {
   ApiSearchResponseSchema,
   ApiV1SkillHardDeleteResponseSchema,
   ApiV1SkillInstallResolveResponseSchema,
+  ApiV1SkillListResponseSchema,
   ApiV1SkillRescanResponseSchema,
   ApiV1SearchResponseSchema,
   ApiV1SkillVerifyResponseSchema,
@@ -26,6 +27,34 @@ import {
 } from "./schemas";
 
 describe("clawhub-schema", () => {
+  it("parses owner-qualified skill list items without a public version", () => {
+    const response = parseArk(
+      ApiV1SkillListResponseSchema,
+      {
+        items: [
+          {
+            ownerHandle: "fixture-owner",
+            slug: "shared-fixture-slug",
+            displayName: "Fixture skill",
+            summary: null,
+            description: null,
+            tags: {},
+            stats: {},
+            createdAt: 1,
+            updatedAt: 2,
+            latestVersion: null,
+            metadata: null,
+          },
+        ],
+        nextCursor: null,
+      },
+      "Skill list response",
+    );
+
+    expect(response.items[0]?.ownerHandle).toBe("fixture-owner");
+    expect(response.items[0]?.latestVersion).toBeNull();
+  });
+
   it("parses package hard-delete responses", () => {
     const result = parseArk(
       ApiV1PackageHardDeleteResponseSchema,
@@ -201,6 +230,38 @@ describe("clawhub-schema", () => {
     expect(response.version?.pluginManifestSummary?.icon).toBe(
       "https://cdn.example.test/icons/demo-plugin.svg",
     );
+  });
+
+  it.each([
+    {},
+    {
+      contracts: { tools: ["apify"], videoGenerationProviders: ["heygen"] },
+      providers: ["model-provider"],
+      channels: ["chat"],
+    },
+  ])("reads old and capability-enriched version summaries: %j", (capabilities) => {
+    const summary = {
+      schemaVersion: 1,
+      configFields: [],
+      mcpServers: [],
+      bundledSkills: [],
+      ...capabilities,
+    };
+    const response = parseArk(
+      ApiV1PackageVersionResponseSchema,
+      {
+        package: { name: "demo", displayName: "Demo", family: "code-plugin" },
+        version: {
+          version: "1.0.0",
+          createdAt: 1,
+          changelog: "",
+          files: [],
+          pluginManifestSummary: summary,
+        },
+      },
+      "Package version response",
+    );
+    expect(response.version?.pluginManifestSummary).toEqual(summary);
   });
 
   it("accepts publish payload with github source", () => {
@@ -528,7 +589,20 @@ describe("clawhub-schema", () => {
     expect(parsed.results[0]?.downloads).toBe(2_190);
   });
 
-  it("parses flattened skill verification envelopes", () => {
+  it.each([
+    { aig: null, skillspector: null },
+    {
+      aig: {
+        $schema: "https://json.schemastore.org/sarif-2.1.0.json",
+        runs: [],
+        futureField: true,
+      },
+      skillspector: {
+        analysis_completeness: { coverage_percent: 99.1 },
+        evidence: "full".repeat(150_000),
+      },
+    },
+  ])("parses skill verification with full scanner reports under security", (scannerReports) => {
     const parsed = parseArk(
       ApiV1SkillVerifyResponseSchema,
       {
@@ -549,7 +623,7 @@ describe("clawhub-schema", () => {
         card: { available: true },
         artifact: { sourceFingerprint: "source", bundleFingerprints: [], files: [] },
         provenance: { source: "unavailable" },
-        security: { status: "clean", passed: true },
+        security: { status: "clean", passed: true, scannerReports },
         signature: { status: "unsigned" },
       },
       "Verify",
@@ -557,6 +631,7 @@ describe("clawhub-schema", () => {
 
     expect(parsed.slug).toBe("demo");
     expect(parsed.version).toBe("1.0.0");
+    expect(parsed.security).toEqual({ status: "clean", passed: true, scannerReports });
   });
 
   it("parses delete request payload", () => {

@@ -3,23 +3,29 @@ import { Binoculars, CloudOff, Loader2, Moon, Plus, X } from "lucide-react";
 import { type ReactNode, useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { api } from "../../convex/_generated/api";
 import { convexHttp } from "../convex/client";
+import { CATALOG_TABS } from "../lib/catalogTabs";
 import { PLUGIN_CATEGORIES, SKILL_CATEGORIES } from "../lib/categories";
 import {
   fetchHomePluginListing as fetchPluginListing,
+  fetchHomeTrendingPluginListing,
   fetchHomeSkillListing as fetchSkillListing,
   searchHomeTrendingSkillListing,
+  fetchHomeFeaturedSkillListing,
+  DEFAULT_HOME_LISTING_VIEW,
   HOME_LISTING_PAGE_SIZE,
   HOME_NEW_WINDOW_MS,
   homeListingCacheKey as listingCacheKey,
   isHomeTrendingSkillEntry,
   type HomeListingCacheEntry,
   type HomeListingInitialData,
-  type HomeListingKind as ListingKind,
   type HomeNativeSkillListingEntry,
-  type HomeListingTab as ListingTab,
   type HomeSkillListingEntry as SkillPageEntry,
+  type HomeListingKind as ListingKind,
+  type HomeListingTab as ListingTab,
+  type HomeListingView,
   type TrendingFeedState,
 } from "../lib/homeListingData";
+import { consumeManualCatalogSearch, type ManualCatalogSearch } from "../lib/manualCatalogSearch";
 import { formatCompactStat } from "../lib/numberFormat";
 import { fetchPluginCatalog, type PackageListItem } from "../lib/packageApi";
 import { buildPluginDetailHref } from "../lib/pluginRoutes";
@@ -36,24 +42,7 @@ import {
 import { MarketplaceIcon } from "./MarketplaceIcon";
 import { OfficialBadge } from "./OfficialBadge";
 import { BrowseResultsSkeleton } from "./skeletons/BrowseResultsSkeleton";
-import { Badge } from "./ui/badge";
-import { Tooltip, TooltipContent, TooltipTrigger } from "./ui/tooltip";
-
-const SKILL_LISTING_TABS: Array<{ id: ListingTab; label: string }> = [
-  { id: "trending", label: "Trending" },
-  { id: "featured", label: "Featured" },
-  { id: "official", label: "Official" },
-  { id: "new", label: "New" },
-];
-
-const PLUGIN_LISTING_TABS: Array<{
-  id: Exclude<ListingTab, "trending">;
-  label: string;
-}> = [
-  { id: "featured", label: "Featured" },
-  { id: "official", label: "Official" },
-  { id: "new", label: "New" },
-];
+import { SkillListingHead, SkillListingRow, SkillListingSkeleton } from "./SkillListingRow";
 
 const LISTING_PAGE_SIZE = HOME_LISTING_PAGE_SIZE;
 const LISTING_SEARCH_DEBOUNCE_MS = 220;
@@ -63,10 +52,12 @@ function HomeListingEmptyPanel({
   variant,
   query,
   onClear,
+  kind = "skills",
 }: {
   variant: "error" | "empty" | "filter" | "search" | "trendingEmpty" | "trendingUnavailable";
   query?: string;
   onClear?: () => void;
+  kind?: ListingKind;
 }) {
   const Icon =
     variant === "error" || variant === "trendingUnavailable"
@@ -88,7 +79,7 @@ function HomeListingEmptyPanel({
     variant === "trendingUnavailable"
       ? "The canonical 24-hour feed isn't available right now. Try another tab."
       : variant === "trendingEmpty"
-        ? "No skills have eligible activity in the current 24-hour window."
+        ? `No ${kind} have eligible activity in the current 24-hour window.`
         : variant === "error"
           ? "We couldn't load this slice of the catalog. Give it another try in a moment."
           : variant === "search"
@@ -151,78 +142,6 @@ function HomeListingResults({
   );
 }
 
-function skillLink(entry: HomeNativeSkillListingEntry) {
-  const owner =
-    entry.ownerHandle?.trim() ||
-    entry.owner?.handle?.trim() ||
-    String(entry.skill.ownerPublisherId ?? entry.skill.ownerUserId);
-  return `/${encodeURIComponent(owner)}/${encodeURIComponent(entry.skill.slug)}`;
-}
-
-function HomeListingSkillRow({ entry }: { entry: SkillPageEntry }) {
-  if (isHomeTrendingSkillEntry(entry)) {
-    const item = entry.trending;
-    const isSkillsSh = item.source === "skills-sh";
-    const owner = isSkillsSh
-      ? (item.sourceIdentity?.owner ?? item.sourceIdentity?.host)
-      : item.publisher?.handle;
-    return (
-      <Link to={item.canonicalUrl} className="home-v2-listing-row">
-        <div className="home-v2-listing-row-body">
-          <div className="home-v2-listing-row-title">
-            <span className="home-v2-listing-row-name" title={item.displayName}>
-              {truncateText(item.displayName, PUBLIC_CATALOG_NAME_PREVIEW_LENGTH)}
-            </span>
-            {owner ? <span className="home-v2-listing-row-by">@{owner}</span> : null}
-          </div>
-          <p className="home-v2-listing-row-summary">
-            {truncateText(item.summary || "Agent-ready skill pack.", 80)}
-          </p>
-        </div>
-        {isSkillsSh ? (
-          <div className="home-v2-listing-row-stats is-skills-sh" aria-label="Source">
-            <Tooltip>
-              <TooltipTrigger asChild>
-                <Badge variant="compact" size="sm">
-                  skills.sh
-                </Badge>
-              </TooltipTrigger>
-              <TooltipContent side="top" align="center">
-                Synced from skills.sh
-              </TooltipContent>
-            </Tooltip>
-          </div>
-        ) : typeof item.metrics.trending24hDownloads === "number" ? (
-          <div className="home-v2-listing-row-stats" aria-label="Downloads">
-            <span>{formatCompactStat(item.metrics.trending24hDownloads)}</span>
-          </div>
-        ) : null}
-      </Link>
-    );
-  }
-  const handle = entry.ownerHandle || entry.owner?.handle;
-  const name = presentationTitle(entry.skill.displayName, entry.skill.slug);
-
-  return (
-    <Link to={skillLink(entry)} className="home-v2-listing-row">
-      <div className="home-v2-listing-row-body">
-        <div className="home-v2-listing-row-title">
-          <span className="home-v2-listing-row-name" title={name}>
-            {truncateText(name, PUBLIC_CATALOG_NAME_PREVIEW_LENGTH)}
-          </span>
-          {handle ? <span className="home-v2-listing-row-by">@{handle}</span> : null}
-        </div>
-        <p className="home-v2-listing-row-summary">
-          {truncateText(entry.skill.summary || "Agent-ready skill pack.", 80)}
-        </p>
-      </div>
-      <div className="home-v2-listing-row-stats" aria-label="Downloads">
-        <span>{formatCompactStat(entry.skill.stats?.downloads ?? 0)}</span>
-      </div>
-    </Link>
-  );
-}
-
 function HomeListingPluginRow({ plugin }: { plugin: PackageListItem }) {
   const name = presentationTitle(plugin.displayName, plugin.name);
   const pluginHref = buildPluginDetailHref(plugin.name, { ownerHandle: plugin.ownerHandle });
@@ -234,6 +153,7 @@ function HomeListingPluginRow({ plugin }: { plugin: PackageListItem }) {
           kind="plugin"
           label={name}
           imageUrl={plugin.icon}
+          publisherImageUrl={plugin.ownerImage}
           categorySlug={plugin.categories?.[0]}
           size="sm"
         />
@@ -253,7 +173,9 @@ function HomeListingPluginRow({ plugin }: { plugin: PackageListItem }) {
         </p>
       </div>
       <div className="home-v2-listing-row-stats" aria-label="Downloads">
-        <span>{formatCompactStat(plugin.stats?.downloads ?? 0)}</span>
+        <span>
+          {formatCompactStat(plugin.trending24h?.downloads ?? plugin.stats?.downloads ?? 0)}
+        </span>
       </div>
     </Link>
   );
@@ -261,6 +183,10 @@ function HomeListingPluginRow({ plugin }: { plugin: PackageListItem }) {
 
 type HomeListingSectionProps = {
   initialListing?: HomeListingInitialData | null;
+  /** Kind and tab requested by the URL; defaults to the loader listing's view. */
+  requestedView?: HomeListingView;
+  /** Called after the visible kind or tab changes so the route can mirror it in the URL. */
+  onViewChange?: (view: HomeListingView) => void;
 };
 
 function createInitialListingCache(initialListing: HomeListingInitialData | null) {
@@ -289,44 +215,67 @@ function createInitialListingCache(initialListing: HomeListingInitialData | null
   return cache;
 }
 
-export function HomeListingSection({ initialListing = null }: HomeListingSectionProps = {}) {
+export function HomeListingSection({
+  initialListing = null,
+  requestedView,
+  onViewChange,
+}: HomeListingSectionProps = {}) {
   const searchInputRef = useRef<HTMLInputElement>(null);
   const searchRequestRef = useRef(0);
+  const manualSearchRef = useRef<ManualCatalogSearch | null>(null);
   const listingCacheRef = useRef<Map<string, HomeListingCacheEntry> | null>(null);
   listingCacheRef.current ??= createInitialListingCache(initialListing);
   const listingCache = listingCacheRef.current;
 
-  const [kind, setKind] = useState<ListingKind>(initialListing?.kind ?? "skills");
-  const initialTab =
-    initialListing?.kind === "skills" && initialListing.trendingState === "unavailable"
-      ? "featured"
-      : (initialListing?.tab ?? "trending");
-  const [tab, setTab] = useState<ListingTab>(initialTab);
+  const startView =
+    requestedView ??
+    (initialListing
+      ? { kind: initialListing.kind, tab: initialListing.tab }
+      : DEFAULT_HOME_LISTING_VIEW);
+  // A cached loader listing can belong to another view after client navigation;
+  // only show it when it answers the requested view.
+  const matchingListing =
+    initialListing?.kind === startView.kind && initialListing.tab === startView.tab
+      ? initialListing
+      : null;
+  const initialTrendingUnavailable =
+    matchingListing?.kind === "skills" && matchingListing.trendingState === "unavailable";
+  const shownListing = initialTrendingUnavailable ? null : matchingListing;
+  // Last view both sides agree on; distinguishes our own URL updates from outside navigation.
+  const syncedViewRef = useRef<HomeListingView>(startView);
+
+  const [kind, setKind] = useState<ListingKind>(startView.kind);
+  const [tab, setTab] = useState<ListingTab>(
+    initialTrendingUnavailable ? "featured" : startView.tab,
+  );
   const [categorySlug, setCategorySlug] = useState<string | undefined>();
   const [searchQuery, setSearchQuery] = useState("");
   const [visibleCount, setVisibleCount] = useState(LISTING_PAGE_SIZE);
   const [fetchLimit, setFetchLimit] = useState(LISTING_PAGE_SIZE);
   const [skills, setSkills] = useState<SkillPageEntry[]>(
-    initialListing?.kind === "skills" ? initialListing.items : [],
+    shownListing?.kind === "skills" ? shownListing.items : [],
   );
   const [plugins, setPlugins] = useState<PackageListItem[]>(
-    initialListing?.kind === "plugins" ? initialListing.items : [],
+    shownListing?.kind === "plugins" ? shownListing.items : [],
   );
   const [status, setStatus] = useState<"loading" | "idle" | "error">(
-    initialListing ? "idle" : "loading",
+    shownListing ? "idle" : "loading",
   );
   const [loadingMore, setLoadingMore] = useState(false);
   const [searchSkills, setSearchSkills] = useState<SkillPageEntry[]>([]);
   const [searchPlugins, setSearchPlugins] = useState<PackageListItem[]>([]);
   const [searchStatus, setSearchStatus] = useState<"loading" | "idle" | "error">("idle");
-  const [listingHasMore, setListingHasMore] = useState(initialListing?.hasMore ?? false);
+  const [listingHasMore, setListingHasMore] = useState(shownListing?.hasMore ?? false);
   const [trendingState, setTrendingState] = useState<TrendingFeedState | undefined>(
-    initialListing?.kind === "skills" ? initialListing.trendingState : undefined,
+    shownListing?.kind === "skills" ? shownListing.trendingState : undefined,
   );
   const [canonicalTrendingUnavailable, setCanonicalTrendingUnavailable] = useState(
-    initialListing?.kind === "skills" && initialListing.trendingState === "unavailable",
+    initialTrendingUnavailable,
   );
-  const clearSearch = useCallback(() => setSearchQuery(""), []);
+  const clearSearch = useCallback(() => {
+    manualSearchRef.current = null;
+    setSearchQuery("");
+  }, []);
   const searchDisclosure = useBrowseSearchDisclosure({
     value: searchQuery,
     onClear: clearSearch,
@@ -343,10 +292,10 @@ export function HomeListingSection({ initialListing = null }: HomeListingSection
 
   const visibleTabs =
     kind === "skills"
-      ? SKILL_LISTING_TABS.filter(
-          (candidate) => candidate.id !== "trending" || !canonicalTrendingUnavailable,
+      ? CATALOG_TABS.filter(
+          (candidate) => candidate.value !== "trending" || !canonicalTrendingUnavailable,
         )
-      : PLUGIN_LISTING_TABS;
+      : CATALOG_TABS;
 
   const activeItems = isSearchMode
     ? kind === "skills"
@@ -420,12 +369,7 @@ export function HomeListingSection({ initialListing = null }: HomeListingSection
             setListingHasMore(result.hasMore);
             setStatus("idle");
           })
-        : fetchPluginListing(
-            tab === "trending" ? "new" : tab,
-            categorySlugs,
-            fetchLimit,
-            controller.signal,
-          ).then((result) => {
+        : fetchPluginListing(tab, categorySlugs, fetchLimit, controller.signal).then((result) => {
             if (controller.signal.aborted) return;
             listingCache.set(cacheKey, {
               kind: "plugins",
@@ -480,6 +424,16 @@ export function HomeListingSection({ initialListing = null }: HomeListingSection
     }
 
     const handle = window.setTimeout(() => {
+      const searchSource =
+        tab !== "trending" &&
+        consumeManualCatalogSearch(
+          manualSearchRef.current,
+          kind === "skills" ? "skill" : "plugin",
+          trimmedSearch,
+        )
+          ? ("clawhub-web" as const)
+          : undefined;
+      manualSearchRef.current = null;
       const load =
         kind === "skills" && tab === "trending"
           ? searchHomeTrendingSkillListing(trimmedSearch, fetchLimit, controller.signal).then(
@@ -497,37 +451,55 @@ export function HomeListingSection({ initialListing = null }: HomeListingSection
                 setSearchStatus("idle");
               },
             )
-          : kind === "skills"
-            ? convexHttp
-                .action(api.search.searchNativeSkills, {
-                  query: trimmedSearch,
-                  limit: fetchLimit,
-                  ...(tab === "featured" ? { highlightedOnly: true } : {}),
-                  ...(tab === "official" ? { officialOnly: true } : {}),
-                  ...(tab === "new" ? { createdAfter: Date.now() - HOME_NEW_WINDOW_MS } : {}),
-                  ...(categorySlug ? { categorySlug } : {}),
-                })
-                .then((hits) => {
-                  if (controller.signal.aborted || requestId !== searchRequestRef.current) return;
-                  const searchHits = hits as HomeNativeSkillListingEntry[];
-                  setSearchSkills(searchHits);
-                  setListingHasMore(searchHits.length >= fetchLimit);
-                  setSearchStatus("idle");
-                })
-            : fetchPluginCatalog({
-                q: trimmedSearch,
-                category: categorySlug,
-                featured: tab === "featured" ? true : undefined,
-                isOfficial: tab === "official" ? true : undefined,
-                createdAfter: tab === "new" ? Date.now() - HOME_NEW_WINDOW_MS : undefined,
-                limit: fetchLimit,
-                signal: controller.signal,
-              }).then((result) => {
+          : kind === "skills" && tab === "featured"
+            ? fetchHomeFeaturedSkillListing(
+                categorySlug ? [categorySlug] : [],
+                fetchLimit,
+                trimmedSearch,
+              ).then((result) => {
                 if (controller.signal.aborted || requestId !== searchRequestRef.current) return;
-                setSearchPlugins(result.items);
-                setListingHasMore(result.nextCursor !== null || result.items.length >= fetchLimit);
+                setSearchSkills(result.page);
+                setListingHasMore(result.hasMore);
                 setSearchStatus("idle");
-              });
+              })
+            : kind === "skills"
+              ? convexHttp
+                  .action(api.search.searchNativeSkills, {
+                    query: trimmedSearch,
+                    ...(searchSource ? { searchSource } : {}),
+                    limit: fetchLimit,
+                    ...(tab === "official" ? { officialOnly: true } : {}),
+                    ...(tab === "new" ? { createdAfter: Date.now() - HOME_NEW_WINDOW_MS } : {}),
+                    ...(categorySlug ? { categorySlug } : {}),
+                  })
+                  .then((hits) => {
+                    if (controller.signal.aborted || requestId !== searchRequestRef.current) return;
+                    const searchHits = hits as HomeNativeSkillListingEntry[];
+                    setSearchSkills(searchHits);
+                    setListingHasMore(searchHits.length >= fetchLimit);
+                    setSearchStatus("idle");
+                  })
+              : (tab === "trending"
+                  ? fetchHomeTrendingPluginListing(fetchLimit, controller.signal, trimmedSearch)
+                  : fetchPluginCatalog({
+                      q: trimmedSearch,
+                      ...(searchSource ? { searchSource } : {}),
+                      category: categorySlug,
+                      featured: tab === "featured" ? true : undefined,
+                      isOfficial: tab === "official" ? true : undefined,
+                      createdAfter: tab === "new" ? Date.now() - HOME_NEW_WINDOW_MS : undefined,
+                      limit: fetchLimit,
+                      signal: controller.signal,
+                    }).then((result) => ({
+                      items: result.items,
+                      hasMore: result.nextCursor !== null || result.items.length >= fetchLimit,
+                    }))
+                ).then((result) => {
+                  if (controller.signal.aborted || requestId !== searchRequestRef.current) return;
+                  setSearchPlugins(result.items);
+                  setListingHasMore(result.hasMore);
+                  setSearchStatus("idle");
+                });
 
       load
         .catch(() => {
@@ -554,30 +526,48 @@ export function HomeListingSection({ initialListing = null }: HomeListingSection
     setFetchLimit(LISTING_PAGE_SIZE);
   }, [categorySlug, isSearchMode, kind, tab, trimmedSearch]);
 
+  // Follow URL changes made outside this section, such as the header logo link.
+  const requestedKind = requestedView?.kind;
+  const requestedTab = requestedView?.tab;
+  useEffect(() => {
+    if (!requestedKind || !requestedTab) return;
+    const synced = syncedViewRef.current;
+    if (synced.kind === requestedKind && synced.tab === requestedTab) return;
+    syncedViewRef.current = { kind: requestedKind, tab: requestedTab };
+    // Outside navigation starts a fresh view, like choosing the kind and tab here.
+    manualSearchRef.current = null;
+    setCategorySlug(undefined);
+    setKind(requestedKind);
+    setTab(requestedTab);
+  }, [requestedKind, requestedTab]);
+
+  // Report every visible view change, including the Trending-unavailable fallback.
+  useEffect(() => {
+    const synced = syncedViewRef.current;
+    if (synced.kind === kind && synced.tab === tab) return;
+    syncedViewRef.current = { kind, tab };
+    onViewChange?.({ kind, tab });
+  }, [kind, onViewChange, tab]);
+
   const visibleSkills = (isSearchMode ? searchSkills : skills).slice(0, visibleCount);
   const visiblePlugins = (isSearchMode ? searchPlugins : plugins).slice(0, visibleCount);
 
   const handleSeeMore = () => {
+    manualSearchRef.current = null;
     setVisibleCount((count) => count + LISTING_PAGE_SIZE);
     setFetchLimit((limit) => limit + LISTING_PAGE_SIZE);
   };
 
   const handleKindChange = (nextKind: ListingKind) => {
     if (nextKind === kind) return;
+    manualSearchRef.current = null;
     setKind(nextKind);
     setCategorySlug(undefined);
-    setTab(
-      nextKind === "skills"
-        ? canonicalTrendingUnavailable
-          ? "featured"
-          : "trending"
-        : tab === "trending"
-          ? "featured"
-          : tab,
-    );
+    setTab("featured");
   };
 
   const handleTabChange = (nextTab: ListingTab) => {
+    manualSearchRef.current = null;
     if (nextTab === "trending") setCategorySlug(undefined);
     setTab(nextTab);
   };
@@ -599,22 +589,22 @@ export function HomeListingSection({ initialListing = null }: HomeListingSection
               <button
                 type="button"
                 className={`home-v2-listing-kind-btn clawhub-segmented-btn oc-segmented-item${
-                  kind === "skills" ? " is-active" : ""
-                }`}
-                aria-pressed={kind === "skills"}
-                onClick={() => handleKindChange("skills")}
-              >
-                Skills
-              </button>
-              <button
-                type="button"
-                className={`home-v2-listing-kind-btn clawhub-segmented-btn oc-segmented-item${
                   kind === "plugins" ? " is-active" : ""
                 }`}
                 aria-pressed={kind === "plugins"}
                 onClick={() => handleKindChange("plugins")}
               >
                 Plugins
+              </button>
+              <button
+                type="button"
+                className={`home-v2-listing-kind-btn clawhub-segmented-btn oc-segmented-item${
+                  kind === "skills" ? " is-active" : ""
+                }`}
+                aria-pressed={kind === "skills"}
+                onClick={() => handleKindChange("skills")}
+              >
+                Skills
               </button>
             </div>
 
@@ -624,12 +614,12 @@ export function HomeListingSection({ initialListing = null }: HomeListingSection
               <div className="home-v2-listing-sort-tabs" role="tablist" aria-label="Catalog view">
                 {visibleTabs.map((item) => (
                   <button
-                    key={item.id}
+                    key={item.value}
                     type="button"
                     role="tab"
-                    aria-selected={tab === item.id}
-                    className={`home-v2-listing-tab${tab === item.id ? " is-active" : ""}`}
-                    onClick={() => handleTabChange(item.id)}
+                    aria-selected={tab === item.value}
+                    className={`home-v2-listing-tab${tab === item.value ? " is-active" : ""}`}
+                    onClick={() => handleTabChange(item.value)}
                   >
                     {item.label}
                   </button>
@@ -644,11 +634,14 @@ export function HomeListingSection({ initialListing = null }: HomeListingSection
               onOpen={searchDisclosure.openSearch}
               label="Search catalog"
             />
-            {kind === "skills" && tab === "trending" ? null : (
+            {tab === "trending" ? null : (
               <BrowseCategorySelect
                 categories={listingCategories}
                 value={categorySlug}
-                onChange={setCategorySlug}
+                onChange={(category) => {
+                  manualSearchRef.current = null;
+                  setCategorySlug(category);
+                }}
               />
             )}
           </div>
@@ -659,7 +652,19 @@ export function HomeListingSection({ initialListing = null }: HomeListingSection
             label={kind === "skills" ? "Search skills" : "Search plugins"}
             placeholder={kind === "skills" ? "Search skills..." : "Search plugins..."}
             value={searchQuery}
-            onChange={setSearchQuery}
+            onChange={(next) => {
+              if (next.trim() !== trimmedSearch) {
+                manualSearchRef.current =
+                  tab === "trending"
+                    ? null
+                    : {
+                        query: next.trim(),
+                        consumed: {},
+                        kinds: [kind === "skills" ? "skill" : "plugin"],
+                      };
+              }
+              setSearchQuery(next);
+            }}
             onClear={searchDisclosure.closeSearch}
             closeLabel="Close search"
           />
@@ -667,38 +672,41 @@ export function HomeListingSection({ initialListing = null }: HomeListingSection
       </div>
 
       {activeStatus === "idle" && activeItems.length > 0 ? (
-        <div
-          className={`home-v2-listing-head${
-            kind === "plugins" ? " home-v2-listing-head-with-icon" : ""
-          }`}
-          aria-hidden="true"
-        >
-          {kind === "plugins" ? <span className="home-v2-listing-head-icon-spacer" /> : null}
-          <span className="home-v2-listing-head-label">
-            {kind === "skills" ? "Skill" : "Plugin"}
-          </span>
-          <span className="home-v2-listing-head-stat">Downloads</span>
-        </div>
+        kind === "skills" ? (
+          <SkillListingHead />
+        ) : (
+          <div
+            className={`home-v2-listing-head${
+              kind === "plugins" ? " home-v2-listing-head-with-icon" : ""
+            }`}
+            aria-hidden="true"
+          >
+            {kind === "plugins" ? <span className="home-v2-listing-head-icon-spacer" /> : null}
+            <span className="home-v2-listing-head-label">Plugin</span>
+            <span className="home-v2-listing-head-stat">Downloads</span>
+          </div>
+        )
       ) : null}
 
       {activeStatus === "loading" ? (
-        <BrowseResultsSkeleton
-          label={kind === "skills" ? "Skill" : "Plugin"}
-          showIcon={kind === "plugins"}
-          variant="list"
-        />
+        kind === "skills" ? (
+          <SkillListingSkeleton />
+        ) : (
+          <BrowseResultsSkeleton label="Plugin" showIcon={kind === "plugins"} variant="list" />
+        )
       ) : null}
 
       {activeStatus === "error" ? <HomeListingEmptyPanel variant="error" /> : null}
 
       {isEmpty ? (
         <HomeListingEmptyPanel
+          kind={kind}
           variant={
             isSearchMode
               ? "search"
               : categorySlug
                 ? "filter"
-                : kind === "skills" && tab === "trending"
+                : tab === "trending"
                   ? trendingState === "unavailable"
                     ? "trendingUnavailable"
                     : "trendingEmpty"
@@ -723,8 +731,14 @@ export function HomeListingSection({ initialListing = null }: HomeListingSection
         >
           <div className="home-v2-listing-list">
             {visibleSkills.map((entry) => (
-              <HomeListingSkillRow
-                key={isHomeTrendingSkillEntry(entry) ? entry.trending.id : String(entry.skill._id)}
+              <SkillListingRow
+                key={
+                  isHomeTrendingSkillEntry(entry)
+                    ? entry.trending.id
+                    : "external" in entry
+                      ? entry.external.id
+                      : String(entry.skill._id)
+                }
                 entry={entry}
               />
             ))}

@@ -3,6 +3,7 @@ import { ClawManifestSummarySchema } from "./claws.js";
 import { DocsLinks } from "./docsLinks.js";
 import { CliPublishFileSchema, PublishSourceSchema } from "./schemas.js";
 export const PACKAGE_TRENDING_LEADERBOARD_LIMIT = 200;
+export const PACKAGE_CATEGORY_BATCH_LIMIT = 200;
 export function normalizePackageOwnerHandle(handle) {
     const normalized = handle?.trim().replace(/^@+/, "").toLowerCase();
     return normalized || undefined;
@@ -36,6 +37,10 @@ export const PackageCompatibilitySchema = type({
 });
 export const PluginManifestSummarySchema = type({
     schemaVersion: "number",
+    contracts: type({ "[string]": "string[]" }).optional(),
+    providers: "string[]?",
+    channels: "string[]?",
+    categories: "string[]?",
     icon: "string?",
     compatibility: PackageCompatibilitySchema.optional(),
     manifestIdentity: type({
@@ -52,6 +57,12 @@ export const PluginManifestSummarySchema = type({
     }).array(),
     mcpServers: type({
         name: "string",
+        url: "string?",
+        "transport?": '"streamable-http"|"sse"|"stdio"',
+        "auth?": '"oauth"|"api-key"|"none"',
+        scope: "string?",
+        setup: "string?",
+        endpointRedacted: "boolean?",
     }).array(),
     bundledSkills: type({
         name: "string",
@@ -60,6 +71,24 @@ export const PluginManifestSummarySchema = type({
         skillMdPath: "string",
         sha256: "string",
         size: "number",
+    }).array(),
+});
+const PackageVersionIdentitySchema = type({
+    "+": "reject",
+    name: "string",
+    version: "string",
+});
+export const ApiV1PackageCategoriesBatchRequestSchema = type({
+    "+": "reject",
+    packages: PackageVersionIdentitySchema.array(),
+});
+export const ApiV1PackageCategoriesBatchResponseSchema = type({
+    "+": "reject",
+    packages: type({
+        "+": "reject",
+        name: "string",
+        version: "string",
+        categories: "string[]|null",
     }).array(),
 });
 export const PackageVerificationSummarySchema = type({
@@ -151,6 +180,41 @@ export const PackageSkillSpectorAnalysisSchema = type({
     recommendation: "string?",
     issueCount: "number",
     issues: PackageSkillSpectorIssueSchema.array(),
+    scannerVersion: "string?",
+    summary: "string?",
+    error: "string?",
+    checkedAt: "number",
+});
+export const PackageEndorAnalysisSchema = type({
+    status: '"completed"',
+    checkedAt: "number",
+    reachableFunctionCount: "number.integer >= 0",
+    findings: type({
+        severity: type("string").atMostLength(64),
+        summary: type("string").atMostLength(2000),
+    })
+        .array()
+        .atMostLength(50),
+}).or({
+    status: '"skipped"|"failed"',
+    checkedAt: "number",
+    reason: type("string").atMostLength(2000),
+});
+export const PackageAigFindingSchema = type({
+    ruleId: "string",
+    level: "string",
+    message: "string",
+    title: "string?",
+    description: "string?",
+    file: "string?",
+    startLine: "number?",
+    endLine: "number?",
+    remediation: "string?",
+});
+export const PackageAigAnalysisSchema = type({
+    status: "string",
+    issueCount: "number",
+    findings: PackageAigFindingSchema.array(),
     scannerVersion: "string?",
     summary: "string?",
     error: "string?",
@@ -283,7 +347,7 @@ export const ServerPackagePublishRequestSchema = type({
     artifact: PackagePublishArtifactSchema.optional(),
     files: CliPublishFileSchema.array(),
 });
-export const PackageListItemSchema = type({
+const PackageListItemFields = {
     name: "string",
     displayName: "string",
     family: PackageFamilySchema,
@@ -293,18 +357,50 @@ export const PackageListItemSchema = type({
     summary: "string|null?",
     icon: "string|null?",
     ownerHandle: "string|null?",
+    ownerImage: "string|null?",
+    ownerOfficial: "boolean?",
     createdAt: "number",
     updatedAt: "number",
     latestVersion: "string|null?",
     categories: "string[]?",
     topics: "string[]?",
     featuredAt: "number?",
+    trending24h: type({
+        downloads: "number",
+        installs: "number",
+        windowStart: "number",
+        windowEnd: "number",
+    }).optional(),
     verificationTier: PackageVerificationTierSchema.or("null").optional(),
     stats: PackageStatsSchema.optional(),
+};
+export const PackageListItemSchema = type(PackageListItemFields);
+export const PluginOverviewItemSchema = type({
+    "+": "reject",
+    ...PackageListItemFields,
+    featured: "boolean?",
+    featuredRank: "number?",
+    trending: "boolean?",
+    trendingRank: "number?",
+});
+export const PluginDiscoveryCategorySchema = type({
+    "+": "reject",
+    slug: "string",
+    label: "string",
+    description: "string",
+    icon: "string",
+    order: "number",
+    pinnedPackages: "string[]?",
+});
+export const ApiV1PluginOverviewResponseSchema = type({
+    "+": "reject",
+    categories: PluginDiscoveryCategorySchema.array(),
+    items: PluginOverviewItemSchema.array(),
 });
 export const ApiV1PackageListResponseSchema = type({
     items: PackageListItemSchema.array(),
     nextCursor: "string|null",
+    categories: PluginDiscoveryCategorySchema.array().optional(),
 });
 export const PackageValidationReportScanStatusSchema = type('"not-scanned"|"skipped"|"clean"|"warning"|"error"');
 export const PackageValidationReportFindingSeveritySchema = type('"info"|"warning"|"error"');
@@ -376,6 +472,8 @@ export const ApiV1PackageResponseSchema = type({
         handle: "string|null",
         displayName: "string|null?",
         image: "string|null?",
+        // Response readers also accept registries predating the publisher badge field.
+        official: "boolean?",
     }).or("null"),
 });
 export const ApiV1PackageVersionListResponseSchema = type({
@@ -408,10 +506,33 @@ export const ApiV1PackageVersionResponseSchema = type({
         sha256hash: "string|null?",
         vtAnalysis: PackageVtAnalysisSchema.or("null").optional(),
         skillSpectorAnalysis: PackageSkillSpectorAnalysisSchema.or("null").optional(),
+        endorAnalysis: PackageEndorAnalysisSchema.or("null").optional(),
+        aigAnalysis: PackageAigAnalysisSchema.or("null").optional(),
         llmAnalysis: PackageLlmAnalysisSchema.or("null").optional(),
         staticScan: PackageStaticScanSchema.or("null").optional(),
     }).or("null"),
 });
+export const ApiV1PackageVersionPublicationResponseSchema = type({
+    name: "string",
+    version: "string",
+    state: '"published"|"absent"',
+})
+    .or({ name: "string", version: "string", state: '"pending"', stage: '"staging"' })
+    .or({
+    name: "string",
+    version: "string",
+    state: '"pending"',
+    stage: '"checks"|"finalization"',
+    attemptId: "string",
+})
+    .or({
+    name: "string",
+    version: "string",
+    state: '"failed"',
+    "attemptId?": "string",
+    recoverable: "boolean",
+})
+    .onUndeclaredKey("reject");
 export const ApiV1PackageArtifactResponseSchema = type({
     package: type({
         name: "string",
@@ -441,6 +562,8 @@ export const ApiV1PackageArtifactResponseSchema = type({
 });
 export const ApiV1PackageSecurityResponseSchema = type({
     overview: "string",
+    // Older registries omit this field; consumers must not infer a display verdict from trust.
+    verdict: "string?",
     securityAuditUrl: "string",
     package: type({
         name: "string",
@@ -456,6 +579,7 @@ export const ApiV1PackageSecurityResponseSchema = type({
         npmShasum: "string?",
         npmTarballName: "string?",
         createdAt: "number",
+        endorAnalysis: PackageEndorAnalysisSchema.or("null").optional(),
     }),
     trust: type({
         scanStatus: '"clean"|"suspicious"|"malicious"|"pending"|"not-run"',
@@ -465,6 +589,12 @@ export const ApiV1PackageSecurityResponseSchema = type({
         pending: "boolean",
         stale: "boolean",
     }),
+});
+export const ApiV1PluginDetailResponseSchema = ApiV1PackageResponseSchema.and({
+    versions: ApiV1PackageVersionListResponseSchema,
+    version: ApiV1PackageVersionResponseSchema.get("version"),
+    readme: "string|null",
+    security: ApiV1PackageSecurityResponseSchema.or("null"),
 });
 export const PackageReleaseModerationRequestSchema = type({
     state: PackageReleaseModerationStateSchema,
@@ -792,6 +922,21 @@ export const ApiV1PackagePublishResponseSchema = type({
 });
 export const PackagePublishAttemptStatusSchema = type('"pending_checks"|"ready_to_finalize"|"finalizing"|"finalized"|"blocked"|"failed"|"expired"');
 export const PackagePublicationStatusSchema = type('"pending"|"published"|"blocked"|"failed"|"expired"');
+export const ApiV1PackagePublishRecoveryRequestSchema = type({
+    manualOverrideReason: "string",
+});
+export const ApiV1PackagePublishRecoveryResponseSchema = type({
+    ok: "true",
+    attemptId: "string",
+    recoveredFromAttemptId: "string",
+    packageId: "string",
+    releaseId: "string",
+    name: "string",
+    version: "string",
+    status: PackagePublishAttemptStatusSchema,
+    publicationStatus: PackagePublicationStatusSchema,
+    reused: "boolean",
+});
 export const PackagePublishAttemptCheckSchema = type({
     status: '"pending"|"clean"|"blocked"|"failed"',
     summary: "string?",

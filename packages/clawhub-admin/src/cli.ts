@@ -1,5 +1,5 @@
 #!/usr/bin/env node
-import { stat } from "node:fs/promises";
+import { readFile, stat } from "node:fs/promises";
 import { join, resolve } from "node:path";
 import { Command } from "commander";
 import { resolveClawdbotDefaultWorkspace } from "../../clawhub/src/cli/clawdbotConfig.js";
@@ -28,6 +28,12 @@ import {
 } from "./commands/contentRights.js";
 import { cmdSendStaffEmail } from "./commands/email.js";
 import { cmdSetPackageFeatured, cmdSetSkillFeatured } from "./commands/featured.js";
+import { cmdFeaturedSelection } from "./commands/featuredSelections.js";
+import {
+  cmdGetManagedMcp,
+  cmdPublishManagedMcp,
+  cmdUnpublishManagedMcp,
+} from "./commands/managedMcp.js";
 import {
   cmdBanUser,
   cmdLiftModerationHold,
@@ -36,6 +42,7 @@ import {
   cmdRepairVtPendingSkills,
   cmdRevokeSkillVersion,
   cmdRescanAllSkills,
+  cmdRescanAllPackages,
   cmdRescanSkill,
   cmdSetRole,
   cmdUnbanUser,
@@ -72,7 +79,9 @@ import {
   cmdSetPromotionStatus,
   cmdUpdatePromotion,
 } from "./commands/promotions.js";
+import { cmdSearchInsights } from "./commands/searchInsights.js";
 import { cmdHardDeleteSkill } from "./commands/skills.js";
+import { planScanWorkers } from "./scanAssignments.js";
 
 const program = new Command()
   .name("clawhub-admin")
@@ -84,7 +93,7 @@ const program = new Command()
   .version(getAdminCliVersion(), "-V, --cli-version", "Show CLI version")
   .option("--workdir <dir>", "Working directory (default: cwd)")
   .option("--dir <dir>", "Skills directory (relative to workdir, default: skills)")
-  .option("--site <url>", "Site base URL (for browser login)")
+  .option("--site <url>", "Site base URL for registry discovery and device verification")
   .option("--registry <url>", "Registry API base URL")
   .option("--no-input", "Disable prompts")
   .showHelpAfterError()
@@ -161,10 +170,10 @@ async function pathExists(path: string) {
 
 program
   .command("login")
-  .description("Log in (opens browser or stores token)")
+  .description("Log in with device flow or store a token")
   .option("--token <token>", "API token")
-  .option("--label <label>", "Token label (browser flow only)", "Admin CLI token")
-  .option("--no-browser", "Do not open browser (requires --token)")
+  .option("--label <label>", "Token label (device flow only)", "Admin CLI token")
+  .option("--no-browser", "Device flow prints a verification URL without opening a browser")
   .action(async (options) => {
     const opts = await resolveGlobalOpts();
     await cmdLoginFlow(opts, options, isInputAllowed());
@@ -194,10 +203,10 @@ const auth = program
 
 auth
   .command("login")
-  .description("Log in (opens browser or stores token)")
+  .description("Log in with device flow or store a token")
   .option("--token <token>", "API token")
-  .option("--label <label>", "Token label (browser flow only)", "Admin CLI token")
-  .option("--no-browser", "Do not open browser (requires --token)")
+  .option("--label <label>", "Token label (device flow only)", "Admin CLI token")
+  .option("--no-browser", "Device flow prints a verification URL without opening a browser")
   .action(async (options) => {
     const opts = await resolveGlobalOpts();
     await cmdLoginFlow(opts, options, isInputAllowed());
@@ -312,6 +321,27 @@ users
     await cmdRecoverPersonalPublisher(opts, handle, options, isInputAllowed());
   });
 
+const managedMcp = program
+  .command("managed-mcp")
+  .description("Author and publish OpenClaw-managed remote MCP plugins");
+managedMcp
+  .command("publish <file>")
+  .description("Publish one definition or a JSON array through normal security gates")
+  .option("--icon <png>", "Use a local PNG for one definition; preserve its icon rights metadata")
+  .option(
+    "--dry-run",
+    "Validate definition fields only; skip artifact, endpoint, and security checks",
+  )
+  .action(async (file, options) => cmdPublishManagedMcp(await resolveGlobalOpts(), file, options));
+managedMcp
+  .command("get <id>")
+  .description("Read the most recent submitted definition for editing")
+  .action(async (id) => cmdGetManagedMcp(await resolveGlobalOpts(), id));
+managedMcp
+  .command("unpublish <id>")
+  .description("Stop new availability; preserve installed copies")
+  .action(async (id) => cmdUnpublishManagedMcp(await resolveGlobalOpts(), id));
+
 const plugins = program
   .command("plugins")
   .alias("plugin")
@@ -358,12 +388,53 @@ const skills = program
   .showHelpAfterError()
   .showSuggestionAfterError();
 
+skills
+  .command("plan-scan-workers <job-ids-file>")
+  .description("Prepare local workflow inputs for disjoint, already-admitted bulk skill jobs")
+  .requiredOption("--batch-limit <number>", "Scans in parallel per shared worker")
+  .option(
+    "--shared-workers <number>",
+    "Shared worker machines (9 or 18); drain old workers before changing",
+    "9",
+  )
+  .action(async (file: string, options: { batchLimit: string; sharedWorkers: string }) => {
+    const ids: unknown = JSON.parse(await readFile(resolve(file), "utf8"));
+    console.log(
+      JSON.stringify(
+        planScanWorkers(ids, Number(options.batchLimit), Number(options.sharedWorkers)),
+        null,
+        2,
+      ),
+    );
+  });
+
 const promotions = program
   .command("promotions")
   .alias("promotion")
   .description("Platform promotion records (admin only)")
   .showHelpAfterError()
   .showSuggestionAfterError();
+
+const featuredSelections = program
+  .command("featured")
+  .description("Review editorial reservations and publish approved complete catalog selections");
+featuredSelections
+  .command("get <catalog>")
+  .description("Read current plugin or skill editorial reservations and publication (JSON)")
+  .action(async (catalog) => cmdFeaturedSelection(await resolveGlobalOpts(), catalog, "get"));
+featuredSelections
+  .command("editorial <file>")
+  .description("Save plugin editorial reservations from revision-checked JSON; does not publish")
+  .action(async (file) =>
+    cmdFeaturedSelection(await resolveGlobalOpts(), "plugin", "editorial", file),
+  );
+featuredSelections
+  .command("publish <catalog> <file>")
+  .description("Validate a reviewed complete selection; publish only with --apply")
+  .option("--apply", "Apply this approved selection atomically (default is dry run)")
+  .action(async (catalog, file, options) =>
+    cmdFeaturedSelection(await resolveGlobalOpts(), catalog, "publish", file, !options.apply),
+  );
 
 registerPluginOperations(plugins);
 registerPluginModerationCommands(plugins);
@@ -785,6 +856,28 @@ function registerPluginModerationCommands(command: Command) {
 
 function registerPluginOperations(command: Command) {
   command
+    .command("rescan-all")
+    .description("Queue admin ClawScan rescans for active latest plugins in paced batches")
+    .option("--batch-size <n>", "Batch size; backend caps at 10", (value) =>
+      Number.parseInt(value, 10),
+    )
+    .option("--poll-interval <sec>", "Seconds between batch status polls", (value) =>
+      Number.parseInt(value, 10),
+    )
+    .option("--cursor <cursor>", "Resume from a backend pagination cursor")
+    .option("--max-packages <n>", "Stop after this many scanned/queued/skipped packages", (value) =>
+      Number.parseInt(value, 10),
+    )
+    .option("--dry-run", "Page eligible plugins without queueing jobs")
+    .option("--yes", "Skip confirmation")
+    .option("--json", "Output JSON progress events")
+    .option("--fail-fast", "Stop after the first drained batch with failed jobs")
+    .action(async (options) => {
+      const opts = await resolveGlobalOpts();
+      await cmdRescanAllPackages(opts, options, isInputAllowed());
+    });
+
+  command
     .command("validation-report")
     .description("Export current plugin validation results as JSON")
     .requiredOption("--json", "Output one JSON report document")
@@ -972,7 +1065,10 @@ function registerSkillModerationCommands(command: Command) {
 
 function registerFeaturedCommands(command: Command, kind: "plugin" | "skill") {
   const label = kind === "plugin" ? "plugin" : "skill";
-  const argument = kind === "plugin" ? "Plugin package name" : "Skill ref, optionally @owner/slug";
+  const argument =
+    kind === "plugin"
+      ? "Plugin package name"
+      : "Skill ref: @owner/slug or skills-sh:owner/repo/slug";
 
   for (const [name, featured] of [
     ["feature", true],
@@ -993,6 +1089,25 @@ function registerFeaturedCommands(command: Command, kind: "plugin" | "skill") {
       });
   }
 }
+
+program
+  .command("search-insights")
+  .description("Read staff-only plugin and skill search demand and advisory opportunities")
+  .option("--view <view>", "demand|recommendations (default: demand)")
+  .option("--artifact-kind <kind>", "plugin|skill (default: plugin)")
+  .option("--scope <scope>", "catalog|shelf|legacy (default: all scopes)")
+  .option("--source <source>", "clawhub-web|openclaw-control-ui (default: both)")
+  .option("--window <days>", "Rank by 7 or 30 completed UTC days")
+  .option("--official-gap", "Only queries with zero-official-result searches")
+  .option("--intent-kind <kind>", "company_product|generic_capability|ambiguous")
+  .option("--end-day <date>", "Exclusive UTC window end, YYYY-MM-DD")
+  .option("--limit <count>", "Maximum query rows, 1–100")
+  .option("--report-id <id>", "Resume a saved report using its original filters")
+  .option("--refresh <id>", "Create a fresh report using a saved report’s original filters")
+  .option("--json", "Output only the completed aggregate JSON; progress goes to stderr")
+  .action(async (options) => {
+    await cmdSearchInsights(await resolveGlobalOpts(), options);
+  });
 
 program.action(() => {
   program.outputHelp();

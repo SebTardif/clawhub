@@ -12,6 +12,7 @@ import {
   signArchivePayload,
   type SkillArchiveManifest,
 } from "../convex/lib/archiveManifest";
+import { STAGING_EDGE_SECRET_HEADER } from "../convex/lib/clawhubVercelOidc";
 import {
   buildConvexProxyTarget,
   isConvexProxyMethodAllowed,
@@ -29,6 +30,7 @@ const TEST_ARCHIVE_DEPENDENCIES = {
     audience: ARCHIVE_MANIFEST_AUDIENCE,
   }),
 };
+const STAGING_EDGE_SECRET = "s".repeat(48);
 
 describe("Convex HTTP proxy", () => {
   afterEach(() => {
@@ -70,6 +72,17 @@ describe("Convex HTTP proxy", () => {
     expect(isConvexProxyMethodAllowed("DELETE", testEnv)).toBe(true);
   });
 
+  it("allows writes in the permanent custom staging environment", () => {
+    const stagingEnv = {
+      VERCEL_ENV: "preview",
+      VERCEL_TARGET_ENV: "preview",
+      VITE_CLAWHUB_DEPLOY_ENV: "staging",
+    };
+
+    expect(isConvexProxyMethodAllowed("POST", stagingEnv)).toBe(true);
+    expect(isConvexProxyMethodAllowed("DELETE", stagingEnv)).toBe(true);
+  });
+
   it("prefers the build-paired Convex URL over stale Vercel runtime values", () => {
     expect(
       resolveConvexProxyEnv(
@@ -89,6 +102,30 @@ describe("Convex HTTP proxy", () => {
       VITE_CLAWHUB_DEPLOY_ENV: "preview",
       VITE_CONVEX_SITE_URL: "https://paired-preview-123.convex.site",
       VITE_CONVEX_URL: "https://paired-preview-123.convex.cloud",
+    });
+  });
+
+  it("prefers the bundled staging marker and SHA over stale runtime values", () => {
+    expect(
+      resolveConvexProxyEnv(
+        {
+          VERCEL_ENV: "preview",
+          VERCEL_TARGET_ENV: "preview",
+          VITE_APP_BUILD_SHA: "b".repeat(40),
+          VITE_CLAWHUB_DEPLOY_ENV: "preview",
+        },
+        {
+          VITE_APP_BUILD_SHA: "a".repeat(40),
+          VITE_CLAWHUB_DEPLOY_ENV: "staging",
+          VITE_CONVEX_SITE_URL: "https://cheery-civet-733.convex.site",
+          VITE_CONVEX_URL: "https://cheery-civet-733.convex.cloud",
+        },
+      ),
+    ).toMatchObject({
+      VITE_APP_BUILD_SHA: "a".repeat(40),
+      VITE_CLAWHUB_DEPLOY_ENV: "staging",
+      VITE_CONVEX_SITE_URL: "https://cheery-civet-733.convex.site",
+      VITE_CONVEX_URL: "https://cheery-civet-733.convex.cloud",
     });
   });
 
@@ -117,10 +154,14 @@ describe("Convex HTTP proxy", () => {
     vi.stubGlobal("fetch", fetchMock);
     const event = mockEvent("https://preview.example/api/v1/skills/demo?include=latest");
 
-    const response = await proxyConvexRequest(event, {
-      VERCEL_ENV: "preview",
-      VITE_CONVEX_URL: "https://preview-branch-123.convex.cloud",
-    });
+    const response = await proxyConvexRequest(
+      event,
+      {
+        VERCEL_ENV: "preview",
+        VITE_CONVEX_URL: "https://preview-branch-123.convex.cloud",
+      },
+      TEST_ARCHIVE_DEPENDENCIES,
+    );
 
     expect(response).toBeInstanceOf(Response);
     await expect(response.json()).resolves.toEqual({ ok: true });
@@ -131,7 +172,61 @@ describe("Convex HTTP proxy", () => {
     expect(response.headers.get("X-ClawHub-Preview-Backend")).toBe("preview-branch-123");
   });
 
-  it("streams hosted downloads from a Convex manifest with the final attachment filename", async () => {
+  it.each(["production", "preview"])(
+    "replaces forged identity headers on %s API requests",
+    async (environment) => {
+      const fetchMock = vi.fn(
+        async (_input: RequestInfo | URL, _init?: RequestInit) => new Response("ok"),
+      );
+      vi.stubGlobal("fetch", fetchMock);
+      const event = mockEvent("https://clawhub.ai/api/v1/search?q=test", {
+        headers: {
+          "x-vercel-forwarded-for": "203.0.113.7",
+          "x-forwarded-for": "198.51.100.8",
+          "x-clawhub-client-ip": "198.51.100.9",
+          "x-clawhub-vercel-oidc-token": "forged",
+          [STAGING_EDGE_SECRET_HEADER]: "forged",
+        },
+      });
+      const response = await proxyConvexRequest(
+        event,
+        { VERCEL_ENV: environment, VITE_CONVEX_URL: "https://preview-branch-123.convex.cloud" },
+        TEST_ARCHIVE_DEPENDENCIES,
+      );
+      expect(response.status).toBe(200);
+      const init = fetchMock.mock.calls[0]?.[1] as RequestInit | undefined;
+      const headers = new Headers(init?.headers);
+      expect(headers.get("x-clawhub-client-ip")).toBe("203.0.113.7");
+      expect(headers.get("x-clawhub-vercel-oidc-token")).toBe("verified-vercel-oidc");
+      expect(headers.get(STAGING_EDGE_SECRET_HEADER)).toBe("");
+    },
+  );
+
+  it("strips caller identity headers outside the Vercel runtime", async () => {
+    const fetchMock = vi.fn(
+      async (_input: RequestInfo | URL, _init?: RequestInit) => new Response("ok"),
+    );
+    vi.stubGlobal("fetch", fetchMock);
+    const event = mockEvent("http://localhost:3000/api/v1/search", {
+      headers: {
+        "x-clawhub-client-ip": "198.51.100.9",
+        "x-clawhub-vercel-oidc-token": "forged",
+        [STAGING_EDGE_SECRET_HEADER]: "forged",
+      },
+    });
+    await proxyConvexRequest(
+      event,
+      { VITE_CONVEX_URL: "http://127.0.0.1:3210" },
+      TEST_ARCHIVE_DEPENDENCIES,
+    );
+    const init = fetchMock.mock.calls[0]?.[1] as RequestInit | undefined;
+    const headers = new Headers(init?.headers);
+    expect(headers.get("x-clawhub-client-ip")).toBe("");
+    expect(headers.get("x-clawhub-vercel-oidc-token")).toBe("");
+    expect(headers.get(STAGING_EDGE_SECRET_HEADER)).toBe("");
+  });
+
+  it.each(["none", "missing", "body error"])("requires complete archives (%s)", async (failure) => {
     const storedBody = new TextEncoder().encode("# streamed skill\n");
     const fetchMock = vi.fn(async (input: string | URL | Request, _init?: RequestInit) => {
       const url = input.toString();
@@ -176,7 +271,16 @@ describe("Convex HTTP proxy", () => {
         return new Response(storedBody, { status: 200 });
       }
       if (url === "https://preview-branch-123.convex.cloud/api/storage/storage-missing") {
-        return new Response("missing", { status: 404 });
+        if (failure === "missing") return new Response("missing", { status: 404 });
+        if (failure === "body error")
+          return new Response(
+            new ReadableStream({
+              start(controller) {
+                controller.error(new Error("Storage body failed"));
+              },
+            }),
+          );
+        return new Response("second file");
       }
       if (url === "https://preview-branch-123.convex.site/api/internal/archive-download-metric") {
         return new Response(null, { status: 204 });
@@ -210,9 +314,22 @@ describe("Convex HTTP proxy", () => {
     expect(response.headers.get("ETag")).toBeNull();
     expect(response.headers.get("X-RateLimit-Remaining")).toBe("49");
     expect(response.headers.get("X-ClawHub-Preview-Backend")).toBe("preview-branch-123");
+    if (failure !== "none") {
+      await expect(response.arrayBuffer()).rejects.toThrow(
+        failure === "missing"
+          ? "Signed archive entry disappeared after manifest creation"
+          : "Storage body failed",
+      );
+      expect(
+        fetchMock.mock.calls.some(([input]) =>
+          input.toString().endsWith("/archive-download-metric"),
+        ),
+      ).toBe(false);
+      return;
+    }
     const archive = unzipSync(new Uint8Array(await response.arrayBuffer()));
     expect(archive["SKILL.md"]).toEqual(storedBody);
-    expect(Object.keys(archive).sort()).toEqual(["SKILL.md", "_meta.json"]);
+    expect(Object.keys(archive).sort()).toEqual(["SKILL.md", "_meta.json", "stale.txt"]);
     expect(fetchMock.mock.calls[0]?.[0]).toBe(
       "https://preview-branch-123.convex.site/api/v1/download?slug=demo",
     );
@@ -767,9 +884,9 @@ describe("Convex HTTP proxy", () => {
       },
       TEST_ARCHIVE_DEPENDENCIES,
     );
-    const archive = unzipSync(new Uint8Array(await response.arrayBuffer()));
-
-    expect(Object.keys(archive)).toEqual(["_meta.json"]);
+    await expect(response.arrayBuffer()).rejects.toThrow(
+      "Signed archive entry disappeared after manifest creation",
+    );
     expect(fetchMock).toHaveBeenCalledTimes(2);
   });
 
@@ -1113,6 +1230,66 @@ describe("Convex HTTP proxy", () => {
     expect(response.headers.get("X-ClawHub-Preview-Backend")).toBeNull();
   });
 
+  it("exposes the permanent Staging backend name for deployment proof", async () => {
+    const fetchMock = vi.fn(
+      async (_input: RequestInfo | URL, _init?: RequestInit) =>
+        new Response(JSON.stringify({ items: [], nextCursor: null })),
+    );
+    vi.stubGlobal("fetch", fetchMock);
+    const event = mockEvent("https://stg.clawhub.ai/api/v1/skills?limit=1", {
+      headers: { [STAGING_EDGE_SECRET_HEADER]: "forged" },
+    });
+
+    const response = await proxyConvexRequest(
+      event,
+      {
+        VERCEL_ENV: "preview",
+        VERCEL_TARGET_ENV: "preview",
+        CLAWHUB_STAGING_EDGE_SECRET: STAGING_EDGE_SECRET,
+        VITE_APP_BUILD_SHA: "a".repeat(40),
+        VITE_CLAWHUB_DEPLOY_ENV: "staging",
+        VITE_CONVEX_URL: "https://cheery-civet-733.convex.cloud",
+      },
+      TEST_ARCHIVE_DEPENDENCIES,
+    );
+
+    expect(response.headers.get("X-ClawHub-Staging-Backend")).toBe("cheery-civet-733");
+    expect(response.headers.get("X-ClawHub-Staging-Build-SHA")).toBe("a".repeat(40));
+    expect(response.headers.get("X-ClawHub-Preview-Backend")).toBeNull();
+    expect(response.headers.get("X-ClawHub-Test-Backend")).toBeNull();
+    const proxiedHeaders = new Headers((fetchMock.mock.calls[0]?.[1] as RequestInit)?.headers);
+    expect(proxiedHeaders.get(STAGING_EDGE_SECRET_HEADER)).toBe(STAGING_EDGE_SECRET);
+  });
+
+  it("fails closed before proxying if the staging secret or target is wrong", async () => {
+    const fetchMock = vi.fn();
+    vi.stubGlobal("fetch", fetchMock);
+    const event = mockEvent("https://stg.clawhub.ai/api/v1/skills?limit=1");
+    const stagingEnv = {
+      VERCEL_ENV: "preview",
+      VITE_CLAWHUB_DEPLOY_ENV: "staging",
+      VITE_CONVEX_URL: "https://cheery-civet-733.convex.cloud",
+    };
+
+    expect((await proxyConvexRequest(event, stagingEnv, TEST_ARCHIVE_DEPENDENCIES)).status).toBe(
+      503,
+    );
+    expect(
+      (
+        await proxyConvexRequest(
+          event,
+          {
+            ...stagingEnv,
+            CLAWHUB_STAGING_EDGE_SECRET: STAGING_EDGE_SECRET,
+            VITE_CONVEX_URL: "https://preview-branch-123.convex.cloud",
+          },
+          TEST_ARCHIVE_DEPENDENCIES,
+        )
+      ).status,
+    ).toBe(503);
+    expect(fetchMock).not.toHaveBeenCalled();
+  });
+
   it("rejects preview writes without contacting Convex", async () => {
     const fetchMock = vi.fn();
     vi.stubGlobal("fetch", fetchMock);
@@ -1129,8 +1306,10 @@ describe("Convex HTTP proxy", () => {
     expect(fetchMock).not.toHaveBeenCalled();
   });
 
-  it("does not wait for download metrics before emitting zip bytes", async () => {
+  it.each([false, true])("counts only completed archives (%s)", async (cancel) => {
     vi.useFakeTimers();
+    const background: Promise<unknown>[] = [];
+    let finishMetric: ((response: Response) => void) | undefined;
     const storedBody = new TextEncoder().encode("# streamed skill\n");
     const fetchMock = vi.fn(async (input: string | URL | Request) => {
       const url = input.toString();
@@ -1162,15 +1341,21 @@ describe("Convex HTTP proxy", () => {
         return new Response(storedBody, { status: 200 });
       }
       if (url === "https://preview-branch-123.convex.site/api/internal/archive-download-metric") {
-        return new Promise<Response>(() => {});
+        return new Promise<Response>((resolve) => {
+          finishMetric = resolve;
+        });
       }
       throw new Error(`Unexpected fetch: ${url}`);
     });
     vi.stubGlobal("fetch", fetchMock);
     vi.spyOn(Date, "now").mockReturnValue(2_000);
 
+    const event = mockEvent("https://preview.example/api/v1/download?slug=demo");
+    event.req.waitUntil = (promise) => {
+      background.push(promise);
+    };
     const response = await proxyConvexRequest(
-      mockEvent("https://preview.example/api/v1/download?slug=demo"),
+      event,
       {
         VERCEL_ENV: "preview",
         VITE_CONVEX_SITE_URL: "https://preview-branch-123.convex.site",
@@ -1197,8 +1382,33 @@ describe("Convex HTTP proxy", () => {
           input.toString() ===
           "https://preview-branch-123.convex.site/api/internal/archive-download-metric",
       ),
-    ).toBe(true);
+    ).toBe(false);
 
-    await reader.cancel();
+    if (cancel) {
+      await reader.cancel();
+      expect(background).toHaveLength(0);
+      expect(
+        fetchMock.mock.calls.some(([input]) =>
+          input.toString().endsWith("/archive-download-metric"),
+        ),
+      ).toBe(false);
+      return;
+    }
+    while (!(await reader.read()).done) {
+      /* consume the complete archive */
+    }
+    expect(
+      fetchMock.mock.calls.some(([input]) => input.toString().endsWith("/archive-download-metric")),
+    ).toBe(true);
+    expect(background).toHaveLength(1);
+    let settled = false;
+    void background[0].then(() => {
+      settled = true;
+    });
+    await Promise.resolve();
+    expect(settled).toBe(false);
+    finishMetric?.(new Response(null, { status: 204 }));
+    await background[0];
+    expect(settled).toBe(true);
   });
 });

@@ -1,6 +1,6 @@
 import { createFileRoute, useNavigate } from "@tanstack/react-router";
 import { Plus, Search, X } from "lucide-react";
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { api } from "../../convex/_generated/api";
 import { PluginListItem } from "../components/PluginListItem";
 import { PublisherListItem } from "../components/PublisherListItem";
@@ -9,8 +9,15 @@ import { SkillListItem } from "../components/SkillListItem";
 import { SkillsShListItem } from "../components/SkillsShListItem";
 import { Card } from "../components/ui/card";
 import { convexHttp } from "../convex/client";
+import { emitPublicSearchSubmission } from "../lib/analyticsEvents";
+import {
+  navigateWithManualCatalogSearch,
+  takeManualCatalogSearch,
+  type ManualCatalogSearch,
+} from "../lib/manualCatalogSearch";
 import type { PublicSkill } from "../lib/publicUser";
 import type { CanonicalSkillSearchResult } from "../lib/skillsShCatalog";
+import { useAnalyticsSearchResults } from "../lib/useAnalyticsSearchResults";
 import {
   useUnifiedSearch,
   toUnifiedSkillResult,
@@ -39,8 +46,15 @@ export const Route = createFileRoute("/search")({
   loaderDeps: ({ search }) => ({
     q: search.q,
   }),
-  loader: async ({ deps }): Promise<UnifiedSearchInitialData | null> =>
-    await loadInitialSearchResults(deps.q),
+  beforeLoad: ({ search, preload }) => ({
+    manualCatalogSearch: preload ? null : takeManualCatalogSearch(search.q),
+  }),
+  loader: async ({ deps, context }): Promise<UnifiedSearchInitialData | null> =>
+    context.manualCatalogSearch &&
+    !context.manualCatalogSearch.consumed.skill &&
+    (!context.manualCatalogSearch.kinds || context.manualCatalogSearch.kinds.includes("skill"))
+      ? null
+      : await loadInitialSearchResults(deps.q),
   component: UnifiedSearchPage,
 });
 
@@ -79,11 +93,18 @@ async function loadInitialSearchResults(query: string | undefined) {
 
 function UnifiedSearchPage() {
   const search = Route.useSearch();
+  const { manualCatalogSearch } = Route.useRouteContext();
   const initialSearch = Route.useLoaderData() as UnifiedSearchInitialData | null | undefined;
   const navigate = useNavigate();
   const activeType = search.type ?? "all";
   const [query, setQuery] = useState(search.q ?? "");
+  const lastManualSearchRef = useRef<ManualCatalogSearch | null>(manualCatalogSearch);
   const [resultLimit, setResultLimit] = useState(SEARCH_PAGE_SIZE);
+
+  useEffect(() => {
+    // Query navigation keeps this page mounted; retain the header's consumed intent.
+    if (manualCatalogSearch) lastManualSearchRef.current = manualCatalogSearch;
+  }, [manualCatalogSearch]);
 
   useEffect(() => {
     setQuery(search.q ?? "");
@@ -105,7 +126,10 @@ function UnifiedSearchPage() {
     pluginHasMore,
     creatorHasMore,
     isSearching,
+    pluginSearchError,
+    skillSearchError,
   } = useUnifiedSearch(search.q ?? "", "all", {
+    ...(manualCatalogSearch ? { manualCatalogSearch } : {}),
     ...(initialSearch ? { initialData: initialSearch } : null),
     limits: {
       skills: resultLimit,
@@ -123,6 +147,23 @@ function UnifiedSearchPage() {
           : creatorResults;
   const allCount = skillCount + pluginCount + creatorCount;
   const allHasMore = skillHasMore || pluginHasMore || creatorHasMore;
+  useAnalyticsSearchResults({
+    query: activeType === "creators" ? undefined : search.q,
+    count: results.length,
+    loading: isSearching,
+    failed:
+      activeType === "skills"
+        ? skillSearchError
+        : activeType === "plugins"
+          ? pluginSearchError
+          : skillSearchError || pluginSearchError,
+    context: activeType === "skills" || activeType === "plugins" ? activeType : "all",
+    complete: !(activeType === "skills"
+      ? skillHasMore
+      : activeType === "plugins"
+        ? pluginHasMore
+        : allHasMore),
+  });
   const canLoadMore =
     search.q &&
     !isSearching &&
@@ -134,13 +175,33 @@ function UnifiedSearchPage() {
 
   const handleSearch = (e: React.FormEvent) => {
     e.preventDefault();
-    void navigate({
-      to: "/search",
-      search: {
-        q: query.trim() || undefined,
-        type: search.type,
-      },
-    });
+    const trimmed = query.trim();
+    if (activeType !== "creators")
+      emitPublicSearchSubmission(trimmed, activeType, "search_results");
+    if (lastManualSearchRef.current?.query !== trimmed) {
+      lastManualSearchRef.current = {
+        query: trimmed,
+        consumed: {},
+        kinds:
+          activeType === "all"
+            ? ["skill", "plugin"]
+            : activeType === "skills"
+              ? ["skill"]
+              : activeType === "plugins"
+                ? ["plugin"]
+                : [],
+      };
+    }
+    const intent = trimmed && activeType !== "creators" ? lastManualSearchRef.current : null;
+    void navigateWithManualCatalogSearch(intent, () =>
+      navigate({
+        to: "/search",
+        search: {
+          q: query.trim() || undefined,
+          type: search.type,
+        },
+      }),
+    );
   };
 
   const setType = (type: UnifiedSearchType) => {
@@ -155,6 +216,7 @@ function UnifiedSearchPage() {
   };
 
   const clearSearch = () => {
+    lastManualSearchRef.current = null;
     setQuery("");
     void navigate({
       to: "/search",
@@ -208,18 +270,18 @@ function UnifiedSearchPage() {
           All
         </button>
         <button
-          className={`search-tab${activeType === "skills" ? " is-active" : ""}`}
-          type="button"
-          onClick={() => setType("skills")}
-        >
-          Skills
-        </button>
-        <button
           className={`search-tab${activeType === "plugins" ? " is-active" : ""}`}
           type="button"
           onClick={() => setType("plugins")}
         >
           Plugins
+        </button>
+        <button
+          className={`search-tab${activeType === "skills" ? " is-active" : ""}`}
+          type="button"
+          onClick={() => setType("skills")}
+        >
+          Skills
         </button>
         <button
           className={`search-tab${activeType === "creators" ? " is-active" : ""}`}
@@ -230,13 +292,32 @@ function UnifiedSearchPage() {
         </button>
       </div>
 
+      {!isSearching && skillSearchError && (activeType === "all" || activeType === "skills") ? (
+        <div role="alert" className="empty-state">
+          <p className="empty-state-title">Unable to search skills</p>
+          <p className="empty-state-body">
+            The skill catalog is temporarily unavailable. Please try again later.
+          </p>
+        </div>
+      ) : null}
+      {!isSearching && pluginSearchError && (activeType === "all" || activeType === "plugins") ? (
+        <div role="alert" className="empty-state">
+          <p className="empty-state-title">Unable to search plugins</p>
+          <p className="empty-state-body">
+            The plugin catalog is temporarily unavailable. Please try again later.
+          </p>
+        </div>
+      ) : null}
       {isSearching ? (
         <BrowseResultsSkeleton count={activeType === "all" ? 8 : 6} />
       ) : !search.q ? (
         <Card className="text-center p-10">
           <p className="text-ink-soft">Enter a search term to find skills, plugins, and creators</p>
         </Card>
-      ) : results.length === 0 ? (
+      ) : results.length === 0 &&
+        ((pluginSearchError && (activeType === "all" || activeType === "plugins")) ||
+          (skillSearchError &&
+            (activeType === "all" || activeType === "skills"))) ? null : results.length === 0 ? (
         <SearchEmptyState
           activeType={activeType}
           hasOtherTypeMatches={hasOtherTypeMatches}
@@ -247,17 +328,17 @@ function UnifiedSearchPage() {
         <>
           {activeType === "all" ? (
             <div className="search-results-sections">
-              {skillResults.length > 0 ? (
-                <SearchResultSection title="Skills">
-                  {skillResults.map((item) => (
-                    <SkillResultRow key={skillResultKey(item)} result={item} />
-                  ))}
-                </SearchResultSection>
-              ) : null}
               {pluginResults.length > 0 ? (
                 <SearchResultSection title="Plugins">
                   {pluginResults.map((item) => (
                     <PluginResultRow key={`plugin-${item.plugin.name}`} result={item} />
+                  ))}
+                </SearchResultSection>
+              ) : null}
+              {skillResults.length > 0 ? (
+                <SearchResultSection title="Skills">
+                  {skillResults.map((item) => (
+                    <SkillResultRow key={skillResultKey(item)} result={item} />
                   ))}
                 </SearchResultSection>
               ) : null}

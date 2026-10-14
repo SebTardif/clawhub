@@ -42,6 +42,12 @@ export const PluginManifestSummarySchema = type({
   }).array(),
   mcpServers: type({
     name: "string",
+    url: "string?",
+    "transport?": '"streamable-http"|"sse"|"stdio"',
+    "auth?": '"oauth"|"api-key"|"none"',
+    scope: "string?",
+    setup: "string?",
+    endpointRedacted: "boolean?",
   }).array(),
   bundledSkills: type({
     name: "string",
@@ -182,6 +188,47 @@ export const PackageSkillSpectorAnalysisSchema = type({
   checkedAt: "number",
 });
 export type PackageSkillSpectorAnalysis = (typeof PackageSkillSpectorAnalysisSchema)[inferred];
+
+export const PackageEndorAnalysisSchema = type({
+  status: '"completed"',
+  checkedAt: "number",
+  reachableFunctionCount: "number.integer >= 0",
+  findings: type({
+    severity: type("string").atMostLength(64),
+    summary: type("string").atMostLength(2000),
+  })
+    .array()
+    .atMostLength(50),
+}).or({
+  status: '"skipped"|"failed"',
+  checkedAt: "number",
+  reason: type("string").atMostLength(2000),
+});
+export type PackageEndorAnalysis = (typeof PackageEndorAnalysisSchema)[inferred];
+
+export const PackageAigFindingSchema = type({
+  ruleId: "string",
+  level: "string",
+  message: "string",
+  title: "string?",
+  description: "string?",
+  file: "string?",
+  startLine: "number?",
+  endLine: "number?",
+  remediation: "string?",
+});
+export type PackageAigFinding = (typeof PackageAigFindingSchema)[inferred];
+
+export const PackageAigAnalysisSchema = type({
+  status: "string",
+  issueCount: "number",
+  findings: PackageAigFindingSchema.array(),
+  scannerVersion: "string?",
+  summary: "string?",
+  error: "string?",
+  checkedAt: "number",
+});
+export type PackageAigAnalysis = (typeof PackageAigAnalysisSchema)[inferred];
 
 export const PackageLlmAnalysisDimensionSchema = type({
   name: "string",
@@ -463,6 +510,8 @@ export const ApiV1PackageResponseSchema = type({
     handle: "string|null",
     displayName: "string|null?",
     image: "string|null?",
+    // Response readers also accept registries predating the publisher badge field.
+    official: "boolean?",
   }).or("null"),
 });
 
@@ -497,6 +546,8 @@ export const ApiV1PackageVersionResponseSchema = type({
     sha256hash: "string|null?",
     vtAnalysis: PackageVtAnalysisSchema.or("null").optional(),
     skillSpectorAnalysis: PackageSkillSpectorAnalysisSchema.or("null").optional(),
+    endorAnalysis: PackageEndorAnalysisSchema.or("null").optional(),
+    aigAnalysis: PackageAigAnalysisSchema.or("null").optional(),
     llmAnalysis: PackageLlmAnalysisSchema.or("null").optional(),
     staticScan: PackageStaticScanSchema.or("null").optional(),
   }).or("null"),
@@ -533,6 +584,8 @@ export type ApiV1PackageArtifactResponse = (typeof ApiV1PackageArtifactResponseS
 
 export const ApiV1PackageSecurityResponseSchema = type({
   overview: "string",
+  // Older registries omit this field; consumers must not infer a display verdict from trust.
+  verdict: "string?",
   securityAuditUrl: "string",
   package: type({
     name: "string",
@@ -548,6 +601,7 @@ export const ApiV1PackageSecurityResponseSchema = type({
     npmShasum: "string?",
     npmTarballName: "string?",
     createdAt: "number",
+    endorAnalysis: PackageEndorAnalysisSchema.or("null").optional(),
   }),
   trust: type({
     scanStatus: '"clean"|"suspicious"|"malicious"|"pending"|"not-run"',
@@ -974,6 +1028,27 @@ export const PackagePublicationStatusSchema = type(
   '"pending"|"published"|"blocked"|"failed"|"expired"',
 );
 export type PackagePublicationStatus = (typeof PackagePublicationStatusSchema)[inferred];
+
+export const ApiV1PackagePublishRecoveryRequestSchema = type({
+  manualOverrideReason: "string",
+});
+export type ApiV1PackagePublishRecoveryRequest =
+  (typeof ApiV1PackagePublishRecoveryRequestSchema)[inferred];
+
+export const ApiV1PackagePublishRecoveryResponseSchema = type({
+  ok: "true",
+  attemptId: "string",
+  recoveredFromAttemptId: "string",
+  packageId: "string",
+  releaseId: "string",
+  name: "string",
+  version: "string",
+  status: PackagePublishAttemptStatusSchema,
+  publicationStatus: PackagePublicationStatusSchema,
+  reused: "boolean",
+});
+export type ApiV1PackagePublishRecoveryResponse =
+  (typeof ApiV1PackagePublishRecoveryResponseSchema)[inferred];
 
 export const PackagePublishAttemptCheckSchema = type({
   status: '"pending"|"clean"|"blocked"|"failed"',

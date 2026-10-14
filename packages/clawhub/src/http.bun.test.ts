@@ -1,5 +1,7 @@
 /* @vitest-environment node */
 
+import { once } from "node:events";
+import { Worker } from "node:worker_threads";
 import { describe, expect, it, vi } from "vitest";
 import { createHttpClient } from "./http.js";
 
@@ -55,6 +57,49 @@ function createBunClient(options?: {
 }
 
 describe("bun http client", () => {
+  it("preserves literal multipart fields and file bytes through real curl", async ({ signal }) => {
+    // curl blocks this thread; the loopback receiver must run independently.
+    const receiver = new Worker(
+      `const { createServer } = require('node:http');
+       const { parentPort } = require('node:worker_threads');
+       const server = createServer(async (req, res) => {
+         const chunks = [];
+         for await (const chunk of req) chunks.push(chunk);
+         const form = await new Request('http://localhost/', {
+           method: 'POST', headers: req.headers, body: Buffer.concat(chunks)
+         }).formData();
+         const file = form.get('file');
+         res.setHeader('content-type', 'application/json');
+         res.end(JSON.stringify({ payload: form.get('payload'), file: await file.text() }));
+       });
+       server.listen(0, '127.0.0.1', () => parentPort.postMessage(server.address().port));`,
+      { eval: true },
+    );
+    try {
+      const [port] = await once(receiver, "message", { signal });
+      const client = createHttpClient({ runtime: "bun", configureDispatcher: false });
+      for (const payload of [
+        JSON.stringify({ manualOverrideReason: "Retry publication; retain original artifacts" }),
+        "@literal-not-a-file",
+        "<literal-not-a-file",
+      ]) {
+        const form = new FormData();
+        form.append("payload", payload);
+        form.append("file", new Blob(["unchanged file bytes"]), "fixture.txt");
+        await expect(
+          client.apiRequestForm(`http://127.0.0.1:${port}`, {
+            method: "POST",
+            path: "/upload",
+            form,
+            retryCount: 0,
+          }),
+        ).resolves.toEqual({ payload, file: "unchanged file bytes" });
+      }
+    } finally {
+      await receiver.terminate();
+    }
+  });
+
   it("uses curl for apiRequest GET and POST", async () => {
     const { client, spawnImpl } = createBunClient({
       spawnImpl: () => ({ status: 0, stdout: '{"ok":true}\n200', stderr: "" }),
@@ -104,6 +149,37 @@ describe("bun http client", () => {
       message: "GitHub-backed skill changed upstream; waiting for scan.",
     });
     expect(spawnImpl).toHaveBeenCalledTimes(1);
+  });
+
+  it("reads rate-limit headers from real curl responses", async ({ signal }) => {
+    const receiver = new Worker(
+      `const { createServer } = require('node:http');
+       const { parentPort } = require('node:worker_threads');
+       const server = createServer((req, res) => {
+         res.writeHead(429, {
+           'content-type': 'text/plain',
+           'retry-after': '7',
+           'x-ratelimit-limit': '20',
+           'x-ratelimit-remaining': '0',
+         });
+         res.end('rate limited');
+       });
+       server.listen(0, '127.0.0.1', () => parentPort.postMessage(server.address().port));`,
+      { eval: true },
+    );
+    try {
+      const [port] = await once(receiver, "message", { signal });
+      const client = createHttpClient({ runtime: "bun", configureDispatcher: false });
+      await expect(
+        client.apiRequest(`http://127.0.0.1:${port}`, {
+          method: "GET",
+          path: "/v1/ping",
+          retryCount: 0,
+        }),
+      ).rejects.toThrow(/retry in 7s.*remaining: 0\/20/i);
+    } finally {
+      await receiver.terminate();
+    }
   });
 
   it("retries 429 responses and keeps 404 non-retryable", async () => {

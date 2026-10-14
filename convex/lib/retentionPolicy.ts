@@ -25,7 +25,13 @@ type EphemeralRetentionPolicy = BaseRetentionPolicy & {
   classification: "ephemeral";
   standardBatchSize: typeof RETENTION_STANDARD_BATCH_SIZE;
   prune: string;
-  expirationField?: "expiresAt" | "expirationTime" | "dayStart" | "processedAt" | "createdAt";
+  expirationField?:
+    | "expiresAt"
+    | "expirationTime"
+    | "dayStart"
+    | "processedAt"
+    | "createdAt"
+    | "observedAt";
   expirationIndex?: string;
   retention: string;
 };
@@ -58,6 +64,54 @@ const ephemeral = (
 });
 
 export const RETENTION_POLICIES = {
+  searchReportRuns: ephemeral(
+    "Private derived report generation outcomes, never search observations.",
+    {
+      expirationField: "expirationTime",
+      expirationIndex: "by_expirationTime",
+      prune: "searchReports.pruneExpiredInternal",
+      retention: "24 hours after generation request.",
+    },
+  ),
+  searchReportChunks: ephemeral("Bounded private evidence chunks owned by a report generation.", {
+    expirationField: "expirationTime",
+    expirationIndex: "by_expirationTime",
+    prune: "searchReports.pruneExpiredInternal",
+    retention: "24 hours after generation request; deleted before the parent.",
+  }),
+  searchAggregateStates: permanent(
+    "One ingestion cursor and query-free coverage bounds; no identities.",
+  ),
+  searchDailyAggregates: ephemeral("Daily anonymous search facts; no historical log backfill.", {
+    expirationField: "expirationTime",
+    expirationIndex: "by_expirationTime",
+    prune: "searchInsights.pruneExpiredInternal",
+    retention: "13 calendar months after the UTC day.",
+  }),
+  searchClassificationRuns: ephemeral(
+    "Query-free weekly classification completion/failure status.",
+    {
+      expirationField: "expirationTime",
+      expirationIndex: "by_expirationTime",
+      prune: "searchInsights.pruneExpiredInternal",
+      retention: "13 calendar months after the week.",
+    },
+  ),
+  searchWeeklyClassifications: ephemeral(
+    "Advisory weekly intent only; never official provenance.",
+    {
+      expirationField: "expirationTime",
+      expirationIndex: "by_expirationTime",
+      prune: "searchInsights.pruneExpiredInternal",
+      retention: "13 calendar months after the week.",
+    },
+  ),
+  searchWeeklyDigests: ephemeral("Bounded weekly aggregate digest payloads and delivery status.", {
+    expirationField: "expirationTime",
+    expirationIndex: "by_expiration_time",
+    prune: "searchWeeklyDigest.pruneExpiredInternal",
+    retention: "13 calendar months from the completed week boundary.",
+  }),
   users: permanent("Canonical user profiles and account state."),
   authSessions: ephemeral("Convex Auth sessions expire after their total session duration.", {
     expirationField: "expirationTime",
@@ -139,6 +193,9 @@ export const RETENTION_POLICIES = {
     "Catalog classification output can be recomputed from package and skill metadata.",
     "skills/packages",
   ),
+  pluginCategoryRefreshes: permanent(
+    "Reviewed category migration decisions and before/after evidence required for guarded rollback.",
+  ),
   packageInspectorWarnings: permanent("Package inspector findings are user-facing review history."),
   packageInspectorFindingNotifications: permanent(
     "Notification sent-log prevents duplicate emails.",
@@ -167,16 +224,25 @@ export const RETENTION_POLICIES = {
     retention: "Parent skillScanRequests TTL.",
   }),
   skillCardGenerationJobs: permanent("Card generation job history and retry state."),
-  packageStatEvents: ephemeral("Package stat event log only needs to survive processing.", {
+  packageStatEvents: ephemeral("Package stat events support processing and 24-hour Trending.", {
     expirationField: "processedAt",
     expirationIndex: "by_unprocessed",
     prune: "packages.pruneProcessedPackageStatEventsInternal",
     retention: "Processed and older than 7 days.",
   }),
+  pluginSearchObservations: ephemeral(
+    "Raw plugin search observations are retained only to build privacy-preserving aggregates.",
+    {
+      expirationField: "observedAt",
+      expirationIndex: "by_observed_at",
+      prune: "pluginSearchObservations.pruneExpiredInternal",
+      retention: "30 days after observation.",
+    },
+  ),
   packageDailyStats: permanent("Daily aggregate package stats are product analytics."),
   packageLeaderboards: derived(
-    "Package trending snapshots can be rebuilt from packageDailyStats.",
-    "packageDailyStats",
+    "Package trending snapshots can be rebuilt from the retained packageStatEvents window.",
+    "packageStatEvents",
   ),
   packageTrustedPublishers: permanent("Trusted publishing configuration."),
   packagePublishTokens: ephemeral("Package publish tokens expire and can be revoked.", {
@@ -286,6 +352,9 @@ export const RETENTION_POLICIES = {
   catalogFeedPublications: permanent("Current published hosted catalog feed snapshot."),
   stars: permanent("User star records."),
   promotions: permanent("Curated promotional offers; ended records stay for launch-page history."),
+  featuredSelections: permanent(
+    "Staff editorial reservations and the current approved publication order.",
+  ),
   auditLogs: permanent("Audit logs are durable compliance/security history."),
   systemSettings: permanent("Durable operator-controlled system settings."),
   skillsShCatalogControls: permanent("Durable skills.sh catalog operator controls."),

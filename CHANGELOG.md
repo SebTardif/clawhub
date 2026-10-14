@@ -2,13 +2,54 @@
 
 ## Unreleased
 
+- Tests: update Vitest and its V8 coverage provider together to 5.0.3; retain registered auth callbacks across per-test mock cleanup.
+- Tests: update jsdom to 30.1.2 and allow its required Undici 8 transport while keeping the CLI on Undici 7.
+- Runtime: use Bun 1.3.14 across CI and deployment tooling to preserve labelled conditional blocks when compiling React server rendering.
+- Tests: revalidate cached npm metadata before installing updated Convex external dependencies, retaining cached package tarballs and bounded fetches.
+
+- Dependencies: refresh production packages and synchronize the Sharp pin; let each package resolve its supported Undici transport and use the unpatched upstream Workpool release. Retain the old Workpool typecheck patch only for the previous-version test fixture.
+
+- Use one shared autoreview installation from `openclaw/agent-skills`; repository entrypoints now receive upstream fixes without copied helpers or test suites.
+
+## 0.24.0 - 2026-09-30
+
 ### Changes
 
+- CLI/API: publish experimental Claw packages from already-built npm tarballs, bind staged uploads to their SHA-256 digest, and preserve the exact artifact bytes through scanning and download.
+- API: expose public exact-version package publication state to distinguish staged, failed, absent, and published releases with advisory recovery eligibility.
+- CI: record dependency advisories from `bun audit` as warning annotations instead of failing `static` and blocking Deploy Test; known-malware findings still fail.
+- Workers: default Skill Cards to GPT-6 Sol with medium reasoning and fast service, and prepare semantic input reuse with stale-result fencing for separate activation after backend deployment.
+- Workers: preserve optional scanner model and reasoning settings in restricted subprocess environments without changing workflow defaults.
 - Web: organization publishers can upload durable PNG, JPEG, or WebP logos from settings instead of relying on hotlinked image URLs.
 - Web/API: make default skill and plugin discovery freshness-aware, add seven-day trending views for both catalogs, and use verified status plus usage as search tie-breakers within direct matches.
 
 ### Fixes
 
+- Publishing: load only the text decoder, not the whole `clawhub-schema` barrel, in the static publish scan Node action, cutting ~140 MB from its peak so large bundled plugins such as WhatsApp no longer run it out of memory.
+- Publishing: settle retries of an exact staged package artifact before scans and Plugin Inspector run again, returning the pending or published result, and name a failed attempt with its recovery command instead of a bare "already exists".
+- CLI: read `Retry-After` and rate-limit headers from curl responses under Bun, so publishes back off for the time the server asks instead of retrying blind.
+- CLI: keep completed skill installs and updates when deleting an old backup fails, without rolling back the new files (thanks @SebTardif).
+- Publishing: prepare the Plugin Inspector OpenClaw target by streaming and verifying only its public declaration surface, so plugin publishes no longer run the Node action out of memory or fill `/tmp` with the full OpenClaw package.
+- Deploy: coalesce pending skills.sh syncs per ref before they enter the production deployment queue, while preserving active sync cleanup and queued manual deploys.
+
+- Dependencies: align brace-expansion and fast-uri overrides with their patched lockfile versions so dependency resolution cannot restore the vulnerable pins.
+
+- Workers: reserve Skill Card capacity by lease slot to avoid global queue contention, continue after partial batches, and release undelivered leases when input hydration fails.
+
+- Workers: redact quoted credentials completely in serialized JSON diagnostics while preserving adjacent non-secret context.
+- Deploy: queue production deployments and hourly skills.sh synchronization together so rollout pauses cannot interrupt synchronization or rollback; retain bounded, redacted failure receipts when synchronization fails.
+- Tests: shorten local Convex scratch paths when a deeply nested `TMPDIR` shares the workspace filesystem, while retaining short overrides and avoiding Unix socket path failures.
+- API/CLI: preserve owner-qualified skill identities in catalog listings and accept explicit null public versions consistently across API and CLI schemas (thanks @HwangBae for the report and @goutamadwant for the fix).
+- Workers: delete a newly generated Skill Card blob when attachment fails, while preserving successfully attached cards and historical bundle fingerprints (thanks @SebTardif).
+- Publishing: fall back to local changelog notes when the provider stalls for ten seconds, including while reading the response body (thanks @SebTardif).
+- Web: bound Agent Skills discovery proxy requests to ten seconds, including stalled response bodies, so installers can recover from an unresponsive upstream (thanks @SebTardif).
+- CLI: preserve literal multipart text when publishing with Bun, including semicolons in JSON metadata and values beginning with `@` or `<`, without changing uploaded file bytes.
+- Workers: scan plugin packages containing both skill and plugin manifests without ambiguous-target failures, preserving full-package scanning and bundled-skill paths.
+- CLI/API: recover failed staged plugin publications from their retained artifacts with `clawhub package recover`, fresh security checks, current publisher authorization, and preserved attempt history.
+- Tests: keep the Vitest localStorage shim working on Node 26, whose native `Storage` global has a non-configurable `length`, so `bun run ci:unit` passes on Node 24 and 26.
+- API/GitHub Actions: authorize human release recovery through v2 approval and the original child-bound parent receipt, fail automated attempts when their exact parent fails, and let admins preview or discard orphaned package publish attempts with a publisher-visible reason.
+- CI: warm and cache the npm packages for local Convex "use node" dependencies and raise the isolated backend's push transport timeout so local-auth browser lanes no longer race a 408-retried external-deps build into a deleted build directory.
+- CI: make the UI proof process-tree reaping test exercise KILL escalation deterministically and assert the reaper's signal sequence, so a TERM that lands before the grandchild ignores it can no longer mask a missing KILL.
 - CI: run the pinned Agent Skills CLI from the Bun lockfile without runtime npm access, retain subprocess failure output, and run first-party CLI coverage before third-party compatibility checks.
 - Docs: repair plugin validation remediation links to the published manifest metadata and runtime session helper sections while preserving valid CLI workflow anchors.
 - Dependencies: pin fast-uri to 3.1.6 to fix host confusion and server-side request forgery advisories in URI normalization.

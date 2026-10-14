@@ -10,11 +10,76 @@ read_when:
 
 See also: [acceptable-usage.md](./acceptable-usage.md) for the marketplace policy on prohibited skill categories.
 
+## Anonymous API ingress
+
+- Hosted anonymous HTTP requests must enter through the ClawHub Vercel edge.
+  The proxy replaces caller-supplied identity headers with its Vercel OIDC
+  service token and the platform-controlled visitor address. Convex verifies
+  the token's issuer, audience, project, owner and deployment environment
+  before using that address for quotas or download metrics.
+- Unverified direct requests consume no shared quota: redirect them to the
+  configured public HTTPS API origin, or reject if no safe origin is configured.
+  Invalid edge assertions are rejected without redirecting, to avoid loops
+  through a misconfigured proxy.
+  The legacy `TRUST_FORWARDED_IPS` flag must never authorize raw IP headers.
+- API tokens retain per-user quotas. A server-owned loopback Convex deployment
+  may use a local development bucket when no hosted environment is configured.
+- The production skills.sh mirror operator, inspector worker routes, signed
+  archive metric receipts, and Convex Auth's OAuth sign-in/callback routes
+  retain their handler-owned credential checks at
+  the Convex origin. They do not use anonymous IP quotas or redirect credentials
+  to another origin. Worker credentials never exempt ordinary public API routes
+  from verified ingress.
+- The skills.sh operator accepts only the verified GitHub Actions identity for
+  this repository's sync workflow on `main` in the `Production` environment.
+  Its Test operator continues to require an admin API token and API quotas.
+- Rollout requires the identity-forwarding edge before the backend starts
+  enforcing verified anonymous ingress.
+
 ## Roles + permissions
+
+- Hidden-skill HTTP hints and private moderation evidence follow current publisher
+  read access. Organization owners, admins, and publishers qualify through current
+  membership; historical `ownerUserId` does not preserve access after membership
+  removal. Personal publishers follow current linkage with the existing legacy
+  owner fallback, and skills without a publisher retain personal-owner access.
+  Existing platform staff access and public evidence redaction remain unchanged.
+
+- Skill transfer, delete, and restore authorization follows the resource's current
+  publisher ownership. For organization skills, the historical `ownerUserId` is
+  not an authorization grant: current organization admin/owner membership is
+  required, subject to the operation's existing platform staff permissions.
+- Transfer acceptance rechecks the requester's current authority, including when
+  they originally published the skill. Removing or downgrading their membership
+  invalidates pending requests. Personal and legacy skills retain personal-owner
+  authorization through the shared publisher ownership check.
+- Changelog previews must authorize previous-version file access before reading
+  stored content or invoking an AI provider. They use the same ownership, staff,
+  moderation, deletion, and publication checks as direct skill file reads.
+  The changelog formatter receives an already-authorized version; it must not
+  resolve and load a different previous version from an untrusted slug.
+- Server-side OG image requests validate all resolved IPv4/IPv6 destinations at
+  the socket lookup boundary. Private, local, special-purpose, or mixed results
+  are rejected. The socket receives only those checked addresses, avoiding a
+  second DNS lookup; HTTPS still verifies the original hostname. Every redirect
+  repeats URL and destination checks. Timeout and byte limits remain enforced.
 
 - user: upload skills (subject to GitHub age gate), report skills/packages.
 - moderator: hide/restore skills, view hidden skills, unhide, soft-delete, ban users (except admins).
 - admin: all moderator actions + hard delete skills, change owners, change roles.
+
+## Manual package scan backfill
+
+- The public `packages.backfillPackageReleaseScans` action requires an active
+  authenticated admin before traversing releases or enqueueing any scan work.
+  Anonymous, ordinary-user, moderator, deleted, and deactivated callers must
+  leave scan queues and scheduled backfill work unchanged.
+- Manual clients must send an admin session through Convex Auth. The public
+  wrapper must not accept a caller-supplied user id or rely on queue deduplication
+  as authorization.
+- The internal backfill and its scheduled continuations retain service access
+  without a user session. Cron calls that internal entry point directly; placing
+  the public admin guard inside it would break scheduled maintenance.
 
 ## Ban + unban batches
 
@@ -25,6 +90,33 @@ See also: [acceptable-usage.md](./acceptable-usage.md) for the marketplace polic
   restoring skills or scheduling another page.
 - Restore pages only clear the exact `softDeletedAt` timestamp from the ban
   being lifted and only for skills hidden with `moderationReason = "user.banned"`.
+
+## Publication visibility at public reads
+
+- A public skill version or plugin release must belong to the selected parent,
+  be published (or be a legacy row without `publicationStatus`), and have neither
+  `softDeletedAt` nor `ownerDeletedAt`. Pending and blocked submissions remain
+  unavailable even when a caller knows their version, tag, identifier, or hash.
+- Resolve the current parent and selected version together in the domain query.
+  HTTP adapters compose that checked result with the existing parent visibility,
+  viewer authorization, and download policy before returning metadata or reading
+  storage. Cached summaries, tags, export digests, and fingerprint indexes are
+  selection hints; none independently authorize a public read.
+- Apply the same publication boundary to files, cards, verification, skill aliases
+  under the packages API, direct and hosted ZIPs, tag labels, description fallback,
+  and exports. Batch export selection checks in small bounded groups before loading
+  blobs. A missing requested tag must not silently select the latest version.
+- Hash resolution checks every candidate against its current parent and version.
+  A withheld newer match must not hide an older published match. Maintain the
+  existing public parent policy and bounded indexed/fallback search.
+- Publication and scan state are separate: published metadata remains inspectable
+  where existing policy allows it, while malicious/failed skill downloads and
+  quarantined/revoked package downloads remain blocked. A pending package scan is
+  not an unpublished release. Authorized owner/staff submission previews retain
+  their separate access path.
+- Changes to version publication or owner-deletion state invalidate public browse
+  projections. A pending replacement must preserve an older approved version where
+  the existing latest-version policy selects it.
 
 ## Exact-version revocation
 
@@ -211,7 +303,7 @@ See also: [acceptable-usage.md](./acceptable-usage.md) for the marketplace polic
   abuse list from the filtered backend dashboard state instead of applying a
   separate client-side official-org filter.
 
-## Reporting + auto-hide
+## Reporting + moderation review
 
 - Reports are unique per user + target (skill/package).
 - Report reason required (trimmed, max 500 chars). Abuse of reporting may result in account bans.
@@ -220,13 +312,13 @@ See also: [acceptable-usage.md](./acceptable-usage.md) for the marketplace polic
     and the owner is not banned.
   - Active package report = package exists, not soft-deleted, and the owner is
     not banned/deactivated.
-- Auto-hide: when unique reports exceed 3 (4th report):
-  - skill report flow:
-    - soft-delete skill (`softDeletedAt`)
-    - set `moderationStatus = hidden`
-    - set `moderationReason = auto.reports`
-    - set embeddings visibility `deleted`
-    - audit log entry: `skill.auto_hide`
+- Reports never change skill visibility or installability automatically, regardless
+  of the number of distinct reporters or whether the skill is official. Report
+  submission records moderator intake and updates report counts only. Hiding a
+  skill requires an authorized moderator's explicit decision; this prevents a
+  small group of ordinary accounts from removing arbitrary catalog entries.
+- Existing report, scanner, and moderator hides retain their provenance; this
+  change does not automatically restore previously hidden skills.
 - Package reports feed `clawhub-admin package moderation-queue` and audit `package.report`,
   but do not auto-hide or block downloads. Moderators can review a formal report
   with an explicit final action to quarantine or revoke the affected release.
@@ -387,6 +479,15 @@ See also: [acceptable-usage.md](./acceptable-usage.md) for the marketplace polic
   download must serve the exact stored tarball bytes whose SHA-256 matches that
   value. Trusted publish tokens accepted by an idempotent retry are revoked on
   the same success boundary as a newly created attempt.
+- Every skill and package publish entry point (web actions, CLI and HTTP
+  routes, GitHub import, trusted publishing, and managed MCP) stores a pending
+  version or release plus a publish attempt bound to the exact artifact
+  fingerprint. No deployment toggle or fallback publishes first and scans
+  later. Only a passing pre-publication verdict promotes the release. Repeated
+  scanner failures terminate the attempt as failed, and a worker whose check
+  lease expired cannot submit a verdict, so scanner failures and timeouts leave
+  the release unpublished. AI summary, changelog, and embedding generation run
+  during finalization, after the checks pass.
 - A staged publish attempt is not a successful release. ClawHub dispatches an
   exact pre-publication worker through the production GitHub App as soon as the
   attempt becomes pending; the scheduled worker remains recovery for missed
@@ -410,13 +511,54 @@ See also: [acceptable-usage.md](./acceptable-usage.md) for the marketplace polic
 - Static findings are internal evidence for Codex-backed ClawScan only. They do
   not hide, block, set public security status, affect installability, or trigger
   user autobans.
-- Public artifact pages present SkillSpector findings, VirusTotal malware telemetry,
+- Public artifact pages present SkillSpector findings, A.I.G findings for skills,
   and ClawScan-powered risk review as one consolidated Security audit page.
   This is a product-facing model only; scanner storage, moderation decisions,
   and worker behavior remain separate internally.
+- Scanner finding content is source evidence, not the verdict or necessarily
+  only the matched risky text. SkillSpector preserves scanner-provided excerpts
+  ahead of source-file fallbacks and labels their provenance. Fallbacks render
+  the full reported line range, labeled with the file path and displayed range.
+  They must not present a bare Markdown frontmatter delimiter as evidence; if the
+  available source is shorter than the reported range, disclose it. Source code
+  remains literal and uses syntax highlighting; scanner Markdown uses the sanitized report renderer.
+  SkillSpector details appear as Category, Confidence, Finding, then Content.
+  A.I.G shows concise labeled facts with long analysis and remediation collapsed
+  until requested; disclosure does not alter the stored report or scanner verdict.
 - ClawScan verdicts come from a GitHub Actions Codex worker, not a single
   hosted LLM call. Codex reviews the materialized artifact workspace with
-  SkillSpector and static scan evidence as context.
+  SkillSpector, A.I.G, and static scan evidence as context.
+- Workers preserve explicitly configured model and reasoning settings through
+  restricted scanner subprocess environments. Workflow defaults and pinned
+  scanner versions define the active policy; forwarding optional settings
+  does not change those defaults or add support to older scanner clients.
+- ClawScan is the sole authority for the stored risk-analysis verdict and its
+  moderation consequences. A.I.G is required supporting evidence for skill
+  scans: missing, failed, or malformed A.I.G output fails the worker through
+  the normal retry lifecycle, but an A.I.G finding never independently blocks,
+  hides, or changes installability. Package releases skip the skill-only A.I.G
+  scanner.
+- Published skill verification retains complete upstream A.I.G and SkillSpector
+  JSON in a version-owned storage blob, separate from capped database summaries.
+  `/verify` returns these reports under `security.scannerReports`, alongside the
+  overall verdict and without duplicate signal summaries, only when their scan timestamp matches all
+  stored summaries and the ClawScan verdict. Legacy scans expose null reports
+  until rescanned; raw evidence never changes moderation or verification policy.
+  Replacing a scan deletes its previous report blob, and version hard deletion
+  or pending-publication discard deletes the associated blob. Workers send raw
+  reports only when the hydrated job provides a signed upload URL, so merging
+  the worker before a separate Convex deployment does not break scan completion.
+  Raw JSON uploads directly to storage; completion receives only a storage ID,
+  avoiding Convex function-argument size and value-encoding limits.
+- Production workers install A.I.G and its complete Python dependency set from
+  the reviewed, hash-locked worker requirements file. Updating the scanner or a
+  dependency requires an explicit lock update; a mutable package-index artifact
+  must not enter a credentialed scan worker.
+- A.I.G 0.2.1 is affected by CVE-2026-84809 and cannot inspect packaged Python
+  bytecode. While that version remains pinned, both worker paths must reject
+  skill targets containing `.pyc`, `.pyo`, or `.pyd` files before invoking
+  A.I.G. ClawScan's static scanner independently flags packaged Python bytecode,
+  but that defense does not remove the worker-boundary rejection requirement.
 - In the external Codex security worker, package-release SkillSpector runs scan
   only normalized bundled-skill roots declared by the stored plugin manifest
   summary. The plugin package root is never a fallback SkillSpector target;
@@ -424,12 +566,18 @@ See also: [acceptable-usage.md](./acceptable-usage.md) for the marketplace polic
   result. This is not a prepublication-worker contract.
 - Current skill and plugin scans are queued through `securityScanJobs` and
   completed by the external Codex worker.
-- VirusTotal telemetry remains a separate Security audit signal and is not an
-  input to the production ClawScan profile or judge.
+- VirusTotal is not displayed in the UI: audit pages, the audit directory, version
+  scan badges, and pending-scan notices omit its results, links, and placeholders.
+  Stored telemetry and machine-readable audit exports remain available; it is
+  not an input to the production ClawScan profile or judge.
 - The worker's explicit artifact-only OSS ClawScan route accepts every claimed
   target kind and source through the same completion/failure contract. Skill
   versions and scan requests use the isolated `artifact` root; extracted
   ClawPack releases use `artifact/package`.
+- Both workers disambiguate directories containing `SKILL.md` and
+  `openclaw.plugin.json` by selecting the manifest matching the claimed target
+  kind. ClawScan still scans the full directory. Single-manifest directory
+  scans and the separate bundled-SkillSpector directory base remain unchanged.
 - OSS ClawScan is the only security-scan implementation. Every claimed target
   kind and source runs through the same ClawScan profile and completion/failure
   contract. ClawScan failures use the existing failure/retry lifecycle; there
@@ -469,15 +617,60 @@ See also: [acceptable-usage.md](./acceptable-usage.md) for the marketplace polic
   claimable immediately, but it must not demote that job from publish priority.
 - Bulk rescans stay lowest priority and use the bounded operator campaign flow,
   which enqueues one page at a time and waits for that page before continuing.
+- The plugin bulk rescan command scans only the latest active release of code/bundle
+  plugins, preserving existing active jobs and manual moderation decisions. It
+  skips deleted/revoked releases, uses stable creation-order catalog pagination,
+  and caps each transaction at 10 package rows to bound release hydration. Admin
+  identity comes from the authenticated API token, and applied batches are audited.
+  Dry runs create neither jobs nor batch audit entries. Existing scanner results
+  do not exclude a release; this supports scanner-version and AIG backfills.
 - ClawScan worker concurrency is an operator-controlled compute concern. The
   backend claim path must cap only a single worker claim size and must not impose
   a global active-scan ceiling; horizontal capacity is controlled by worker
   dispatch count, worker batch limit, provider quotas, and cost monitoring.
+- Local bulk campaigns may assign disjoint lists of existing job IDs to shared
+  worker shards. Assigned claims read only those IDs, accept only queued, due,
+  ungated `bulk-rescan` skill-version jobs, and use the normal lease, hydration,
+  scan and result paths. They must not fall back to the general queue when an
+  assignment is empty or stale, claim package jobs, or retry terminal failures.
+  Assigned shared workers use separate GitHub concurrency groups from ordinary
+  queue workers, so a slow general-queue wave cannot block local bulk assignments.
+  Each assigned shard still permits only one running and one pending worker.
+  The dedicated priority shard remains unassigned, retains its normal queue, and
+  uses the same reserved concurrency group for every dispatch mode. Drain assigned
+  workers and pending assigned dispatches before changing their group naming.
+  Assignment plans, admission baselines, receipts, cursor and capacity control
+  remain local; no server-side campaign coordinator or assignment table is added.
+  Admin batch status exposes queued identities from the same bounded point reads
+  as its counts, so completed jobs in partial batches cannot fill the local
+  assignment payload. This is an observation; claims still recheck eligibility.
+  The local planner may select nine or eighteen shared worker machines separately
+  from per-worker scan concurrency. Default queue dispatches retain nine shared
+  workers and one reserved priority worker. Changing pool size requires draining
+  the previous shared pool because stable hashing depends on pool size. A worker
+  must reject an assignment count that differs from its dispatched pool size
+  before claiming any shared job; priority work remains independent of that check.
+- Normal scan claims read only enough ready queue rows to fill the worker's
+  remaining capacity. Broader pagination is reserved for skipping blocked legacy
+  GitHub jobs or the catalog lane's bounded admission window; disabling a rollout
+  must not make every native one-job claim read hundreds of unrelated jobs.
 - The Skill Card verification envelope exposes ClawScan as the top-level
   `security` verdict for install automation, with deterministic and third-party
   scanner evidence grouped under `security.signals`. Clients should key install
   decisions off `ok`, `decision`, `reasons`, and `security.status` instead of
   re-deriving trust from individual signal payloads.
+- Skill Card completion owns a newly stored card until its attachment mutation succeeds. If attachment rejects a stale lease or unavailable version, delete only that new blob and preserve the original error if cleanup fails. Successful replacement retains prior card blobs and generated bundle fingerprints so existing installs remain resolvable.
+- Skill Card workers default to GPT-6 Sol with medium reasoning and the fast service
+  tier. Recipe-hash claims remain inactive until the separate activation after
+  [backend deployment](deploy.md). Once activated, the backend binds each lease before
+  generation to the source file hashes,
+  server evidence, and worker recipe (model, effort, tier, prompt, template, and
+  trusted NVIDIA generator bytes). A completed card is reused only when those
+  semantic inputs and the attached card SHA still match. Fresh scan timestamps and
+  storage URLs do not invalidate reuse. Completion rereads the same evidence in its
+  transaction: changed inputs requeue the job with a fresh attempt budget and delete
+  the unattached output. Reuse and deferred-input receipts count toward the existing
+  worker max-jobs bound and keep later batches discoverable.
 - Exact-version security verdict reads preserve the complete skill identity.
   Batch callers may qualify a request with the publisher handle; owner, slug,
   and version form the dedupe identity, and qualified success or failure results
@@ -527,8 +720,24 @@ See also: [acceptable-usage.md](./acceptable-usage.md) for the marketplace polic
   skill/package rescans for a chosen artifact, or paged all-active-latest skill
   rescan batches. The old suspicious LLM bucket tools (`all`, `llm-only`,
   `vt-only`, `both`) are retired.
+- Security workers back off and retry a transient claim API failure up to three
+  times before draining their existing leases. Every failed call remains in
+  claim-health counters, and the claim window/max-jobs limits still apply.
+  This does not retry terminal scan failures or change their job identities.
+  Authentication/validation failures do not enter this transient retry path.
+- Recoverable bulk skill requests use administrator-scoped request IDs. Their
+  job identities, cursor boundary and counters commit atomically in the permanent
+  batch audit entry. An identical replay returns that receipt before traversing
+  current skills, even after completion or permanent failure; it must not create
+  replacement jobs. Conflicting reuse fails. Optional ordered version baselines
+  reject page drift atomically. Legacy batches without receipt IDs require
+  read-only, fully paginated exact-version job reconciliation before admission.
 - Package/plugin scan backfills may recompute deterministic static scan results for older releases,
   but those results remain ClawScan context and are not public trust status.
+- `packages.backfillLatestPackageScanStatus` is an admin-only catalog maintenance entry point.
+  Anonymous callers and signed-in non-admins are rejected before any package, release, or
+  search-digest write. An admin call runs the internal paged mutation, which patches drifted
+  scan status and schedules the next batch until the catalog page is done.
 - ClawPack package releases materialize parsed npm-pack artifact entries into the release file
   surface. Static scan, LLM review, package inspect/file APIs, and Codex package ClawScan use those
   stored artifact entries instead of metadata-only `package.json` / `openclaw.plugin.json` rows.
@@ -648,3 +857,13 @@ See also: [acceptable-usage.md](./acceptable-usage.md) for the marketplace polic
   skills.
 - Word counting is language-aware (`Intl.Segmenter` with fallback), reducing
   false positives for non-space-separated languages.
+
+## Managed company MCP wrappers
+
+Admin-managed MCP packages use ordinary package releases as their authority. Both management UI and admin CLI require an active administrator and normal OpenClaw organization publishing access, including definition reads and unpublication. They cannot replace unrelated package identities. Each edit creates a new immutable version; unpublication uses the existing package policy and checks current administrator, publisher, and membership authority in the same transaction as soft deletion. Finalizing a queued managed release rechecks the submitting administrator, the active OpenClaw publisher, and current publishing membership in the same transaction that makes the release public. Revocation while scans run must leave the release unavailable.
+
+Generated wrappers accept only remote public HTTPS HTTP/SSE connections, current categories, credential placeholders, and PNG icons with attribution and explicit rights metadata. Wrapper code remains MIT-licensed; company artwork can have separate terms and must not inherit that license. Non-MIT icons require public HTTPS source and terms URLs, and the publishing operator must verify permission to redistribute the asset. Recording those URLs does not itself grant permission. They contain no arbitrary local commands or fetched provider code. OpenClaw wrapper authorship is distinct from remote-service ownership.
+
+Managed publication always enters the ordinary staged security pipeline. Neither admin authorship nor the `@openclaw` namespace grants trusted-package scan exemption; subsequent ordinary submissions retaining the managed definition marker also remain subject to checks. A successful package scan says nothing about the remote service's current or future tools.
+
+Public MCP inspection resolves a server from an accessible immutable release, never a caller-supplied URL. It pins public DNS destinations, rejects private addresses and credential-bearing URLs, never follows redirects, limits bytes and time, and uses an endpoint rate limit. It does not authenticate, register OAuth clients, follow legacy SSE session endpoints, or execute tools. OAuth authoring checks inspect public discovery metadata; they do not imply completed account testing.

@@ -1,7 +1,7 @@
 /* @vitest-environment node */
 
 import { spawn, spawnSync } from "node:child_process";
-import { mkdir, mkdtemp, readFile, rename, rm, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, readdir, rename, rm, writeFile } from "node:fs/promises";
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from "node:http";
 import type { AddressInfo } from "node:net";
 import { tmpdir } from "node:os";
@@ -112,7 +112,7 @@ function writeJson(response: ServerResponse, status: number, body: unknown) {
   response.end(JSON.stringify(body));
 }
 
-async function startLocalRegistry() {
+async function startLocalRegistry(catalogItems?: unknown[]) {
   const requests: RecordedRequest[] = [];
   const skillZip = zipSync({
     "SKILL.md": strToU8("# Demo\n\nA local registry fixture.\n"),
@@ -128,6 +128,11 @@ async function startLocalRegistry() {
     };
     if (bodyText) recorded.body = JSON.parse(bodyText) as unknown;
     requests.push(recorded);
+
+    if (request.method === "GET" && url.pathname === "/api/v1/skills" && catalogItems) {
+      writeJson(response, 200, { items: catalogItems, nextCursor: null });
+      return;
+    }
 
     if (request.method === "GET" && url.pathname === "/api/v1/whoami") {
       writeJson(response, 200, {
@@ -244,6 +249,47 @@ async function writeConfigWithToken(root: string, registry: string) {
 }
 
 describe("built CLI artifact", () => {
+  it("explores same-slug owners, null versions, and an older custom registry", async () => {
+    const item = {
+      slug: "shared-fixture",
+      displayName: "Fixture skill",
+      summary: null,
+      tags: {},
+      stats: {},
+      createdAt: 1,
+      updatedAt: 2,
+    };
+    const current = await startLocalRegistry([
+      {
+        ...item,
+        ownerHandle: "fixture-owner-a",
+        latestVersion: { version: "1.2.3+fixture.01", createdAt: 3, changelog: "Fixture" },
+      },
+      { ...item, ownerHandle: "fixture-owner-b", latestVersion: null },
+    ]);
+    const currentResult = await runNodeAsync([
+      binPath,
+      "--registry",
+      current.registry,
+      "--no-input",
+      "explore",
+    ]);
+    expect(currentResult.status).toBe(0);
+    expect(currentResult.stdout).toContain("fixture-owner-a/shared-fixture  v1.2.3+fixture.01");
+    expect(currentResult.stdout).toContain("fixture-owner-b/shared-fixture  v?");
+
+    const legacy = await startLocalRegistry([item]);
+    const legacyResult = await runNodeAsync([
+      binPath,
+      "--registry",
+      legacy.registry,
+      "--no-input",
+      "explore",
+    ]);
+    expect(legacyResult.status).toBe(0);
+    expect(legacyResult.stdout).toContain("shared-fixture  v?");
+  });
+
   it("resolves the package version from a flattened CLI artifact", async () => {
     const publishedRoot = await makeTmpDir("clawhub-artifact-version-");
     const flatDistDir = join(publishedRoot, "dist");
@@ -347,6 +393,21 @@ describe("built CLI artifact", () => {
     expect(result.status).toBe(0);
     expect(result.stderr).toBe("");
     expect(result.stdout).toContain("ClawHub CLI");
+    expect(result.stdout.replace(/\s+/g, " ")).toContain(
+      "registry discovery and device verification",
+    );
+  });
+
+  it.each([["login"], ["auth", "login"]])("describes device approval in %s help", (...command) => {
+    const result = runNode([binPath, ...command, "--help"]);
+    const help = result.stdout.replace(/\s+/g, " ");
+
+    expect(result.status).toBe(0);
+    expect(result.stderr).toBe("");
+    expect(help).toContain("Log in with device flow or store a token");
+    expect(help).toContain("Use device flow (default)");
+    expect(help).toContain("verification URL");
+    expect(help).not.toMatch(/opens browser|requires --token/);
   });
 
   it("reports a controlled error when the built CLI module is missing", async () => {
@@ -605,6 +666,60 @@ describe("built CLI artifact", () => {
       "/api/v1/download?slug=demo&version=1.0.0",
       "/api/cli/telemetry/install",
     ]);
+  });
+
+  it("keeps a completed force install when backup cleanup fails", async () => {
+    const { registry } = await startLocalRegistry();
+    const workdir = await makeTmpDir("clawhub-artifact-force-");
+    const configPath = await writeConfigWithToken(workdir, registry);
+    const skillsDir = join(workdir, "skills");
+    const target = join(skillsDir, "demo");
+    await mkdir(target, { recursive: true });
+    await writeFile(join(target, "SKILL.md"), "# Previous version\n");
+    const faultModule = join(workdir, "backup-cleanup-fault.mjs");
+    await writeFile(
+      faultModule,
+      `import fs from "node:fs/promises";
+import { basename } from "node:path";
+import { syncBuiltinESMExports } from "node:module";
+const remove = fs.rm;
+fs.rm = async (path, options) => {
+  if (basename(String(path)).startsWith(".demo.backup-")) {
+    process.stderr.write("Injected EBUSY during backup cleanup\\n");
+    throw Object.assign(new Error("Backup is busy"), { code: "EBUSY" });
+  }
+  return remove(path, options);
+};
+syncBuiltinESMExports();
+`,
+    );
+
+    const result = await runNodeAsync(
+      [
+        "--import",
+        pathToFileURL(faultModule).href,
+        binPath,
+        "--workdir",
+        workdir,
+        "--registry",
+        registry,
+        "install",
+        "demo",
+        "--force",
+      ],
+      { CLAWHUB_CONFIG_PATH: configPath },
+    );
+
+    expect(result.stderr).toContain("Injected EBUSY during backup cleanup");
+    expect(result.status, result.stderr).toBe(0);
+    expect(await readFile(join(target, "SKILL.md"), "utf8")).toContain("A local registry fixture.");
+    const lock = JSON.parse(await readFile(join(workdir, ".clawhub", "lock.json"), "utf8"));
+    expect(lock.skills.demo.version).toBe("1.0.0");
+    const backups = (await readdir(skillsDir)).filter((name) => name.startsWith(".demo.backup-"));
+    expect(backups).toHaveLength(1);
+    expect(await readFile(join(skillsDir, backups[0]!, "SKILL.md"), "utf8")).toBe(
+      "# Previous version\n",
+    );
   });
 
   it("keeps the built dist free of compiled test files", async () => {

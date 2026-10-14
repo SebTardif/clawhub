@@ -42,6 +42,19 @@ describe("securityScanDispatch", () => {
     vi.unstubAllEnvs();
   });
 
+  it("marks staging scan events for the branch relay", async () => {
+    vi.stubEnv("CLAWHUB_ENV", "staging");
+    const fetchImpl = vi.fn<typeof fetch>(async () => new Response(null, { status: 204 }));
+    await dispatchSecurityScanWorkflow(
+      { token: "installation-token", permissions: { contents: "write" } },
+      fetchImpl,
+    );
+    expect(JSON.parse(fetchImpl.mock.calls[0]?.[1]?.body as string)).toMatchObject({
+      event_type: "clawhub-security-scan",
+      client_payload: { environment: "staging" },
+    });
+  });
+
   it("schedules an immediate worker dispatch for claimable queue work", async () => {
     vi.useFakeTimers();
     vi.setSystemTime(1_000_000);
@@ -104,62 +117,70 @@ describe("securityScanDispatch", () => {
     );
   });
 
-  it("coalesces simultaneous queue requests behind the existing scheduled dispatch", async () => {
-    vi.useFakeTimers();
-    vi.setSystemTime(1_000_000);
-    vi.stubEnv("SECURITY_SCAN_EVENT_DISPATCH_ENABLED", "1");
-    vi.stubEnv("GITHUB_APP_ID", "configured");
-    vi.stubEnv("GITHUB_APP_INSTALLATION_ID", "configured");
-    vi.stubEnv("GITHUB_APP_PRIVATE_KEY", "configured");
+  it.each([
+    { scheduledAt: 1_000_000, leaseExpiresAt: undefined },
+    { scheduledAt: 1_300_000, leaseExpiresAt: 1_300_000 },
+  ])(
+    "coalesces requests without reading the queue when dispatch is covered: %j",
+    async ({ scheduledAt, leaseExpiresAt }) => {
+      vi.useFakeTimers();
+      vi.setSystemTime(1_000_000);
+      vi.stubEnv("SECURITY_SCAN_EVENT_DISPATCH_ENABLED", "1");
+      vi.stubEnv("GITHUB_APP_ID", "configured");
+      vi.stubEnv("GITHUB_APP_INSTALLATION_ID", "configured");
+      vi.stubEnv("GITHUB_APP_PRIVATE_KEY", "configured");
 
-    const runAt = vi.fn();
-    const query = vi.fn((table: string) => {
-      if (table === "securityScanJobs") {
+      const runAt = vi.fn();
+      const query = vi.fn((table: string) => {
+        if (table === "securityScanJobs") {
+          return {
+            withIndex: vi.fn(() => ({
+              order: vi.fn(() => ({
+                first: vi.fn(async () => ({
+                  _id: "securityScanJobs:1",
+                  status: "queued",
+                  nextRunAt: 900_000,
+                })),
+              })),
+            })),
+          };
+        }
         return {
           withIndex: vi.fn(() => ({
-            order: vi.fn(() => ({
-              first: vi.fn(async () => ({
-                _id: "securityScanJobs:1",
-                status: "queued",
-                nextRunAt: 900_000,
-              })),
+            unique: vi.fn(async () => ({
+              _id: "securityScanDispatchState:1",
+              key: "codex-worker",
+              scheduledToken: "existing-token",
+              scheduledAt,
+              leaseExpiresAt,
+              updatedAt: 999_000,
             })),
           })),
         };
-      }
-      return {
-        withIndex: vi.fn(() => ({
-          unique: vi.fn(async () => ({
-            _id: "securityScanDispatchState:1",
-            key: "codex-worker",
-            scheduledToken: "existing-token",
-            scheduledAt: 1_000_000,
-            updatedAt: 999_000,
-          })),
-        })),
-      };
-    });
+      });
 
-    const result = await requestSecurityScanDispatchInternalHandler(
-      {
-        db: {
-          get: vi.fn(),
-          insert: vi.fn(),
-          patch: vi.fn(),
-          query,
-          replace: vi.fn(),
-          delete: vi.fn(),
-          normalizeId: vi.fn(),
-          system: {},
+      const result = await requestSecurityScanDispatchInternalHandler(
+        {
+          db: {
+            get: vi.fn(),
+            insert: vi.fn(),
+            patch: vi.fn(),
+            query,
+            replace: vi.fn(),
+            delete: vi.fn(),
+            normalizeId: vi.fn(),
+            system: {},
+          },
+          scheduler: { runAt },
         },
-        scheduler: { runAt },
-      },
-      {},
-    );
+        {},
+      );
 
-    expect(result).toEqual({ scheduled: false, scheduledAt: 1_000_000 });
-    expect(runAt).not.toHaveBeenCalled();
-  });
+      expect(result).toEqual({ scheduled: false, scheduledAt });
+      expect(runAt).not.toHaveBeenCalled();
+      expect(query).not.toHaveBeenCalledWith("securityScanJobs");
+    },
+  );
 
   it("defers the next drain wave until the active dispatch lease expires", async () => {
     vi.useFakeTimers();
@@ -222,6 +243,70 @@ describe("securityScanDispatch", () => {
     expect(patch).toHaveBeenCalledWith(
       "securityScanDispatchState:1",
       expect.objectContaining({ scheduledAt: 1_300_000 }),
+    );
+  });
+
+  it("brings a future dispatch forward for newly claimable work", async () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(1_000_000);
+    vi.stubEnv("SECURITY_SCAN_EVENT_DISPATCH_ENABLED", "1");
+    vi.stubEnv("GITHUB_APP_ID", "configured");
+    vi.stubEnv("GITHUB_APP_INSTALLATION_ID", "configured");
+    vi.stubEnv("GITHUB_APP_PRIVATE_KEY", "configured");
+
+    const patch = vi.fn();
+    const runAt = vi.fn(async () => "_scheduled_functions:next");
+    const query = vi.fn((table: string) => {
+      if (table === "securityScanJobs") {
+        return {
+          withIndex: vi.fn(() => ({
+            order: vi.fn(() => ({
+              first: vi.fn(async () => ({
+                _id: "securityScanJobs:2",
+                status: "queued",
+                nextRunAt: 900_000,
+              })),
+            })),
+          })),
+        };
+      }
+      return {
+        withIndex: vi.fn(() => ({
+          unique: vi.fn(async () => ({
+            _id: "securityScanDispatchState:1",
+            key: "codex-worker",
+            scheduledToken: "future-dispatch",
+            scheduledAt: 1_300_000,
+            updatedAt: 999_000,
+          })),
+        })),
+      };
+    });
+
+    const result = await requestSecurityScanDispatchInternalHandler(
+      {
+        db: {
+          get: vi.fn(),
+          insert: vi.fn(),
+          patch,
+          query,
+          replace: vi.fn(),
+          delete: vi.fn(),
+          normalizeId: vi.fn(),
+          system: {},
+        },
+        scheduler: { runAt },
+      },
+      {},
+    );
+
+    expect(result).toEqual({ scheduled: true, scheduledAt: 1_000_000 });
+    expect(runAt).toHaveBeenCalledWith(1_000_000, expect.anything(), {
+      scheduleToken: expect.any(String),
+    });
+    expect(patch).toHaveBeenCalledWith(
+      "securityScanDispatchState:1",
+      expect.objectContaining({ scheduledAt: 1_000_000 }),
     );
   });
 
@@ -383,7 +468,7 @@ describe("securityScanDispatch", () => {
   });
 
   it("dispatches the production workflow through a narrowly typed repository event", async () => {
-    const fetchImpl = vi.fn(async () => new Response(null, { status: 204 }));
+    const fetchImpl = vi.fn<typeof fetch>(async () => new Response(null, { status: 204 }));
 
     await expect(
       dispatchSecurityScanWorkflow(

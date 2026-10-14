@@ -7,6 +7,8 @@ export * from "./experimentalClawFeed.js";
 export * from "./catalogMetadata.js";
 export * from "./docsLinks.js";
 export * from "./license.js";
+export * from "./managedMcp.js";
+export * from "./featuredSelections.js";
 export * from "./openclawContract.js";
 export * from "./openClawExtensionSlugs.js";
 export * from "./packages.js";

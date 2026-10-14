@@ -7,6 +7,20 @@ import {
   canonicalTrendingSourceRefValidator,
 } from "./lib/canonicalTrending";
 import { EMBEDDING_DIMENSIONS } from "./lib/embeddings";
+import { endorAnalysisValidator } from "./lib/endorAnalysis";
+import { editorialSelection, featuredPublication } from "./lib/featuredSelections";
+import {
+  pluginCategoryClassificationValidator,
+  pluginCategoryReviewValidator,
+} from "./lib/pluginCategoryClassificationContract";
+import { searchDigestValidator } from "./lib/searchDigestContract";
+import {
+  searchArtifactKind,
+  searchClassification,
+  searchInsightSource,
+  searchScope,
+} from "./lib/searchInsights";
+import { reportRequest } from "./lib/searchReportContract";
 
 const PLATFORM_SKILL_LICENSE = "MIT-0" as const;
 
@@ -57,6 +71,28 @@ const skillSpectorAnalysisValidator = v.object({
   issueCount: v.number(),
   // Scanner/action boundaries cap this array before storage; Convex validators cannot express max length.
   issues: v.array(skillSpectorIssueValidator),
+  scannerVersion: v.optional(v.string()),
+  summary: v.optional(v.string()),
+  error: v.optional(v.string()),
+  checkedAt: v.number(),
+});
+
+const aigAnalysisValidator = v.object({
+  status: v.string(),
+  issueCount: v.number(),
+  findings: v.array(
+    v.object({
+      ruleId: v.string(),
+      level: v.string(),
+      message: v.string(),
+      title: v.optional(v.string()),
+      description: v.optional(v.string()),
+      file: v.optional(v.string()),
+      startLine: v.optional(v.number()),
+      endLine: v.optional(v.number()),
+      remediation: v.optional(v.string()),
+    }),
+  ),
   scannerVersion: v.optional(v.string()),
   summary: v.optional(v.string()),
   error: v.optional(v.string()),
@@ -116,7 +152,7 @@ const llmRiskSummaryBucketValidator = v.object({
   highestSeverity: v.optional(v.string()),
 });
 
-const llmAnalysisValidator = v.object({
+export const llmAnalysisValidator = v.object({
   status: v.string(),
   verdict: v.optional(v.string()),
   confidence: v.optional(v.string()),
@@ -582,6 +618,7 @@ const githubSkillScans = defineTable({
   status: githubSkillScanStatusValidator,
   skillScanRequestId: v.optional(v.id("skillScanRequests")),
   staticScan: v.optional(staticScanValidator),
+  aigAnalysis: v.optional(aigAnalysisValidator),
   skillSpectorAnalysis: v.optional(skillSpectorAnalysisValidator),
   llmAnalysis: v.optional(llmAnalysisValidator),
   lastError: v.optional(v.string()),
@@ -682,8 +719,12 @@ const packageCompatibilityValidator = v.optional(
   }),
 );
 
-const pluginManifestSummaryValidator = v.object({
+export const pluginManifestSummaryValidator = v.object({
   schemaVersion: v.literal(1),
+  contracts: v.optional(v.record(v.string(), v.array(v.string()))),
+  providers: v.optional(v.array(v.string())),
+  channels: v.optional(v.array(v.string())),
+  categories: v.optional(v.array(v.string())),
   icon: v.optional(v.string()),
   compatibility: v.optional(
     v.object({
@@ -712,6 +753,14 @@ const pluginManifestSummaryValidator = v.object({
   mcpServers: v.array(
     v.object({
       name: v.string(),
+      url: v.optional(v.string()),
+      transport: v.optional(
+        v.union(v.literal("streamable-http"), v.literal("sse"), v.literal("stdio")),
+      ),
+      auth: v.optional(v.union(v.literal("oauth"), v.literal("api-key"), v.literal("none"))),
+      scope: v.optional(v.string()),
+      setup: v.optional(v.string()),
+      endpointRedacted: v.optional(v.boolean()),
     }),
   ),
   bundledSkills: v.array(
@@ -1151,6 +1200,7 @@ const skillVersions = defineTable({
       contentType: v.optional(v.string()),
     }),
   ),
+  skillCardGeneration: v.optional(v.object({ inputHash: v.string(), cardSha256: v.string() })),
   parsed: v.object({
     frontmatter: v.record(v.string(), v.any()),
     metadata: v.optional(v.any()),
@@ -1194,7 +1244,9 @@ const skillVersions = defineTable({
     }),
   ),
   sha256hash: v.optional(v.string()),
+  scannerReportsStorageId: v.optional(v.id("_storage")),
   vtAnalysis: v.optional(vtAnalysisValidator),
+  aigAnalysis: v.optional(aigAnalysisValidator),
   skillSpectorAnalysis: v.optional(skillSpectorAnalysisValidator),
   llmAnalysis: v.optional(
     v.object({
@@ -1376,6 +1428,26 @@ const skillBadges = defineTable({
   .index("by_skill", ["skillId"])
   .index("by_skill_kind", ["skillId", "kind"])
   .index("by_kind_at", ["kind", "at"]);
+
+// Two bounded catalog records; reservations are editable product data.
+const featuredSelections = defineTable({
+  artifactKind: searchArtifactKind,
+  revision: v.number(),
+  editorial: v.array(editorialSelection),
+  // Staff selections only; the mirror continues to own visibility and source identity.
+  externalSkills: v.optional(
+    v.array(
+      v.object({
+        externalId: v.string(),
+        at: v.number(),
+        byUserId: v.id("users"),
+      }),
+    ),
+  ),
+  published: v.optional(featuredPublication),
+  updatedAt: v.number(),
+  updatedBy: v.id("users"),
+}).index("by_artifact_kind", ["artifactKind"]);
 
 const packageBadges = defineTable({
   packageId: v.id("packages"),
@@ -1859,6 +1931,7 @@ const packageReleases = defineTable({
   normalizedBundleManifest: v.optional(v.any()),
   manifestSearchTerms: v.optional(v.array(v.string())),
   pluginManifestSummary: v.optional(pluginManifestSummaryValidator),
+  categoryClassification: v.optional(pluginCategoryClassificationValidator),
   clawManifestSummary: v.optional(clawManifestSummaryValidator),
   compatibility: packageCompatibilityValidator,
   runtimeId: v.optional(v.string()),
@@ -1867,37 +1940,10 @@ const packageReleases = defineTable({
   // Deprecated compatibility hash for exact /download ZIP bytes; use artifact.sha256 for installs.
   sha256hash: v.optional(v.string()),
   vtAnalysis: v.optional(vtAnalysisValidator),
+  aigAnalysis: v.optional(aigAnalysisValidator),
   skillSpectorAnalysis: v.optional(skillSpectorAnalysisValidator),
-  llmAnalysis: v.optional(
-    v.object({
-      status: v.string(),
-      verdict: v.optional(v.string()),
-      confidence: v.optional(v.string()),
-      summary: v.optional(v.string()),
-      dimensions: v.optional(
-        v.array(
-          v.object({
-            name: v.string(),
-            label: v.string(),
-            rating: v.string(),
-            detail: v.string(),
-          }),
-        ),
-      ),
-      guidance: v.optional(v.string()),
-      findings: v.optional(v.string()),
-      agenticRiskFindings: v.optional(v.array(llmAgenticRiskFindingValidator)),
-      riskSummary: v.optional(
-        v.object({
-          abnormal_behavior_control: llmRiskSummaryBucketValidator,
-          permission_boundary: llmRiskSummaryBucketValidator,
-          sensitive_data_protection: llmRiskSummaryBucketValidator,
-        }),
-      ),
-      model: v.optional(v.string()),
-      checkedAt: v.number(),
-    }),
-  ),
+  endorAnalysis: v.optional(endorAnalysisValidator),
+  llmAnalysis: v.optional(llmAnalysisValidator),
   staticScan: v.optional(
     v.object({
       status: v.union(v.literal("clean"), v.literal("suspicious"), v.literal("malicious")),
@@ -1932,6 +1978,40 @@ const packageReleases = defineTable({
   .index("by_active_created", ["softDeletedAt", "createdAt"])
   .index("by_package_version", ["packageId", "version"])
   .index("by_sha256hash", ["sha256hash"]);
+
+// Retained as review/apply history: regenerating a preview never erases an accepted decision.
+const pluginCategoryRefreshes = defineTable({
+  runId: v.string(),
+  packageId: v.id("packages"),
+  releaseId: v.id("packageReleases"),
+  packageName: v.string(),
+  version: v.string(),
+  beforeHash: v.string(),
+  beforeCategories: v.optional(v.array(v.string())),
+  beforeReleaseCategories: v.optional(v.array(v.string())),
+  beforeHadSummary: v.boolean(),
+  newReleaseSummary: v.optional(pluginManifestSummaryValidator),
+  beforeClassification: v.optional(pluginCategoryClassificationValidator),
+  review: v.optional(pluginCategoryReviewValidator),
+  categories: v.array(v.string()),
+  classification: pluginCategoryClassificationValidator,
+  status: v.union(
+    v.literal("preview"),
+    v.literal("accepted"),
+    v.literal("applied"),
+    v.literal("stale"),
+    v.literal("rolled-back"),
+  ),
+  createdAt: v.number(),
+  acceptedAt: v.optional(v.number()),
+  appliedAt: v.optional(v.number()),
+  afterHash: v.optional(v.string()),
+  rolledBackAt: v.optional(v.number()),
+  reason: v.optional(v.string()),
+})
+  .index("by_run_package", ["runId", "packageId"])
+  .index("by_run", ["runId"])
+  .index("by_status", ["status"]);
 
 const catalogClassificationResults = defineTable({
   targetKind: v.union(v.literal("skill"), v.literal("plugin")),
@@ -2206,6 +2286,7 @@ const skillScanRequests = defineTable({
   ),
   sha256hash: v.optional(v.string()),
   vtAnalysis: v.optional(vtAnalysisValidator),
+  aigAnalysis: v.optional(aigAnalysisValidator),
   skillSpectorAnalysis: v.optional(skillSpectorAnalysisValidator),
   llmAnalysis: v.optional(llmAnalysisValidator),
   staticScan: v.optional(staticScanValidator),
@@ -2236,15 +2317,19 @@ const skillCardGenerationJobs = defineTable({
   priority: v.number(),
   nextRunAt: v.number(),
   attempts: v.number(),
+  claimSlot: v.optional(v.number()),
   leaseToken: v.optional(v.string()),
   leaseExpiresAt: v.optional(v.number()),
   workerId: v.optional(v.string()),
+  generationHash: v.optional(v.string()),
+  inputHash: v.optional(v.string()),
   lastError: v.optional(v.string()),
   runId: v.optional(v.string()),
   completedAt: v.optional(v.number()),
   createdAt: v.number(),
   updatedAt: v.number(),
 })
+  .index("by_status_and_claim_slot", ["status", "claimSlot"])
   .index("by_status_and_next_run_at", ["status", "nextRunAt"])
   .index("by_status_and_lease_expires_at", ["status", "leaseExpiresAt"])
   .index("by_skill", ["skillId"])
@@ -2258,7 +2343,20 @@ const packageStatEvents = defineTable({
   processedAt: v.optional(v.number()),
 })
   .index("by_unprocessed", ["processedAt"])
+  .index("by_occurred_at", ["occurredAt"])
   .index("by_package", ["packageId"]);
+
+const pluginSearchObservations = defineTable({
+  normalizedQuery: v.string(),
+  observedAt: v.number(),
+  source: v.union(v.literal("clawhub-web"), v.literal("openclaw-control-ui")),
+  artifactKind: v.union(v.literal("plugin"), v.literal("skill")),
+  scope: v.optional(v.union(v.literal("catalog"), v.literal("shelf"))),
+  category: v.optional(v.string()),
+  topic: v.optional(v.string()),
+  resultCount: v.number(),
+  officialResultCount: v.number(),
+}).index("by_observed_at", ["observedAt"]);
 
 const packageDailyStats = defineTable({
   packageId: v.id("packages"),
@@ -2278,6 +2376,8 @@ const packageLeaderboards = defineTable({
   generatedAt: v.number(),
   rangeStartDay: v.number(),
   rangeEndDay: v.number(),
+  rangeStartAt: v.optional(v.number()),
+  rangeEndAt: v.optional(v.number()),
   items: v.array(
     v.object({
       packageId: v.id("packages"),
@@ -2587,6 +2687,12 @@ const packagePluginCategorySearchDigest = defineTable({
   updatedAt: v.number(),
 })
   .index("by_package", ["packageId", "pluginCategory"])
+  .index("by_active_category_downloads_name", [
+    "softDeletedAt",
+    "pluginCategory",
+    "stats.downloads",
+    "name",
+  ])
   .index("by_active_category_updated", ["softDeletedAt", "pluginCategory", "updatedAt"])
   .index("by_active_category_downloads", [
     "softDeletedAt",
@@ -3135,6 +3241,9 @@ const catalogFeedPublications = defineTable({
   payload: v.string(),
   payloadSha256: v.string(),
   publishedAt: v.number(),
+  clawPolicyVersion: v.optional(v.literal(1)),
+  clawEntryCount: v.optional(v.number()),
+  clawPublisherId: v.optional(v.id("publishers")),
 }).index("by_feed", ["feedId"]);
 
 const stars = defineTable({
@@ -4447,7 +4556,127 @@ const skillOwnershipTransfers = defineTable({
   .index("by_from_user_status", ["fromUserId", "status"])
   .index("by_skill_status", ["skillId", "status"]);
 
+const searchAggregateStates = defineTable({
+  key: v.literal("plugin"),
+  cursor: v.union(v.string(), v.null()),
+  processedThrough: v.number(),
+  revision: v.number(),
+  coverageStart: v.number(),
+  skillCoverageStart: v.optional(v.number()),
+  coverageGapStart: v.optional(v.number()),
+  coverageGapEnd: v.optional(v.number()),
+}).index("by_key", ["key"]);
+const searchDailyAggregates = defineTable({
+  dayStart: v.number(),
+  query: v.string(),
+  source: searchInsightSource,
+  artifactKind: searchArtifactKind,
+  scope: v.optional(searchScope),
+  category: v.string(),
+  intent: v.string(),
+  searches: v.number(),
+  officialGaps: v.number(),
+  zeroResults: v.number(),
+  expirationTime: v.number(),
+})
+  .index("by_dayStart_and_source_and_query_and_category_and_intent", [
+    "dayStart",
+    "source",
+    "query",
+    "category",
+    "intent",
+  ])
+  .index("by_artifact_day", ["artifactKind", "dayStart"])
+  .index("by_artifact_source_day", ["artifactKind", "source", "dayStart"])
+  .index("by_bucket", [
+    "artifactKind",
+    "scope",
+    "dayStart",
+    "source",
+    "query",
+    "category",
+    "intent",
+  ])
+  .index("by_expirationTime", ["expirationTime"]);
+const searchClassificationRuns = defineTable({
+  artifactKind: v.optional(searchArtifactKind),
+  weekStart: v.number(),
+  weekEnd: v.number(),
+  processedAt: v.number(),
+  status: v.union(v.literal("available"), v.literal("unavailable")),
+  expectedQualified: v.number(),
+  classifiedCount: v.number(),
+  truncated: v.optional(v.boolean()),
+  model: v.string(),
+  modelVersion: v.string(),
+  failureCode: v.optional(v.string()),
+  expirationTime: v.number(),
+})
+  .index("by_weekEnd", ["weekEnd"])
+  .index("by_expirationTime", ["expirationTime"]);
+const searchWeeklyClassifications = defineTable(
+  searchClassification.extend({ expirationTime: v.number() }),
+)
+  .index("by_query_and_weekEnd", ["query", "weekEnd"])
+  .index("by_weekEnd", ["weekEnd"])
+  .index("by_expirationTime", ["expirationTime"]);
+const searchWeeklyDigests = defineTable({
+  weekEnd: v.number(),
+  status: v.union(
+    v.literal("claimed"),
+    v.literal("sent"),
+    v.literal("failed"),
+    v.literal("exhausted"),
+  ),
+  attempts: v.number(),
+  claimedUntil: v.number(),
+  nextAttemptAt: v.number(),
+  sentAt: v.optional(v.number()),
+  failureCode: v.optional(v.string()),
+  expirationTime: v.number(),
+  payload: v.optional(searchDigestValidator),
+})
+  .index("by_weekEnd", ["weekEnd"])
+  .index("by_status_and_nextAttemptAt", ["status", "nextAttemptAt"])
+  .index("by_expiration_time", ["expirationTime"]);
+
+const searchReportRuns = defineTable({
+  request: reportRequest,
+  requestKey: v.string(),
+  sourceRevision: v.string(),
+  reportVersion: v.union(v.literal("search-report-v1"), v.literal("search-report-v2")),
+  refreshOf: v.optional(v.id("searchReportRuns")),
+  workId: v.optional(v.string()),
+  requestedAt: v.number(),
+  expirationTime: v.number(),
+  completedAt: v.optional(v.number()),
+  previousAttempts: v.optional(v.number()),
+  state: v.union(v.literal("pending"), v.literal("ready"), v.literal("failed")),
+  failureCode: v.optional(v.string()),
+  chunkCount: v.optional(v.number()),
+  resultBytes: v.optional(v.number()),
+  resultHash: v.optional(v.string()),
+})
+  .index("by_requestKey", ["requestKey"])
+  .index("by_refreshOf", ["refreshOf"])
+  .index("by_expirationTime", ["expirationTime"]);
+const searchReportChunks = defineTable({
+  reportId: v.id("searchReportRuns"),
+  index: v.number(),
+  bytes: v.bytes(),
+  expirationTime: v.number(),
+})
+  .index("by_reportId_index", ["reportId", "index"])
+  .index("by_expirationTime", ["expirationTime"]);
+
 export default defineSchema({
+  searchReportRuns,
+  searchReportChunks,
+  searchAggregateStates,
+  searchDailyAggregates,
+  searchWeeklyClassifications,
+  searchClassificationRuns,
+  searchWeeklyDigests,
   ...authTables,
   authSessions,
   authRefreshTokens,
@@ -4468,6 +4697,7 @@ export default defineSchema({
   packages,
   packageReleases,
   catalogClassificationResults,
+  pluginCategoryRefreshes,
   packageInspectorWarnings,
   packageInspectorFindingNotifications,
   packageInspectorScanCursors,
@@ -4479,12 +4709,14 @@ export default defineSchema({
   skillScanRequestFileChunks,
   skillCardGenerationJobs,
   packageStatEvents,
+  pluginSearchObservations,
   packageDailyStats,
   packageLeaderboards,
   packageTrustedPublishers,
   packagePublishTokens,
   packagePublishUploadTickets,
   packageBadges,
+  featuredSelections,
   packageSearchDigest,
   packageTopicSearchDigest,
   packagePluginCategorySearchDigest,

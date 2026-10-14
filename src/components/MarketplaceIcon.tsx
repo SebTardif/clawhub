@@ -7,6 +7,7 @@ type MarketplaceIconProps = {
   kind: MarketplaceIconKind;
   label: string;
   imageUrl?: string | null;
+  publisherImageUrl?: string | null;
   categorySlug?: string | null;
   skill?: {
     categories?: readonly string[] | null;
@@ -20,6 +21,11 @@ type MarketplaceIconProps = {
   size?: "xs" | "sm" | "md";
   tone?: "default" | "muted";
 };
+
+// Match the artwork, not the publisher: bundled plugins can use their own logos.
+// Content addressing also prevents double-padding a future, already-inset replacement.
+const OPENCLAW_PLUGIN_ICON =
+  "/api/v1/skill-icons/79e24bf179e94e005912591a67ecdf30f04df50204ff5fa5fed06a8e8eb88532";
 
 const TONES = [
   { accent: "oklch(0.63 0.16 42)", wash: "oklch(0.95 0.04 42)" },
@@ -38,6 +44,7 @@ export function MarketplaceIcon({
   kind,
   label,
   imageUrl,
+  publisherImageUrl,
   categorySlug,
   skill,
   size = "sm",
@@ -46,7 +53,7 @@ export function MarketplaceIcon({
   const [failedImageUrl, setFailedImageUrl] = useState<string | null>(null);
   useEffect(() => {
     setFailedImageUrl(null);
-  }, [imageUrl]);
+  }, [imageUrl, publisherImageUrl]);
 
   const skillCategory = kind === "skill" && skill ? getSkillIconCategoryForSkill(skill) : null;
   const pluginCategory = kind === "plugin" ? getPluginCategoryBySlug(categorySlug) : null;
@@ -57,8 +64,13 @@ export function MarketplaceIcon({
         ? (getCategoryIconComponent(pluginCategory.icon) ?? MARKETPLACE_KIND_ICONS.plugin)
         : MARKETPLACE_KIND_ICONS[kind];
   const hashedTone = hashTone(label);
+  // Legacy remote manifest URLs are not bundled icons; publisher profiles are a separate source.
   const supportedImageUrl =
-    kind !== "skill" || isHostedSkillPresentationIcon(imageUrl) ? imageUrl : null;
+    (kind !== "skill" && kind !== "plugin") || isHostedSkillPresentationIcon(imageUrl)
+      ? imageUrl
+      : kind === "plugin"
+        ? publisherImageUrl
+        : null;
   const visibleImageUrl =
     supportedImageUrl && failedImageUrl !== supportedImageUrl ? supportedImageUrl : null;
 
@@ -66,7 +78,11 @@ export function MarketplaceIcon({
     <span
       className={`marketplace-icon marketplace-icon-${kind} marketplace-icon-${size}${
         tone === "muted" ? " marketplace-icon-muted" : ""
-      }${visibleImageUrl ? " marketplace-icon-image-backed" : ""}`}
+      }${visibleImageUrl ? " marketplace-icon-image-backed" : ""}${
+        kind === "plugin" && visibleImageUrl === OPENCLAW_PLUGIN_ICON
+          ? " marketplace-icon-openclaw"
+          : ""
+      }`}
       style={
         {
           "--marketplace-icon-accent": hashedTone.accent,

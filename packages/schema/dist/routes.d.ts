@@ -22,11 +22,15 @@ export declare const ApiRoutes: {
     readonly skillsSh: "/api/v1/skills-sh";
     readonly skillScans: "/api/v1/skills/-/scan";
     readonly plugins: "/api/v1/plugins";
+    readonly pluginOverview: "/api/v1/plugins/overview";
     readonly pluginCategories: "/api/v1/plugins/categories";
     readonly pluginsExport: "/api/v1/plugins/export";
     readonly packages: "/api/v1/packages";
+    readonly packageVersionPublication: "/api/v1/packages/{name}/versions/{version}/publication";
+    readonly packageCategoriesBatch: "/api/v1/packages/categories:batch";
     readonly codePlugins: "/api/v1/code-plugins";
     readonly bundlePlugins: "/api/v1/bundle-plugins";
+    readonly featured: "/api/v1/featured";
     readonly promotions: "/api/v1/promotions";
     readonly catalogFeed: "/api/v1/feeds/plugins";
     readonly catalogSkillsFeed: "/api/v1/feeds/skills";

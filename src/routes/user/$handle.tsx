@@ -4,6 +4,7 @@ import {
   getCatalogTopicSlugs,
   isPluginCategorySlug,
   isSkillCategorySlug,
+  LEGACY_PLUGIN_CATEGORY_DEFINITIONS,
   normalizeCatalogTopic,
   resolveStoredPluginCategories,
 } from "clawhub-schema";
@@ -515,7 +516,19 @@ export function PublisherProfilePage({
     resolveDefaultCatalogTab(loaderPublisher),
   );
   useEffect(() => {
-    setCatalogTab(resolveDefaultCatalogTab(loaderPublisher));
+    const syncTabFromHash = () => {
+      const hash = window.location.hash.slice(1);
+      const tab =
+        hash === "skills" ||
+        hash === "plugins" ||
+        (hash === "stars" && loaderPublisher.kind === "user")
+          ? hash
+          : resolveDefaultCatalogTab(loaderPublisher);
+      setCatalogTab(tab);
+    };
+    syncTabFromHash();
+    window.addEventListener("hashchange", syncTabFromHash);
+    return () => window.removeEventListener("hashchange", syncTabFromHash);
   }, [handle, loaderPublisher]);
   const [catalogSort, setCatalogSort] = useState<ProfileCatalogSort>(DEFAULT_PROFILE_CATALOG_SORT);
   const [catalogSearch, setCatalogSearch] = useState("");
@@ -868,6 +881,7 @@ export function PublisherProfilePage({
                   onChange={(value) => {
                     if (!value) return;
                     setCatalogTab(value as ProfileCatalogTab);
+                    window.location.hash = value;
                     setCatalogSearch("");
                   }}
                 />
@@ -1046,7 +1060,10 @@ export function buildPublisherCatalogCategoryOptions(
   items: readonly PublicPublisherCatalogItem[],
   kind: "skill" | "plugin",
 ): BrowseCategory[] {
-  const source = kind === "plugin" ? PLUGIN_CATEGORIES : SKILL_CATEGORIES;
+  const source =
+    kind === "plugin"
+      ? [...PLUGIN_CATEGORIES, ...LEGACY_PLUGIN_CATEGORY_DEFINITIONS]
+      : SKILL_CATEGORIES;
   const presentSlugs = new Set(items.flatMap((item) => getPublisherCatalogItemCategorySlugs(item)));
   return source.filter((category) => presentSlugs.has(category.slug));
 }

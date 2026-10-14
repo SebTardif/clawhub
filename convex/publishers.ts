@@ -107,10 +107,7 @@ type PublisherCatalogItem = {
   inferredCategories?: string[];
   latestVersionId?: Id<"skillVersions">;
   inferredFromVersionId?: Id<"skillVersions">;
-  /**
-   * Legacy skill icon field or public plugin manifest HTTPS icon URL retained
-   * while older frontend bundles are cached.
-   */
+  /** Hosted bundled icon path; older records may retain legacy icon values. */
   icon: string | null;
   href: string;
   installs: number;
@@ -2568,7 +2565,7 @@ export const listStarredPage = query({
       await Promise.all(
         starRows.map(async (star): Promise<PublisherCatalogItem | null> => {
           const skill = await ctx.db.get(star.skillId);
-          if (!skill || skill.softDeletedAt) return null;
+          if (!skill || !isPublicPublishedSkill(skill)) return null;
           const ownerPublisher = skill.ownerPublisherId
             ? await ctx.db.get(skill.ownerPublisherId)
             : null;

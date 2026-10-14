@@ -64,10 +64,12 @@ import { PluginsPage } from "./-management/PluginsPage";
 import { PromotionsPage } from "./-management/PromotionsPage";
 import { RecentPushesPage } from "./-management/RecentPushesPage";
 import { ReportsPage } from "./-management/ReportsPage";
+import { SearchInsightsPage } from "./-management/SearchInsightsPage";
 import { SkillsPage } from "./-management/SkillsPage";
 import { UsersPage } from "./-management/UsersPage";
 
 const MANAGEMENT_VIEWS = new Set<string>([
+  "search-insights",
   "overview",
   "abuse",
   "reports",
@@ -190,6 +192,7 @@ export const Route = createFileRoute("/management")({
       skill?: string;
       plugin?: string;
       view?: ManagementView;
+      endDay?: number;
       tab?: PublisherAbuseTab;
     } = {};
     if (typeof search.skill === "string" && search.skill.trim()) {
@@ -197,6 +200,14 @@ export const Route = createFileRoute("/management")({
     }
     if (typeof search.plugin === "string" && search.plugin.trim()) {
       validated.plugin = search.plugin;
+    }
+    if (
+      typeof search.endDay === "number" &&
+      Number.isSafeInteger(search.endDay) &&
+      search.endDay >= 0 &&
+      search.endDay % 86_400_000 === 0
+    ) {
+      validated.endDay = search.endDay;
     }
     if (isManagementView(search.view)) {
       validated.view = search.view;
@@ -755,6 +766,7 @@ export function Management() {
           <strong>{formatManagementViewLabel(activeView)}</strong>
         </div>
 
+        {activeView === "search-insights" ? <SearchInsightsPage endDay={search.endDay} /> : null}
         {activeView === "abuse" ? (
           <AbusePage
             admin={admin}
@@ -899,6 +911,7 @@ export function Management() {
 
         {activeView === "plugins" ? (
           <PluginsPage
+            isAdmin={admin}
             pluginSearch={pluginSearch}
             selectedPlugin={selectedPlugin}
             selectedPluginName={selectedPluginName}
@@ -1063,6 +1076,12 @@ function ManagementSidebar({
         </div>
 
         <div className="management-sidebar-section-title">Staff tools</div>
+        <ManagementSidebarLink
+          active={activeView === "search-insights"}
+          icon={<PackageSearch size={15} />}
+          label="Search intelligence"
+          view="search-insights"
+        />
         <div className="management-sidebar-group">
           {admin ? (
             <ManagementSidebarLink
@@ -1136,6 +1155,7 @@ function resolveManagementView(
 }
 
 const MANAGEMENT_VIEW_LABELS: Record<ManagementView, string> = {
+  "search-insights": "Search intelligence",
   overview: "Overview",
   abuse: "Publisher abuse",
   reports: "Content reports",

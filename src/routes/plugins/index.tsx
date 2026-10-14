@@ -1,26 +1,21 @@
 import { createFileRoute, Link, redirect } from "@tanstack/react-router";
 import { isPluginCategorySlug } from "clawhub-schema";
 import { useQuery } from "convex/react";
-import { BadgeCheck, PackageSearch, Plus } from "lucide-react";
+import { PackageSearch, Plus } from "lucide-react";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { api } from "../../../convex/_generated/api";
 import {
-  BrowseActions,
   BrowseCategorySelect,
   BrowseCategorySidebar,
   BrowseControls,
-  BrowseControlsRow,
   BrowseSearchInput,
-  BrowseSearchPanel,
-  BrowseSearchTrigger,
-  BrowseTabs,
   BrowseTopicChips,
-  BrowseViewToggle,
-  useBrowseSearchDisclosure,
 } from "../../components/BrowseControls";
 import { PluginListItem } from "../../components/PluginListItem";
 import { BrowseResultsSkeleton } from "../../components/skeletons/BrowseResultsSkeleton";
 import { Button } from "../../components/ui/button";
+import { analyticsSearchFilter } from "../../lib/analyticsEvents";
+import { emitPublicSearchSubmission } from "../../lib/analyticsEvents";
 import { formatBrowseCount } from "../../lib/browseCount";
 import {
   parseBrowseTopicFromSearchInput,
@@ -32,16 +27,19 @@ import {
   isRateLimitedPackageApiError,
   type PackageListItem,
 } from "../../lib/packageApi";
+import { useAnalyticsSearchResults } from "../../lib/useAnalyticsSearchResults";
 import { useBrowseTopicSearch } from "../../lib/useBrowseTopicSearch";
-import { useMediaQuery } from "../../lib/useMediaQuery";
 
 type VisiblePluginSort = "recommended" | "updated" | "downloads" | "trending";
 type PluginSort = VisiblePluginSort | "relevance";
 type LegacyPluginSort = PluginSort | "newest" | "name" | "installs";
-type PluginBrowseTab = VisiblePluginSort | "official";
 
 const PLUGINS_PAGE_SIZE = 25;
 const PLUGIN_CATALOG_REQUEST_TIMEOUT_MS = 5_000;
+
+// One navigation's input intent, never URL/history state. Reloads and preloads
+// cannot recreate it; the loader consumes it before dispatch so retries are unmarked.
+const manualSearchNavigation: { pending: { query: string } | null } = { pending: null };
 
 type PluginSearchState = {
   q?: string;
@@ -50,30 +48,11 @@ type PluginSearchState = {
   cursor?: string;
   family?: undefined;
   featured?: boolean;
+  new?: boolean;
   official?: boolean;
   sort?: LegacyPluginSort;
-  view?: LegacyPluginView;
+  view?: "list" | "grid" | "cards";
 };
-
-type PluginView = "list" | "grid";
-type LegacyPluginView = PluginView | "cards";
-
-const PLUGIN_BROWSE_TABS = [
-  { value: "recommended", label: "All" },
-  { value: "trending", label: "Trending" },
-  {
-    value: "official",
-    label: "Official",
-    icon: <BadgeCheck size={14} strokeWidth={2.25} aria-hidden="true" />,
-  },
-  { value: "updated", label: "Updated" },
-];
-
-function normalizePluginView(value: unknown): PluginView | undefined {
-  if (value === "list") return "list";
-  if (value === "grid" || value === "cards") return "grid";
-  return undefined;
-}
 
 type PluginsLoaderData = {
   items: PackageListItem[];
@@ -87,11 +66,10 @@ type PluginsLoaderData = {
 
 type PluginsPageDataRequest = {
   q?: string;
+  searchSource?: "clawhub-web";
   category?: string;
   topic?: string;
   cursor?: string;
-  featured?: boolean;
-  official?: boolean;
   sort?: PluginSort;
   signal?: AbortSignal;
 };
@@ -157,18 +135,6 @@ function normalizeActivePluginSort(sort: LegacyPluginSort | undefined): PluginSo
   return sort;
 }
 
-function getDefaultPluginBrowseSort(
-  _args: Pick<PluginsPageDataRequest, "category" | "featured" | "official">,
-): VisiblePluginSort {
-  return "recommended";
-}
-
-function hasPersistentPluginBrowseFilter(
-  args: Pick<PluginsPageDataRequest, "category" | "featured" | "official">,
-) {
-  return Boolean(args.category || args.featured || args.official);
-}
-
 function isNavigationAbortError(signal?: AbortSignal) {
   return Boolean(signal?.aborted);
 }
@@ -190,19 +156,28 @@ export async function loadPluginsPageData(
   try {
     const data = await fetchPluginCatalog({
       q: args.q,
+      ...(args.searchSource ? { searchSource: args.searchSource } : {}),
       category: args.category,
       topic: args.topic,
-      officialFirst: Boolean(args.category && !args.q),
+      curated: Boolean(
+        args.category &&
+        args.category !== "other" &&
+        !args.q &&
+        (!args.sort || args.sort === "recommended" || args.sort === "downloads"),
+      ),
       cursor: args.q ? undefined : args.cursor,
-      featured: args.featured,
-      isOfficial: args.official,
       ...(!args.q &&
       (args.sort === "downloads" ||
         args.sort === "updated" ||
         args.sort === "trending" ||
         !args.sort ||
         args.sort === "recommended")
-        ? { sort: args.sort ?? getDefaultPluginBrowseSort(args) }
+        ? {
+            sort:
+              args.category && (!args.sort || args.sort === "recommended")
+                ? "downloads"
+                : (args.sort ?? "recommended"),
+          }
         : {}),
       limit: PLUGINS_PAGE_SIZE,
       signal: requestController.signal,
@@ -256,38 +231,27 @@ export const Route = createFileRoute("/plugins/")({
       typeof search.category === "string"
         ? resolvePluginBrowseCategorySlug(search.category)
         : undefined;
-    const featured =
-      search.featured === true || search.featured === "true" || search.featured === "1"
-        ? true
-        : undefined;
-    const official =
-      search.official === true ||
-      search.official === "true" ||
-      search.official === "1" ||
-      search.verified === true ||
-      search.verified === "true" ||
-      search.verified === "1"
-        ? true
-        : undefined;
+    // Retired feed links must not keep filtering the category catalog or reuse feed cursors.
+    const legacyFeed =
+      ["featured", "highlighted", "official", "verified", "new", "tab"].some(
+        (key) => search[key] !== undefined,
+      ) || search.sort === "trending";
     const legacyInstallSort = search.sort === "installs";
     const noExplicitSort = search.sort === undefined;
-    const staleImplicitFilteredCursor =
-      noExplicitSort && !q && hasPersistentPluginBrowseFilter({ category, featured, official });
+    const staleImplicitFilteredCursor = noExplicitSort && !q && Boolean(category);
     return {
       q,
       category,
       topic: parseBrowseTopicFromSearchInput(search as Record<string, unknown>),
       cursor:
+        !legacyFeed &&
         !legacyInstallSort &&
         !staleImplicitFilteredCursor &&
         typeof search.cursor === "string" &&
         search.cursor
           ? search.cursor
           : undefined,
-      featured,
-      official,
-      sort: parsePluginSort(search.sort),
-      view: normalizePluginView(search.view),
+      sort: search.sort === "trending" ? undefined : parsePluginSort(search.sort),
     };
   },
   beforeLoad: ({ search }) => {
@@ -299,13 +263,11 @@ export const Route = createFileRoute("/plugins/")({
       search.sort !== "downloads" &&
       search.sort !== "trending" &&
       !(hasQuery && search.sort === "relevance");
-    const staleFeatured = Boolean(hasQuery && search.featured);
-    if (incompatibleSort || staleFeatured) {
+    if (incompatibleSort) {
       throw redirect({
         to: "/plugins",
         search: {
           ...search,
-          featured: staleFeatured ? undefined : search.featured,
           sort: incompatibleSort ? undefined : search.sort,
         },
         replace: true,
@@ -319,44 +281,51 @@ export const Route = createFileRoute("/plugins/")({
       category: search.category,
       topic: search.topic,
       cursor: hasQuery ? undefined : search.cursor,
-      featured: search.featured,
-      official: search.official,
       sort: hasQuery ? undefined : normalizeActivePluginSort(search.sort),
     };
   },
-  loader: async ({ deps, abortController }): Promise<PluginsLoaderData> =>
-    await loadPluginsPageData({
+  shouldReload: ({ deps, preload }) =>
+    !preload && manualSearchNavigation.pending && manualSearchNavigation.pending.query === deps.q
+      ? true
+      : undefined,
+  loader: async ({ deps, abortController, preload }): Promise<PluginsLoaderData> => {
+    const isManual = Boolean(
+      !preload &&
+      !abortController.signal.aborted &&
+      manualSearchNavigation.pending &&
+      manualSearchNavigation.pending.query === deps.q,
+    );
+    if (isManual) manualSearchNavigation.pending = null;
+    return await loadPluginsPageData({
       ...deps,
+      ...(isManual ? { searchSource: "clawhub-web" as const } : {}),
       signal: abortController.signal,
-    }),
+    });
+  },
   component: PluginsIndex,
 });
 
 function PluginsIndexPending() {
   return (
-    <main className="browse-page browse-page-borderless-header plugins-browse-page">
+    <main className="browse-page browse-page-borderless-header plugins-browse-page catalog-browse-page">
       <div className="browse-page-header">
         <h1 className="browse-title">Plugins</h1>
       </div>
       <BrowseControls>
-        <BrowseControlsRow>
-          <BrowseTabs
-            ariaLabel="Sort order"
-            options={PLUGIN_BROWSE_TABS}
-            value="recommended"
-            onChange={() => {}}
-          />
-          <BrowseActions>
-            <BrowseSearchTrigger open={false} onOpen={() => {}} label="Search plugins" disabled />
-            <BrowseCategorySelect
-              categories={PLUGIN_CATEGORIES}
-              value={undefined}
-              onChange={() => {}}
-              responsive
-            />
-            <BrowseViewToggle view="list" onToggle={() => {}} />
-          </BrowseActions>
-        </BrowseControlsRow>
+        <BrowseSearchInput
+          label="plugin search"
+          placeholder="Search plugins..."
+          value=""
+          onChange={() => {}}
+          onClear={() => {}}
+          disabled
+        />
+        <BrowseCategorySelect
+          categories={PLUGIN_CATEGORIES}
+          value={undefined}
+          onChange={() => {}}
+          responsive
+        />
       </BrowseControls>
       <div className="browse-layout browse-layout-with-sidebar">
         <BrowseCategorySidebar
@@ -395,9 +364,6 @@ function PluginsIndex() {
   const retryAfterSeconds = catalogData.retryAfterSeconds;
   const isLoading = catalogData.isLoading ?? false;
   const apiError = catalogData.apiError ?? false;
-  const view = normalizePluginView(search.view) ?? "list";
-  const isMobileBrowse = useMediaQuery("(max-width: 760px)");
-  const effectiveView = isMobileBrowse ? "list" : view;
 
   const [query, setQuery] = useState(search.q ?? "");
   const [isLoadingMore, setIsLoadingMore] = useState(false);
@@ -406,18 +372,14 @@ function PluginsIndex() {
   const loadMoreInFlightRef = useRef(false);
   const loadMoreAbortControllerRef = useRef<AbortController | null>(null);
   const searchNavigateTimer = useRef<number>(0);
+  const lastManualQueryRef = useRef<string | null>(null);
 
   useEffect(() => {
     setQuery(search.q ?? "");
   }, [search.q]);
 
   const hasQuery = Boolean(search.q?.trim());
-  const hasActiveFilters =
-    hasQuery ||
-    Boolean(search.category) ||
-    Boolean(activeTopic) ||
-    Boolean(search.official) ||
-    Boolean(search.featured);
+  const hasActiveFilters = hasQuery || Boolean(search.category) || Boolean(activeTopic);
   const shouldResolveTotalCount =
     !hasActiveFilters && !search.cursor && catalogData.totalCount == null;
   const totalPluginsCount = useQuery(
@@ -454,56 +416,19 @@ function PluginsIndex() {
       ? "downloads"
       : search.sort === "relevance" || search.sort === "newest" || search.sort === "name"
         ? "recommended"
-        : (search.sort ?? (hasQuery ? "recommended" : getDefaultPluginBrowseSort(search)));
-  const activeBrowseTab: PluginBrowseTab = search.official ? "official" : activeSort;
+        : (search.sort ?? "recommended");
+  useAnalyticsSearchResults({
+    filter: analyticsSearchFilter(search),
+    query: search.q,
+    count: items.length,
+    loading: isLoading,
+    failed: apiError || rateLimited,
+    context: "plugins",
+    complete: !nextCursor && items.length < PLUGINS_PAGE_SIZE,
+  });
   const visibleItems = useMemo(() => {
     return hasQuery ? sortPluginSearchItems(items, activeSort) : items;
   }, [activeSort, hasQuery, items]);
-  const handleBrowseTabChange = (value: string | undefined) => {
-    if (value === "official") {
-      void navigate({
-        search: (prev: PluginSearchState) => ({
-          ...prev,
-          cursor: undefined,
-          family: undefined,
-          official: true,
-          sort: undefined,
-        }),
-        replace: true,
-      });
-      return;
-    }
-
-    handleSortChange(value ?? "recommended");
-  };
-
-  const handleSortChange = (value: string) => {
-    const nextSort = parsePluginSort(value) ?? "recommended";
-
-    void navigate({
-      search: (prev: PluginSearchState) => {
-        const isExplicitFilteredRecommendation =
-          nextSort === "recommended" && !prev.q && hasPersistentPluginBrowseFilter(prev);
-        const sort =
-          isExplicitFilteredRecommendation || nextSort === "downloads"
-            ? nextSort
-            : nextSort === "updated" || nextSort === "trending"
-              ? nextSort
-              : undefined;
-        const nextSearch: PluginSearchState = {
-          ...prev,
-          cursor: undefined,
-          family: undefined,
-          featured: prev.q ? undefined : prev.featured,
-          sort,
-        };
-        delete nextSearch.official;
-        return nextSearch;
-      },
-      replace: true,
-    });
-  };
-
   const handleCategoryChange = (slug: string | undefined) => {
     const category = slug && isPluginCategorySlug(slug) ? slug : undefined;
     void navigate({
@@ -513,8 +438,6 @@ function PluginsIndex() {
         family: undefined,
         category,
         topic: undefined,
-        featured: undefined,
-        sort: undefined,
       }),
       replace: true,
     });
@@ -542,16 +465,22 @@ function PluginsIndex() {
   const navigateToPluginSearch = useCallback(
     (next: string, replace: boolean) => {
       const trimmed = next.trim();
+      const intent = trimmed && lastManualQueryRef.current !== trimmed ? { query: trimmed } : null;
+      manualSearchNavigation.pending = intent;
+      lastManualQueryRef.current = trimmed || null;
       void navigate({
         search: (prev: PluginSearchState) => ({
           ...prev,
           cursor: undefined,
           family: undefined,
           q: trimmed ? next : undefined,
+          new: undefined,
           featured: undefined,
           sort: undefined,
         }),
         replace,
+      }).finally(() => {
+        if (manualSearchNavigation.pending === intent) manualSearchNavigation.pending = null;
       });
     },
     [navigate],
@@ -569,12 +498,15 @@ function PluginsIndex() {
   );
 
   const handleSearchSubmit = () => {
+    emitPublicSearchSubmission(query, "plugins", "catalog");
     window.clearTimeout(searchNavigateTimer.current);
     navigateToPluginSearch(query, false);
   };
 
   const handleClearSearch = () => {
     window.clearTimeout(searchNavigateTimer.current);
+    lastManualQueryRef.current = null;
+    manualSearchNavigation.pending = null;
     setQuery("");
     searchInputRef.current?.focus();
     void navigate({
@@ -588,22 +520,6 @@ function PluginsIndex() {
       replace: true,
     });
   };
-  const browseSearch = useBrowseSearchDisclosure({
-    value: query,
-    onClear: handleClearSearch,
-    inputRef: searchInputRef,
-  });
-
-  const handleToggleView = () => {
-    void navigate({
-      search: (prev: PluginSearchState) => ({
-        ...prev,
-        view: normalizePluginView(prev.view) === "grid" ? undefined : "grid",
-      }),
-      replace: true,
-    });
-  };
-
   const canLoadMore =
     !hasQuery && !isLoading && !apiError && !rateLimited && Boolean(nextCursor) && !isLoadingMore;
 
@@ -619,8 +535,6 @@ function PluginsIndex() {
         category: search.category,
         topic: search.topic,
         cursor: nextCursor,
-        featured: search.featured,
-        official: search.official,
         sort: normalizeActivePluginSort(search.sort),
         signal: controller.signal,
       });
@@ -644,16 +558,7 @@ function PluginsIndex() {
         loadMoreInFlightRef.current = false;
       }
     }
-  }, [
-    initialLoaderData,
-    nextCursor,
-    search.category,
-    search.featured,
-    search.official,
-    search.q,
-    search.sort,
-    search.topic,
-  ]);
+  }, [initialLoaderData, nextCursor, search.category, search.q, search.sort, search.topic]);
 
   useEffect(() => {
     if (!canLoadMore || typeof IntersectionObserver === "undefined") return () => {};
@@ -673,7 +578,7 @@ function PluginsIndex() {
   }, [canLoadMore, loadMore]);
 
   return (
-    <main className="browse-page browse-page-borderless-header plugins-browse-page">
+    <main className="browse-page browse-page-borderless-header plugins-browse-page catalog-browse-page">
       <div className="browse-page-header">
         <div className="browse-page-header-main">
           <h1 className="browse-title">
@@ -688,40 +593,22 @@ function PluginsIndex() {
         </div>
       </div>
       <BrowseControls>
-        <BrowseControlsRow>
-          <BrowseTabs
-            ariaLabel="Sort order"
-            options={PLUGIN_BROWSE_TABS}
-            value={activeBrowseTab}
-            onChange={handleBrowseTabChange}
-          />
-          <BrowseActions>
-            <BrowseSearchTrigger
-              open={browseSearch.open}
-              onOpen={browseSearch.openSearch}
-              label="Search plugins"
-            />
-            <BrowseCategorySelect
-              categories={PLUGIN_CATEGORIES}
-              value={activeCategory}
-              onChange={handleCategoryChange}
-              responsive
-            />
-            <BrowseViewToggle view={view} onToggle={handleToggleView} />
-          </BrowseActions>
-          <BrowseSearchPanel open={browseSearch.open}>
-            <BrowseSearchInput
-              inputRef={searchInputRef}
-              label="plugin search"
-              placeholder="Search plugins..."
-              value={query}
-              onChange={handleQueryChange}
-              onClear={browseSearch.closeSearch}
-              onSubmit={handleSearchSubmit}
-              closeLabel="Close search"
-            />
-          </BrowseSearchPanel>
-        </BrowseControlsRow>
+        <BrowseSearchInput
+          inputRef={searchInputRef}
+          focusShortcut
+          label="plugin search"
+          placeholder="Search plugins..."
+          value={query}
+          onChange={handleQueryChange}
+          onClear={handleClearSearch}
+          onSubmit={handleSearchSubmit}
+        />
+        <BrowseCategorySelect
+          categories={PLUGIN_CATEGORIES}
+          value={activeCategory}
+          onChange={handleCategoryChange}
+          responsive
+        />
         <BrowseTopicChips
           topics={categoryTopics ?? []}
           activeTopic={activeTopic}
@@ -738,11 +625,7 @@ function PluginsIndex() {
         />
         <div className="browse-results">
           {isLoading ? (
-            <BrowseResultsSkeleton
-              label="Plugin"
-              variant={effectiveView}
-              showCategoryColumn={false}
-            />
+            <BrowseResultsSkeleton label="Plugin" showCategoryColumn={false} />
           ) : apiError ? (
             <div className="empty-state">
               <PackageSearch size={22} className="empty-state-icon" aria-hidden="true" />
@@ -770,12 +653,6 @@ function PluginsIndex() {
                   Add a plugin
                 </Link>
               </Button>
-            </div>
-          ) : effectiveView === "grid" ? (
-            <div className="grid browse-results-grid">
-              {visibleItems.map((item) => (
-                <PluginListItem key={item.name} item={item} variant="card" />
-              ))}
             </div>
           ) : (
             <div className="browse-list-stack">

@@ -1326,6 +1326,7 @@ export async function cmdExplore(
 }
 
 export function formatExploreLine(item: {
+  ownerHandle?: string;
   slug: string;
   summary?: string | null;
   updatedAt: number;
@@ -1334,7 +1335,8 @@ export function formatExploreLine(item: {
   const version = item.latestVersion?.version ?? "?";
   const age = formatRelativeTime(item.updatedAt);
   const summary = item.summary ? `  ${styleText(truncate(item.summary, 50), "muted")}` : "";
-  return `${styleText(item.slug, "brand")}  ${styleText(`v${version}`, "muted")}  ${styleText(
+  const qualifiedSlug = item.ownerHandle ? `${item.ownerHandle}/${item.slug}` : item.slug;
+  return `${styleText(qualifiedSlug, "brand")}  ${styleText(`v${version}`, "muted")}  ${styleText(
     age,
     "muted",
   )}${summary}`;
@@ -1843,9 +1845,8 @@ async function installSkillWithOptionalStaging(
     backupCreated = true;
     await rename(stage, target);
     stageMoved = true;
-    await rm(backup, { recursive: true, force: true });
   } catch (error) {
-    if (backupCreated) {
+    if (backupCreated && !stageMoved) {
       await rm(target, { recursive: true, force: true }).catch(() => {});
       await rename(backup, target).catch(() => {});
     }
@@ -1855,6 +1856,8 @@ async function installSkillWithOptionalStaging(
       await rm(stage, { recursive: true, force: true }).catch(() => {});
     }
   }
+
+  await rm(backup, { recursive: true, force: true }).catch(() => {});
 }
 
 function gitHubZipUrl(repo: string, commit: string) {

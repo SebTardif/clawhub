@@ -30,6 +30,7 @@ import {
 } from "./lib/skillHourlyStats";
 import { isPublicSkillsShMirrorDigest } from "./lib/skillsShMirrorPublic";
 import { assertTestSeedAllowed } from "./lib/testSeed";
+import { isEnglishTrendingText } from "./lib/trendingLanguage";
 import { getSkillsShPublicCatalogEnabledHandler } from "./rolloutCapabilities";
 
 const WRITE_BATCH_SIZE = 100;
@@ -1198,6 +1199,7 @@ export const getPageInternal = internalQuery({
   args: {
     cursor: v.union(v.string(), v.null()),
     limit: v.number(),
+    now: v.optional(v.number()),
   },
   handler: async (ctx, args) => {
     if (!Number.isSafeInteger(args.limit) || args.limit < 1 || args.limit > 100) {
@@ -1211,7 +1213,7 @@ export const getPageInternal = internalQuery({
         return { status: "invalid-cursor" as const };
       }
     }
-    const now = Date.now();
+    const now = args.now ?? Date.now();
     const snapshot = decoded
       ? await ctx.db
           .query("canonicalTrendingSnapshots")
@@ -1228,7 +1230,14 @@ export const getPageInternal = internalQuery({
     if (snapshot && snapshot.generatedAt + SNAPSHOT_MAX_SERVING_AGE_MS <= now) {
       return { status: decoded ? ("expired" as const) : ("unavailable" as const) };
     }
-    if (snapshot && snapshot.rankingVersion !== CANONICAL_TRENDING_RANKING_VERSION) {
+    // Keep the previous snapshot available during deployment; the live checks
+    // below enforce English eligibility until the next materialization replaces it.
+    if (
+      snapshot &&
+      snapshot.rankingVersion !== CANONICAL_TRENDING_RANKING_VERSION &&
+      snapshot.rankingVersion !== "skills-trending-v4" &&
+      snapshot.rankingVersion !== "skills-trending-v5"
+    ) {
       return { status: decoded ? ("expired" as const) : ("unavailable" as const) };
     }
     if (
@@ -1281,6 +1290,7 @@ export const getPageInternal = internalQuery({
       if (rows.length === 0) break;
       const eligibility = await Promise.all(
         rows.map(async (row) => {
+          if (!isEnglishTrendingText(row.card.displayName, row.card.summary)) return false;
           const sourceRef = row.sourceRef;
           if (sourceRef.kind === "clawhub") {
             const digest = await ctx.db
@@ -1290,7 +1300,8 @@ export const getPageInternal = internalQuery({
             return Boolean(
               digest &&
               !shouldExcludeSkillFromPublicBrowse(digest) &&
-              digest.publicVersion?.status === "available",
+              digest.publicVersion?.status === "available" &&
+              isEnglishTrendingText(digest.displayName, digest.summary),
             );
           }
           if (!skillsShPublicCatalogEnabled) return false;
@@ -1298,7 +1309,11 @@ export const getPageInternal = internalQuery({
             .query("skillsShMirrorDigests")
             .withIndex("by_external_id", (q) => q.eq("externalId", sourceRef.externalId))
             .unique();
-          return Boolean(digest && isPublicSkillsShMirrorDigest(digest));
+          return Boolean(
+            digest &&
+            isPublicSkillsShMirrorDigest(digest) &&
+            isEnglishTrendingText(digest.displayName, digest.searchSummary),
+          );
         }),
       );
       for (let index = 0; index < rows.length; index += 1) {

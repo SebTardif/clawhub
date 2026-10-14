@@ -11,6 +11,7 @@ vi.mock("../convex/client", () => ({
 
 vi.mock("../../convex/_generated/api", () => ({
   api: {
+    featuredSkills: { listPublic: "featuredSkills:listPublic" },
     packages: { listPublicNewPluginsPage: "packages:listPublicNewPluginsPage" },
     skills: {
       listPublicPageV4: "skills:listPublicPageV4",
@@ -60,19 +61,34 @@ describe("homeListingData", () => {
     fetchCanonicalTrendingPageMock.mockResolvedValue(canonicalPage([], null));
   });
 
-  it("loads canonical Trending skills as the initial homepage catalog", async () => {
-    const item = makeTrending("first", "First", 12);
-    fetchCanonicalTrendingPageMock.mockResolvedValue(canonicalPage([item], "next-cursor"));
+  it("loads Featured plugins as the initial homepage catalog", async () => {
+    const item = makePlugin("first", 100);
+    fetchPluginCatalogMock.mockResolvedValue({ items: [item], nextCursor: null });
 
     await expect(fetchInitialHomeListing()).resolves.toEqual({
+      kind: "plugins",
+      tab: "featured",
+      categorySlugs: [],
+      fetchLimit: HOME_LISTING_PAGE_SIZE,
+      items: [item],
+      hasMore: false,
+    });
+  });
+
+  it("loads a URL-requested Skills Trending view as the initial homepage catalog", async () => {
+    const item = makeTrending("first", "First", 12);
+    fetchCanonicalTrendingPageMock.mockResolvedValue(canonicalPage([item], null));
+
+    await expect(fetchInitialHomeListing({ kind: "skills", tab: "trending" })).resolves.toEqual({
       kind: "skills",
       tab: "trending",
       categorySlugs: [],
       fetchLimit: HOME_LISTING_PAGE_SIZE,
       items: [{ trending: item }],
-      hasMore: true,
+      hasMore: false,
       trendingState: "available",
     });
+    expect(fetchPluginCatalogMock).not.toHaveBeenCalled();
   });
 
   it("preserves canonical order and forwards opaque cursors across pages", async () => {
@@ -204,7 +220,7 @@ describe("homeListingData", () => {
     );
   });
 
-  it("requests the latest 40 Featured skills and preserves editorial order", async () => {
+  it("requests the finite Featured selection and preserves newest-added order", async () => {
     convexQueryMock.mockResolvedValue({
       page: [makeNative("newest", 200, 1), makeNative("older", 100, 10_000)],
       hasMore: false,
@@ -217,13 +233,10 @@ describe("homeListingData", () => {
       "newest",
       "older",
     ]);
-    expect(convexQueryMock).toHaveBeenCalledWith(
-      "skills:listPublicPageV4",
-      expect.objectContaining({ highlightedOnly: true, numItems: 40 }),
-    );
+    expect(convexQueryMock).toHaveBeenCalledWith("featuredSkills:listPublic", { query: undefined });
   });
 
-  it("ends the finite Featured feed after exposing the latest 40", async () => {
+  it("ends the finite Featured feed without a continuation", async () => {
     convexQueryMock.mockResolvedValue({
       page: Array.from({ length: 40 }, (_, index) =>
         makeNative(`featured-${index}`, 40 - index, 0),
@@ -260,11 +273,11 @@ describe("homeListingData", () => {
     );
     expect(fetchPluginCatalogMock).toHaveBeenNthCalledWith(
       1,
-      expect.objectContaining({ featured: true, isOfficial: undefined }),
+      expect.objectContaining({ featured: true, limit: 16 }),
     );
     expect(fetchPluginCatalogMock).toHaveBeenNthCalledWith(
       2,
-      expect.objectContaining({ featured: undefined, isOfficial: true }),
+      expect.objectContaining({ isOfficial: true }),
     );
   });
 
