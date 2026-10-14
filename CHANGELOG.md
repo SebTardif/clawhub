@@ -2,6 +2,13 @@
 
 ## Unreleased
 
+- Tests: update Vitest and its V8 coverage provider together to 5.0.3; retain registered auth callbacks across per-test mock cleanup.
+- Tests: update jsdom to 30.1.2 and allow its required Undici 8 transport while keeping the CLI on Undici 7.
+- Runtime: use Bun 1.3.14 across CI and deployment tooling to preserve labelled conditional blocks when compiling React server rendering.
+- Tests: revalidate cached npm metadata before installing updated Convex external dependencies, retaining cached package tarballs and bounded fetches.
+
+- Dependencies: refresh production packages and synchronize the Sharp pin; let each package resolve its supported Undici transport and use the unpatched upstream Workpool release. Retain the old Workpool typecheck patch only for the previous-version test fixture.
+
 - Use one shared autoreview installation from `openclaw/agent-skills`; repository entrypoints now receive upstream fixes without copied helpers or test suites.
 
 ## 0.24.0 - 2026-09-30
