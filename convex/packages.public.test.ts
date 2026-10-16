@@ -15250,6 +15250,7 @@ describe("packages public queries", () => {
       inspectorVersion: "0.6.0",
       targetOpenClawVersion: "2026.8.0-beta.1",
       completedAt: expect.any(Number),
+      findingsCompletedAt: expect.any(Number),
       notificationCompletedAt: expect.any(Number),
     });
   });
