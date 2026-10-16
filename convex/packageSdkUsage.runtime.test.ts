@@ -5,7 +5,7 @@ import { register as registerRateLimiter } from "@convex-dev/rate-limiter/test";
 import { convexTest } from "convex-test";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { internal } from "./_generated/api";
-import type { SdkUsageReport } from "./lib/packageSdkUsageContract";
+import { failedSdkUsageReport, type SdkUsageReport } from "./lib/packageSdkUsageContract";
 import schema from "./schema";
 
 const modules = import.meta.glob("./**/*.ts");
@@ -377,6 +377,78 @@ describe("public SDK usage from serialized Inspector reports", () => {
     });
     await ingest({ ...inventory([]), status: "partial" });
     expect((await claim()).items).toHaveLength(1);
+  });
+
+  it("keeps a crashed Inspector run retryable and clears that mark after a later success", async () => {
+    const { t, releaseId, ingest } = await fixture();
+    const failed = await ingest(failedSdkUsageReport("inspector crashed"), {
+      inspectorVersion: "0.4.3",
+      targetOpenClawVersion: "2026.10.16",
+      inspectionFailed: true,
+    });
+    expect(failed.status).toBe(200);
+    const crashed = await t.run(async (ctx) =>
+      ctx.db
+        .query("packageInspectorScanStates")
+        .withIndex("by_release_and_inspector_version_and_target_openclaw_version", (q) =>
+          q
+            .eq("releaseId", releaseId)
+            .eq("inspectorVersion", "0.4.3")
+            .eq("targetOpenClawVersion", "2026.10.16"),
+        )
+        .unique(),
+    );
+    expect(crashed?.inspectionFailed).toBe(true);
+    expect(crashed?.sdkUsage?.status).toBe("failed");
+    expect(crashed?.notificationCompletedAt).toBeUndefined();
+    const retry = await t.query(internal.packages.previewPackageInspectorScanBatchInternal, {
+      inspectorVersion: "0.4.3",
+      targetOpenClawVersion: "2026.10.16",
+      inventorySchemaVersion: 1,
+      inventoryAnalysisVersion: "1",
+      notifyOwners: false,
+    });
+    expect(retry.items).toEqual([
+      expect.objectContaining({ packageName: "sdk-plugin", version: "1.0.0" }),
+    ]);
+    expect(
+      (
+        await ingest(inventory([]), {
+          inspectorVersion: "0.4.3",
+          targetOpenClawVersion: "2026.10.16",
+        })
+      ).status,
+    ).toBe(200);
+    const recovered = await t.run(async (ctx) =>
+      ctx.db
+        .query("packageInspectorScanStates")
+        .withIndex("by_release_and_inspector_version_and_target_openclaw_version", (q) =>
+          q
+            .eq("releaseId", releaseId)
+            .eq("inspectorVersion", "0.4.3")
+            .eq("targetOpenClawVersion", "2026.10.16"),
+        )
+        .unique(),
+    );
+    expect(recovered?.inspectionFailed).toBeUndefined();
+    expect(recovered?.sdkUsage?.status).toBe("complete");
+    const afterRecovery = await t.query(
+      internal.packages.previewPackageInspectorScanBatchInternal,
+      {
+        inspectorVersion: "0.4.3",
+        targetOpenClawVersion: "2026.10.16",
+        inventorySchemaVersion: 1,
+        inventoryAnalysisVersion: "1",
+        notifyOwners: false,
+      },
+    );
+    expect(afterRecovery).toMatchObject({
+      items: [],
+      skippedUnchanged: 1,
+      skipped: [
+        { packageName: "sdk-plugin", version: "1.0.0", reason: "compatible-complete-inventory" },
+      ],
+    });
   });
 
   it("reports an unscanned new latest release as missing and ignores a late old-release scan", async () => {

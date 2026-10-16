@@ -2318,14 +2318,16 @@ function makePluginValidationReportCtx(
                 };
                 builder(queryBuilder);
                 return {
-                  order: vi.fn(() => ({
-                    first: vi.fn(
-                      async () =>
-                        [...(options.statesByRelease?.[releaseId] ?? [])].sort(
-                          (a, b) => Number(b.completedAt) - Number(a.completedAt),
-                        )[0] ?? null,
-                    ),
-                  })),
+                  order: vi.fn(() => {
+                    const ordered = () =>
+                      [...(options.statesByRelease?.[releaseId] ?? [])].sort(
+                        (a, b) => Number(b.completedAt) - Number(a.completedAt),
+                      );
+                    return {
+                      first: vi.fn(async () => ordered()[0] ?? null),
+                      take: vi.fn(async (limit: number) => ordered().slice(0, limit)),
+                    };
+                  }),
                 };
               },
             ),
@@ -3539,6 +3541,81 @@ describe("packages public queries", () => {
     });
     expect(second.done).toBe(true);
     expect(second.nextCursor).toBeNull();
+  });
+
+  it("keeps the previous findings tuple when a newer Inspector run failed", async () => {
+    const digest = makePluginExportDigest("demo", "code-plugin", 300);
+    const releaseId = "packageReleases:demo-1";
+    const ctx = makePluginValidationReportCtx([digest], {
+      statesByRelease: {
+        [releaseId]: [
+          {
+            releaseId,
+            inspectorVersion: "0.4.2",
+            targetOpenClawVersion: "2026.10.01",
+            completedAt: 100,
+          },
+          {
+            releaseId,
+            inspectorVersion: "0.4.3",
+            targetOpenClawVersion: "2026.10.16",
+            completedAt: 300,
+            inspectionFailed: true,
+          },
+        ],
+      },
+      findingsByRelease: {
+        [releaseId]: [
+          {
+            scanSource: "nightly",
+            inspectorVersion: "0.4.2",
+            targetOpenClawVersion: "2026.10.01",
+            findingKind: "error",
+            code: "missing-api",
+            message: "Required API is unavailable",
+          },
+        ],
+      },
+    });
+
+    const result = await listPluginValidationReportPageInternalHandler(ctx, { numItems: 20 });
+
+    expect(result.items[0]).toMatchObject({
+      scan: {
+        status: "error",
+        scannedAt: 100,
+        inspectorVersion: "0.4.2",
+        target: { channel: "beta", version: "2026.10.01" },
+      },
+      findings: [
+        { severity: "error", code: "missing-api", message: "Required API is unavailable" },
+      ],
+    });
+  });
+
+  it("reports not-scanned when the only Inspector row is a failed run", async () => {
+    const digest = makePluginExportDigest("demo", "code-plugin", 300);
+    const releaseId = "packageReleases:demo-1";
+    const ctx = makePluginValidationReportCtx([digest], {
+      statesByRelease: {
+        [releaseId]: [
+          {
+            releaseId,
+            inspectorVersion: "0.4.3",
+            targetOpenClawVersion: "2026.10.16",
+            completedAt: 300,
+            inspectionFailed: true,
+          },
+        ],
+      },
+    });
+
+    const result = await listPluginValidationReportPageInternalHandler(ctx, { numItems: 20 });
+
+    expect(result.items[0]).toMatchObject({
+      scan: { status: "not-scanned", scannedAt: null, inspectorVersion: null, target: null },
+      findings: [],
+    });
   });
 
   it("keeps buffered cursor items aligned across paginated public pages", async () => {

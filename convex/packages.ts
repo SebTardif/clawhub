@@ -4570,6 +4570,23 @@ function normalizePackageValidationFinding(warning: Doc<"packageInspectorWarning
   return { severity, code: warning.code, message: warning.message };
 }
 
+const FINDINGS_SCAN_LOOKBACK = 20;
+
+async function latestCompletedFindingsScan(
+  ctx: Pick<QueryCtx, "db">,
+  releaseId: Id<"packageReleases">,
+) {
+  // A crashed run still writes completedAt so the inventory claim can see it.
+  // That row is not a findings scan. Walk a short recent window so one new
+  // Inspector version that crashes does not hide the previous successful tuple.
+  const states = await ctx.db
+    .query("packageInspectorScanStates")
+    .withIndex("by_release_and_completed_at", (q) => q.eq("releaseId", releaseId))
+    .order("desc")
+    .take(FINDINGS_SCAN_LOOKBACK);
+  return states.find((state) => state.inspectionFailed !== true) ?? null;
+}
+
 export const listPluginValidationReportPageInternal = internalQuery({
   args: {
     cursor: v.optional(v.string()),
@@ -4594,11 +4611,7 @@ export const listPluginValidationReportPageInternal = internalQuery({
       if (!digest.latestReleaseId) continue;
       const release = await ctx.db.get(digest.latestReleaseId);
       if (!isPublishedPackageRelease(release, digest.packageId)) continue;
-      const scanState = await ctx.db
-        .query("packageInspectorScanStates")
-        .withIndex("by_release_and_completed_at", (q) => q.eq("releaseId", release._id))
-        .order("desc")
-        .first();
+      const scanState = await latestCompletedFindingsScan(ctx, release._id);
       // CLAW-626 reconciles nightly findings per release and preserves publish/static findings.
       // Matching the selected tuple also fails closed if stale nightly rows survive a partial rollout.
       const storedWarnings = await ctx.db
@@ -11464,6 +11477,7 @@ async function listPackageInspectorScanBatch(
         scanState.sdkUsage.analysisVersion === args.inventoryAnalysisVersion;
       if (
         scanState &&
+        scanState.inspectionFailed !== true &&
         (!inventoryRequired || inventoryCurrent) &&
         (!args.notifyOwners || scanState.notificationCompletedAt)
       ) {
@@ -11719,7 +11733,9 @@ export const ingestPackageInspectorScanResultsInternal = internalMutation({
         release,
         inspectorVersion,
         targetOpenClawVersion,
-        notificationComplete: args.notifyOwners === true && !result.shouldEmailOwner,
+        notificationComplete:
+          args.inspectionFailed !== true && args.notifyOwners === true && !result.shouldEmailOwner,
+        inspectionFailed: args.inspectionFailed === true,
         report: args.sdkUsage,
         artifactSha256: args.artifactSha256,
       });

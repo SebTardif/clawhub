@@ -53,6 +53,14 @@ The backend's HTTP transport timeout for the initial push is raised so a slow
 external-deps build cannot be retried into the executor's shared build directory.
 No test timeout or backend execution limit is raised.
 
+A nightly run that throws stores `inspectionFailed` on that inspector and
+target tuple, plus a failed SDK inventory when one was supplied. That row
+keeps the release eligible for the next inventory claim. The moderator
+validation report ignores it and keeps the previous findings tuple, or
+`not-scanned` when no successful findings tuple exists. A later successful
+run of the same tuple clears `inspectionFailed`. A failed run does not mark
+owner notification complete.
+
 The earlier generated-card browser failure included one-second execution
 timeouts in multiple unrelated queries and mutations. It is not evidence of a
 runtime-identity regression. Re-run its unchanged publish/scan/card lifecycle

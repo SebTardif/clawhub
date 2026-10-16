@@ -101,6 +101,7 @@ export async function recordPackageInspectorScan(
     inspectorVersion: string;
     targetOpenClawVersion: string;
     notificationComplete?: boolean;
+    inspectionFailed?: boolean;
     report?: SdkUsageReport;
     artifactSha256?: string;
   },
@@ -123,6 +124,12 @@ export async function recordPackageInspectorScan(
     targetOpenClawVersion,
     completedAt,
     ...(args.notificationComplete ? { notificationCompletedAt: completedAt } : {}),
+    // Clear a previous crash when this same tuple later stores a real findings scan.
+    ...(args.inspectionFailed
+      ? { inspectionFailed: true as const }
+      : existing
+        ? { inspectionFailed: undefined }
+        : {}),
   };
   const scanId = existing?._id ?? (await ctx.db.insert("packageInspectorScanStates", values));
   if (existing) await ctx.db.patch(scanId, values);

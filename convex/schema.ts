@@ -2116,6 +2116,8 @@ const packageInspectorScanStates = defineTable({
   targetOpenClawVersion: v.string(),
   completedAt: v.number(),
   notificationCompletedAt: v.optional(v.number()),
+  // A crashed Inspector run still stores inventory status, but it is not a findings scan.
+  inspectionFailed: v.optional(v.boolean()),
   sdkUsage: v.optional(sdkUsageScan),
 })
   .index("by_release_and_inspector_version_and_target_openclaw_version", [
