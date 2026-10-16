@@ -2307,7 +2307,7 @@ function makePluginValidationReportCtx(
           return {
             withIndex: vi.fn(
               (
-                _indexName: string,
+                indexName: string,
                 builder: (q: { eq: (field: string, value: unknown) => unknown }) => unknown,
               ) => {
                 const queryBuilder = {
@@ -2319,13 +2319,25 @@ function makePluginValidationReportCtx(
                 builder(queryBuilder);
                 return {
                   order: vi.fn(() => {
-                    const ordered = () =>
-                      [...(options.statesByRelease?.[releaseId] ?? [])].sort(
-                        (a, b) => Number(b.completedAt) - Number(a.completedAt),
-                      );
+                    const ordered = () => {
+                      const rows = [...(options.statesByRelease?.[releaseId] ?? [])];
+                      if (indexName === "by_release_and_findings_completed_at") {
+                        return rows
+                          .filter((row) => row.findingsCompletedAt !== undefined)
+                          .sort(
+                            (a, b) => Number(b.findingsCompletedAt) - Number(a.findingsCompletedAt),
+                          );
+                      }
+                      return rows.sort((a, b) => Number(b.completedAt) - Number(a.completedAt));
+                    };
                     return {
                       first: vi.fn(async () => ordered()[0] ?? null),
                       take: vi.fn(async (limit: number) => ordered().slice(0, limit)),
+                      paginate: vi.fn(async ({ numItems }: { numItems: number }) => ({
+                        page: ordered().slice(0, numItems),
+                        isDone: ordered().length <= numItems,
+                        continueCursor: "",
+                      })),
                     };
                   }),
                 };
@@ -3615,6 +3627,92 @@ describe("packages public queries", () => {
     expect(result.items[0]).toMatchObject({
       scan: { status: "not-scanned", scannedAt: null, inspectorVersion: null, target: null },
       findings: [],
+    });
+  });
+
+  it("keeps findings when a later retry of the same Inspector tuple crashes", async () => {
+    const digest = makePluginExportDigest("demo", "code-plugin", 300);
+    const releaseId = "packageReleases:demo-1";
+    const ctx = makePluginValidationReportCtx([digest], {
+      statesByRelease: {
+        [releaseId]: [
+          {
+            releaseId,
+            inspectorVersion: "0.4.3",
+            targetOpenClawVersion: "2026.10.16",
+            completedAt: 300,
+            findingsCompletedAt: 200,
+            inspectionFailed: true,
+          },
+        ],
+      },
+      findingsByRelease: {
+        [releaseId]: [
+          {
+            scanSource: "nightly",
+            inspectorVersion: "0.4.3",
+            targetOpenClawVersion: "2026.10.16",
+            findingKind: "error",
+            code: "missing-api",
+            message: "Required API is unavailable",
+          },
+        ],
+      },
+    });
+
+    const result = await listPluginValidationReportPageInternalHandler(ctx, { numItems: 20 });
+
+    expect(result.items[0]).toMatchObject({
+      scan: {
+        status: "error",
+        scannedAt: 200,
+        inspectorVersion: "0.4.3",
+      },
+      findings: [{ severity: "error", code: "missing-api" }],
+    });
+  });
+
+  it("keeps an older findings scan behind more than twenty newer crashes", async () => {
+    const digest = makePluginExportDigest("demo", "code-plugin", 300);
+    const releaseId = "packageReleases:demo-1";
+    const crashes = Array.from({ length: 21 }, (_, index) => ({
+      releaseId,
+      inspectorVersion: "0.4.3",
+      targetOpenClawVersion: `2026.10.${index + 1}`,
+      completedAt: 200 + index,
+      inspectionFailed: true,
+    }));
+    const ctx = makePluginValidationReportCtx([digest], {
+      statesByRelease: {
+        [releaseId]: [
+          {
+            releaseId,
+            inspectorVersion: "0.4.2",
+            targetOpenClawVersion: "2026.10.01",
+            completedAt: 100,
+          },
+          ...crashes,
+        ],
+      },
+      findingsByRelease: {
+        [releaseId]: [
+          {
+            scanSource: "nightly",
+            inspectorVersion: "0.4.2",
+            targetOpenClawVersion: "2026.10.01",
+            findingKind: "error",
+            code: "missing-api",
+            message: "Required API is unavailable",
+          },
+        ],
+      },
+    });
+
+    const result = await listPluginValidationReportPageInternalHandler(ctx, { numItems: 20 });
+
+    expect(result.items[0]).toMatchObject({
+      scan: { status: "error", scannedAt: 100, inspectorVersion: "0.4.2" },
+      findings: [{ severity: "error", code: "missing-api" }],
     });
   });
 

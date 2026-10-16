@@ -54,12 +54,17 @@ external-deps build cannot be retried into the executor's shared build directory
 No test timeout or backend execution limit is raised.
 
 A nightly run that throws stores `inspectionFailed` on that inspector and
-target tuple, plus a failed SDK inventory when one was supplied. That row
-keeps the release eligible for the next inventory claim. The moderator
-validation report ignores it and keeps the previous findings tuple, or
-`not-scanned` when no successful findings tuple exists. A later successful
-run of the same tuple clears `inspectionFailed`. A failed run does not mark
-owner notification complete.
+target tuple, plus a failed SDK inventory when one was supplied. That flag
+describes the latest attempt only. `findingsCompletedAt` is set when a run
+actually stores a findings scan, and a later crash of the same tuple must
+not clear it. The moderator validation report reads the newest
+`findingsCompletedAt`. Rows written before that field existed still count
+as findings scans when `inspectionFailed` is absent, and the report walks
+the whole `completedAt` index to find one. It does not stop after a fixed
+number of newer crashes. The crashed release stays eligible for the next
+inventory claim. A later successful run of the same tuple clears
+`inspectionFailed` and refreshes `findingsCompletedAt`. A failed run does
+not mark owner notification complete.
 
 The earlier generated-card browser failure included one-second execution
 timeouts in multiple unrelated queries and mutations. It is not evidence of a

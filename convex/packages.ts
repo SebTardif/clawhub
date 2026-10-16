@@ -4570,21 +4570,35 @@ function normalizePackageValidationFinding(warning: Doc<"packageInspectorWarning
   return { severity, code: warning.code, message: warning.message };
 }
 
-const FINDINGS_SCAN_LOOKBACK = 20;
-
 async function latestCompletedFindingsScan(
   ctx: Pick<QueryCtx, "db">,
   releaseId: Id<"packageReleases">,
 ) {
-  // A crashed run still writes completedAt so the inventory claim can see it.
-  // That row is not a findings scan. Walk a short recent window so one new
-  // Inspector version that crashes does not hide the previous successful tuple.
-  const states = await ctx.db
+  // Rows written after this change record findingsCompletedAt only for a
+  // finished findings scan. A later crash on that same tuple leaves the
+  // timestamp in place, so the index still returns it.
+  const indexed = await ctx.db
     .query("packageInspectorScanStates")
-    .withIndex("by_release_and_completed_at", (q) => q.eq("releaseId", releaseId))
+    .withIndex("by_release_and_findings_completed_at", (q) => q.eq("releaseId", releaseId))
     .order("desc")
-    .take(FINDINGS_SCAN_LOOKBACK);
-  return states.find((state) => state.inspectionFailed !== true) ?? null;
+    .first();
+  if (indexed?.findingsCompletedAt !== undefined) return indexed;
+
+  // Older rows have completedAt and no findingsCompletedAt. Skip crashes and
+  // keep reading until a successful tuple or the end of the index. A fixed
+  // window would hide that tuple behind enough newer failed targets.
+  let cursor: string | null = null;
+  while (true) {
+    const page = await ctx.db
+      .query("packageInspectorScanStates")
+      .withIndex("by_release_and_completed_at", (q) => q.eq("releaseId", releaseId))
+      .order("desc")
+      .paginate({ numItems: 25, cursor });
+    const found = page.page.find((state) => state.inspectionFailed !== true);
+    if (found) return found;
+    if (page.isDone) return null;
+    cursor = page.continueCursor;
+  }
 }
 
 export const listPluginValidationReportPageInternal = internalQuery({
@@ -4651,7 +4665,9 @@ export const listPluginValidationReportPageInternal = internalQuery({
         },
         scan: {
           status,
-          scannedAt: scanState?.completedAt ?? null,
+          // A later crash refreshes completedAt. The report shows when the
+          // findings scan finished, which stays on findingsCompletedAt.
+          scannedAt: scanState?.findingsCompletedAt ?? scanState?.completedAt ?? null,
           target: scanState
             ? { channel: "beta" as const, version: scanState.targetOpenClawVersion }
             : null,
