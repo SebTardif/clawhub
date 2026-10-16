@@ -4583,7 +4583,8 @@ async function latestCompletedFindingsScan(
     .withIndex("by_release_and_findings_completed_at", (q) => q.eq("releaseId", releaseId))
     .order("desc")
     .first();
-  const indexedScan = indexed?.findingsCompletedAt !== undefined ? indexed : null;
+  const indexedFindingsAt = indexed?.findingsCompletedAt;
+  const indexedScan = indexedFindingsAt !== undefined ? indexed : null;
 
   // Older rows have completedAt and no findingsCompletedAt. Skip crashes and
   // rows already represented by findingsCompletedAt. A fixed window would hide
@@ -4608,11 +4609,16 @@ async function latestCompletedFindingsScan(
       (state) =>
         state.findingsCompletedAt === undefined &&
         state.inspectionFailed !== true &&
-        (indexedScan === null || state.completedAt > indexedScan.findingsCompletedAt),
+        (indexedFindingsAt === undefined || state.completedAt > indexedFindingsAt),
     );
     if (found) return found;
     const oldest = page.page.at(-1);
-    if (indexedScan && oldest && oldest.completedAt <= indexedScan.findingsCompletedAt) {
+    if (
+      indexedScan &&
+      indexedFindingsAt !== undefined &&
+      oldest &&
+      oldest.completedAt <= indexedFindingsAt
+    ) {
       return indexedScan;
     }
     const nextKey = page.indexKeys.at(-1);
