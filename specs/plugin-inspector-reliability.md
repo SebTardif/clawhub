@@ -57,8 +57,10 @@ A nightly run that throws stores `inspectionFailed` on that inspector and
 target tuple, plus a failed SDK inventory when one was supplied. That flag
 describes the latest attempt only. `findingsCompletedAt` is set when a run
 actually stores a findings scan, and a later crash of the same tuple must
-not clear it. The moderator validation report reads the newest
-`findingsCompletedAt`. Rows written before that field existed still count
+not clear it. The moderator validation report uses the newer of the newest
+`findingsCompletedAt` and the newest pre-field success `completedAt`.
+Copying an older tuple forward must not hide a newer row that still has
+only `completedAt`. Rows written before that field existed still count
 as findings scans when `inspectionFailed` is absent. A later crash of that
 same tuple copies the old `completedAt` into `findingsCompletedAt` before
 replacing the attempt time. The report walks the whole `completedAt` index

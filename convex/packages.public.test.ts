@@ -3721,6 +3721,50 @@ describe("packages public queries", () => {
     });
   });
 
+  it("prefers a newer legacy findings scan over an older promoted tuple", async () => {
+    const digest = makePluginExportDigest("demo", "code-plugin", 300);
+    const releaseId = "packageReleases:demo-1";
+    const ctx = makePluginValidationReportCtx([digest], {
+      statesByRelease: {
+        [releaseId]: [
+          {
+            releaseId,
+            inspectorVersion: "0.4.2",
+            targetOpenClawVersion: "2026.10.01",
+            completedAt: 900,
+            findingsCompletedAt: 100,
+            inspectionFailed: true,
+          },
+          {
+            releaseId,
+            inspectorVersion: "0.4.3",
+            targetOpenClawVersion: "2026.10.16",
+            completedAt: 200,
+          },
+        ],
+      },
+      findingsByRelease: {
+        [releaseId]: [
+          {
+            scanSource: "nightly",
+            inspectorVersion: "0.4.3",
+            targetOpenClawVersion: "2026.10.16",
+            findingKind: "error",
+            code: "missing-api",
+            message: "Required API is unavailable",
+          },
+        ],
+      },
+    });
+
+    const result = await listPluginValidationReportPageInternalHandler(ctx, { numItems: 20 });
+
+    expect(result.items[0]).toMatchObject({
+      scan: { status: "error", scannedAt: 200, inspectorVersion: "0.4.3" },
+      findings: [{ severity: "error", code: "missing-api" }],
+    });
+  });
+
   it("keeps an older findings scan behind more than twenty newer crashes", async () => {
     const digest = makePluginExportDigest("demo", "code-plugin", 300);
     const releaseId = "packageReleases:demo-1";

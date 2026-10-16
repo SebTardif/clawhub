@@ -658,6 +658,85 @@ describe("public SDK usage from serialized Inspector reports", () => {
     });
   });
 
+  it("keeps a newer legacy findings row ahead of an older tuple promoted by a crash", async () => {
+    const { t, packageId, releaseId, ownerUserId, ingest } = await fixture();
+    await t.run(async (ctx) => {
+      await ctx.db.insert("packageSearchDigest", {
+        packageId,
+        name: "sdk-plugin",
+        normalizedName: "sdk-plugin",
+        displayName: "SDK plugin",
+        ownerUserId,
+        family: "code-plugin",
+        channel: "community",
+        isOfficial: false,
+        latestVersion: "1.0.0",
+        scanStatus: "clean",
+        stats: { downloads: 0, installs: 0, stars: 0, versions: 1 },
+        createdAt: 1,
+        updatedAt: 1,
+      });
+      await ctx.db.insert("packageInspectorScanStates", {
+        packageId,
+        releaseId,
+        inspectorVersion: "0.4.2",
+        targetOpenClawVersion: "2026.10.01",
+        completedAt: 100,
+      });
+      await ctx.db.insert("packageInspectorScanStates", {
+        packageId,
+        releaseId,
+        inspectorVersion: "0.4.3",
+        targetOpenClawVersion: "2026.10.16",
+        completedAt: 200,
+      });
+      await ctx.db.insert("packageInspectorWarnings", {
+        packageId,
+        releaseId,
+        ownerUserId,
+        packageName: "sdk-plugin",
+        version: "1.0.0",
+        scanSource: "nightly",
+        inspectorVersion: "0.4.3",
+        targetOpenClawVersion: "2026.10.16",
+        findingKind: "error",
+        code: "missing-api",
+        message: "Required API is unavailable",
+        createdAt: 200,
+      });
+    });
+    expect(
+      (
+        await ingest(failedSdkUsageReport("inspector crashed"), {
+          inspectorVersion: "0.4.2",
+          targetOpenClawVersion: "2026.10.01",
+          inspectionFailed: true,
+          findings: [],
+        })
+      ).status,
+    ).toBe(200);
+    const stored = await t.run(async (ctx) =>
+      ctx.db
+        .query("packageInspectorScanStates")
+        .withIndex("by_release_and_inspector_version_and_target_openclaw_version", (q) =>
+          q
+            .eq("releaseId", releaseId)
+            .eq("inspectorVersion", "0.4.2")
+            .eq("targetOpenClawVersion", "2026.10.01"),
+        )
+        .unique(),
+    );
+    expect(stored?.inspectionFailed).toBe(true);
+    expect(stored?.findingsCompletedAt).toBe(100);
+    const report = await t.query(internal.packages.listPluginValidationReportPageInternal, {
+      numItems: 20,
+    });
+    expect(report.items[0]).toMatchObject({
+      scan: { status: "error", scannedAt: 200, inspectorVersion: "0.4.3" },
+      findings: [expect.objectContaining({ code: "missing-api", severity: "error" })],
+    });
+  });
+
   it("reads several legacy releases in one validation report page", async () => {
     const { t, packageId, releaseId, ownerUserId } = await fixture();
     await t.run(async (ctx) => {

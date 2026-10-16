@@ -4576,19 +4576,20 @@ async function latestCompletedFindingsScan(
 ) {
   // Rows written after this change record findingsCompletedAt only for a
   // finished findings scan. A later crash on that same tuple leaves the
-  // timestamp in place, so the index still returns it.
+  // timestamp in place, so the index still returns it. That timestamp can be
+  // older than a pre-field success that has not been copied forward yet.
   const indexed = await ctx.db
     .query("packageInspectorScanStates")
     .withIndex("by_release_and_findings_completed_at", (q) => q.eq("releaseId", releaseId))
     .order("desc")
     .first();
-  if (indexed?.findingsCompletedAt !== undefined) return indexed;
+  const indexedScan = indexed?.findingsCompletedAt !== undefined ? indexed : null;
 
   // Older rows have completedAt and no findingsCompletedAt. Skip crashes and
-  // keep reading until a successful tuple or the end of the index. A fixed
-  // window would hide that tuple behind enough newer failed targets.
-  // getPage can run once per release in this query. Native .paginate() cannot:
-  // a second call throws MultiplePaginatedDatabaseQueries.
+  // rows already represented by findingsCompletedAt. A fixed window would hide
+  // a success behind enough newer failed targets. getPage can run once per
+  // release in this query. Native .paginate() cannot: a second call throws
+  // MultiplePaginatedDatabaseQueries.
   let startIndexKey: IndexKey = [releaseId];
   let startInclusive = true;
   while (true) {
@@ -4603,10 +4604,19 @@ async function latestCompletedFindingsScan(
       absoluteMaxRows: 25,
       schema,
     });
-    const found = page.page.find((state) => state.inspectionFailed !== true);
+    const found = page.page.find(
+      (state) =>
+        state.findingsCompletedAt === undefined &&
+        state.inspectionFailed !== true &&
+        (indexedScan === null || state.completedAt > indexedScan.findingsCompletedAt),
+    );
     if (found) return found;
+    const oldest = page.page.at(-1);
+    if (indexedScan && oldest && oldest.completedAt <= indexedScan.findingsCompletedAt) {
+      return indexedScan;
+    }
     const nextKey = page.indexKeys.at(-1);
-    if (!page.hasMore || !nextKey) return null;
+    if (!page.hasMore || !nextKey) return indexedScan;
     startIndexKey = nextKey;
     startInclusive = false;
   }
