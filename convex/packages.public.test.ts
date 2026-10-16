@@ -2310,32 +2310,81 @@ function makePluginValidationReportCtx(
                 indexName: string,
                 builder: (q: { eq: (field: string, value: unknown) => unknown }) => unknown,
               ) => {
+                const filters: Array<{ op: string; field: string; value: unknown }> = [];
+                const remember = (op: string) => (field: string, value: unknown) => {
+                  filters.push({ op, field, value });
+                  return queryBuilder;
+                };
                 const queryBuilder = {
-                  eq: (field: string, value: unknown) => {
-                    if (field === "releaseId") releaseId = String(value);
-                    return queryBuilder;
-                  },
+                  eq: remember("eq"),
+                  lt: remember("lt"),
+                  lte: remember("lte"),
+                  gt: remember("gt"),
+                  gte: remember("gte"),
                 };
                 builder(queryBuilder);
+                const releaseFilter = filters.find(
+                  (filter) => filter.op === "eq" && filter.field === "releaseId",
+                );
+                if (releaseFilter) releaseId = String(releaseFilter.value);
                 return {
                   order: vi.fn(() => {
                     const ordered = () => {
-                      const rows = [...(options.statesByRelease?.[releaseId] ?? [])];
+                      const rows: Array<Record<string, unknown>> = [
+                        ...(options.statesByRelease?.[releaseId] ?? []),
+                      ].map((row, index) => ({
+                        ...row,
+                        _id:
+                          typeof row._id === "string"
+                            ? row._id
+                            : `packageInspectorScanStates:${releaseId}:${index}`,
+                        _creationTime:
+                          typeof row._creationTime === "number" ? row._creationTime : index,
+                      }));
+                      const compareValues = (left: unknown, right: unknown) => {
+                        if (typeof left === "number" && typeof right === "number")
+                          return left - right;
+                        if (typeof left === "string" && typeof right === "string") {
+                          if (left < right) return -1;
+                          if (left > right) return 1;
+                          return 0;
+                        }
+                        return null;
+                      };
+                      const bounded = rows.filter((row) =>
+                        filters.every((filter) => {
+                          if (filter.op === "eq" && filter.field === "releaseId") return true;
+                          const left = row[filter.field];
+                          const right = filter.value;
+                          if (filter.op === "eq") return left === right;
+                          const order = compareValues(left, right);
+                          if (order === null) return false;
+                          if (filter.op === "lt") return order < 0;
+                          if (filter.op === "lte") return order <= 0;
+                          if (filter.op === "gt") return order > 0;
+                          if (filter.op === "gte") return order >= 0;
+                          return false;
+                        }),
+                      );
                       if (indexName === "by_release_and_findings_completed_at") {
-                        return rows
+                        return bounded
                           .filter((row) => row.findingsCompletedAt !== undefined)
                           .sort(
                             (a, b) => Number(b.findingsCompletedAt) - Number(a.findingsCompletedAt),
                           );
                       }
-                      return rows.sort((a, b) => Number(b.completedAt) - Number(a.completedAt));
+                      return bounded.sort((a, b) => Number(b.completedAt) - Number(a.completedAt));
                     };
+                    const rows = ordered();
                     return {
-                      first: vi.fn(async () => ordered()[0] ?? null),
-                      take: vi.fn(async (limit: number) => ordered().slice(0, limit)),
+                      [Symbol.asyncIterator]: async function* scanStates() {
+                        for (const row of rows) yield row;
+                      },
+                      first: vi.fn(async () => rows[0] ?? null),
+                      take: vi.fn(async (limit: number) => rows.slice(0, limit)),
                       paginate: vi.fn(async ({ numItems }: { numItems: number }) => ({
-                        page: ordered().slice(0, numItems),
-                        isDone: ordered().length <= numItems,
+                        page: rows.slice(0, numItems),
+                        isDone: rows.length <= numItems,
                         continueCursor: "",
                       })),
                     };

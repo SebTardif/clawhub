@@ -59,9 +59,12 @@ describes the latest attempt only. `findingsCompletedAt` is set when a run
 actually stores a findings scan, and a later crash of the same tuple must
 not clear it. The moderator validation report reads the newest
 `findingsCompletedAt`. Rows written before that field existed still count
-as findings scans when `inspectionFailed` is absent, and the report walks
-the whole `completedAt` index to find one. It does not stop after a fixed
-number of newer crashes. The crashed release stays eligible for the next
+as findings scans when `inspectionFailed` is absent. A later crash of that
+same tuple copies the old `completedAt` into `findingsCompletedAt` before
+replacing the attempt time. The report walks the whole `completedAt` index
+with `getPage`, not native pagination, so one report page can read every
+release. It does not stop after a fixed number of newer crashes. The crashed
+release stays eligible for the next
 inventory claim. A later successful run of the same tuple clears
 `inspectionFailed` and refreshes `findingsCompletedAt`. A failed run does
 not mark owner notification complete.

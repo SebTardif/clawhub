@@ -4587,17 +4587,28 @@ async function latestCompletedFindingsScan(
   // Older rows have completedAt and no findingsCompletedAt. Skip crashes and
   // keep reading until a successful tuple or the end of the index. A fixed
   // window would hide that tuple behind enough newer failed targets.
-  let cursor: string | null = null;
+  // getPage can run once per release in this query. Native .paginate() cannot:
+  // a second call throws MultiplePaginatedDatabaseQueries.
+  let startIndexKey: IndexKey = [releaseId];
+  let startInclusive = true;
   while (true) {
-    const page = await ctx.db
-      .query("packageInspectorScanStates")
-      .withIndex("by_release_and_completed_at", (q) => q.eq("releaseId", releaseId))
-      .order("desc")
-      .paginate({ numItems: 25, cursor });
+    const page = await getPage(ctx, {
+      table: "packageInspectorScanStates",
+      index: "by_release_and_completed_at",
+      startIndexKey,
+      startInclusive,
+      endIndexKey: [releaseId],
+      endInclusive: true,
+      order: "desc",
+      absoluteMaxRows: 25,
+      schema,
+    });
     const found = page.page.find((state) => state.inspectionFailed !== true);
     if (found) return found;
-    if (page.isDone) return null;
-    cursor = page.continueCursor;
+    const nextKey = page.indexKeys.at(-1);
+    if (!page.hasMore || !nextKey) return null;
+    startIndexKey = nextKey;
+    startInclusive = false;
   }
 }
 
