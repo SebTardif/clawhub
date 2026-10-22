@@ -69,11 +69,17 @@ export const PRIMARY_NAV_ITEMS: NavItem[] = [
 // Secondary nav items (desktop secondary tabs + mobile dropdown section)
 // ---------------------------------------------------------------------------
 
+const OPENCLAW_SUPPORT_URL = "https://community.openclaw.ai/";
+
 export const SECONDARY_NAV_ITEMS: NavItem[] = [
   {
     label: "Docs",
     href: CLAWHUB_DOCS_URL,
     activePathPrefixes: ["/docs"],
+  },
+  {
+    label: "Support",
+    href: OPENCLAW_SUPPORT_URL,
   },
 ];
 
@@ -167,6 +173,7 @@ export const FOOTER_NAV_SECTIONS: FooterNavSection[] = [
   {
     title: "Community",
     items: [
+      { kind: "external", label: "Support", href: OPENCLAW_SUPPORT_URL },
       {
         kind: "external",
         label: "GitHub",
@@ -184,6 +191,7 @@ export const FOOTER_NAV_SECTIONS: FooterNavSection[] = [
 ];
 
 export const FOOTER_PLATFORM_LINKS = [
+  { label: "Privacy policy", href: "https://openclaw.ai/privacy" },
   { label: "Status", href: "https://clawhub.betteruptime.com" },
   { label: "Deployed on Vercel", href: "https://vercel.com" },
   { label: "Powered by Convex", href: "https://www.convex.dev" },
@@ -227,7 +235,7 @@ export const FOOTER_ECOSYSTEM_PROJECTS: FooterEcosystemProject[] = [
   {
     label: "ClickClack",
     href: "https://clickclack.chat",
-    blurb: "Chat for claws",
+    blurb: "Agent chat",
     logoUrl: openclawEcosystemAsset("/ecosystem/logos/clickclack.svg"),
   },
   {

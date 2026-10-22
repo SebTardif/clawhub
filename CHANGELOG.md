@@ -2,8 +2,32 @@
 
 ## Unreleased
 
+- skills.sh: sync once a day at 03:00 Pacific and mirror the top 4,000 rows of the all-time and trending views, so the sync completes again after skills.sh expanded its default feed to ~93k rows; Trending keeps the last skills.sh run for up to 50 hours.
+- Workers: include bounded, redacted skill evaluation failure reasons in CI logs so operators can diagnose failed runs.
+- Tooling: accept Bun's environment-file loading diagnostic in local dependency audits while preserving tool-error and malware failures.
+- Plugins: show informational notices for OpenClaw APIs with scheduled retirement dates, with replacement details and a publisher dashboard nudge.
+- Dependencies: update Plugin Inspector to 0.4.0 in the app and CLI to retain structured API retirement guidance; the CLI now requires Node.js 22.13+ on the 22.x line or Node.js 24+.
+- CLI/Scans: load Plugin Inspector only for validation, select Node.js 24 for hosted Convex actions, and run bulk scans under Node.js; ordinary Bun CLI commands remain available, while local plugin validation explains its Node.js requirement.
+
+- Dependencies: patch vulnerable DOMPurify, Next.js preview tooling, shell-quote, and source-map-js versions.
+- Dependencies: refresh supported React, TanStack, Radix, email, CLI utility, lint, format, and test packages while retaining the current Node and compiler compatibility contracts.
+
+- Tests: update Vitest and its V8 coverage provider together to 5.0.3; retain registered auth callbacks across per-test mock cleanup.
+- Tests: update jsdom to 30.1.2 and allow its required Undici 8 transport while keeping the CLI on Undici 7.
+- Runtime: use Bun 1.3.14 across CI and deployment tooling to preserve labelled conditional blocks when compiling React server rendering.
+- Tests: revalidate cached npm metadata before installing updated Convex external dependencies, retaining cached package tarballs and bounded fetches.
+
+- Dependencies: refresh production packages and synchronize the Sharp pin; let each package resolve its supported Undici transport and use the unpatched upstream Workpool release. Retain the old Workpool typecheck patch only for the previous-version test fixture.
+
+- Use one shared autoreview installation from `openclaw/agent-skills`; repository entrypoints now receive upstream fixes without copied helpers or test suites.
+
+## 0.24.0 - 2026-09-30
+
 ### Changes
 
+- CLI/API: publish experimental Claw packages from already-built npm tarballs, bind staged uploads to their SHA-256 digest, and preserve the exact artifact bytes through scanning and download.
+- API: expose public exact-version package publication state to distinguish staged, failed, absent, and published releases with advisory recovery eligibility.
+- CI: record dependency advisories from `bun audit` as warning annotations instead of failing `static` and blocking Deploy Test; known-malware findings still fail.
 - Workers: default Skill Cards to GPT-6 Sol with medium reasoning and fast service, and prepare semantic input reuse with stale-result fencing for separate activation after backend deployment.
 - Workers: preserve optional scanner model and reasoning settings in restricted subprocess environments without changing workflow defaults.
 - Web: organization publishers can upload durable PNG, JPEG, or WebP logos from settings instead of relying on hotlinked image URLs.
@@ -11,7 +35,14 @@
 
 ### Fixes
 
+- Publishing: load only the text decoder, not the whole `clawhub-schema` barrel, in the static publish scan Node action, cutting ~140 MB from its peak so large bundled plugins such as WhatsApp no longer run it out of memory.
+- Publishing: settle retries of an exact staged package artifact before scans and Plugin Inspector run again, returning the pending or published result, and name a failed attempt with its recovery command instead of a bare "already exists".
+- CLI: read `Retry-After` and rate-limit headers from curl responses under Bun, so publishes back off for the time the server asks instead of retrying blind.
+- CLI: keep completed skill installs and updates when deleting an old backup fails, without rolling back the new files (thanks @SebTardif).
+- Publishing: prepare the Plugin Inspector OpenClaw target by streaming and verifying only its public declaration surface, so plugin publishes no longer run the Node action out of memory or fill `/tmp` with the full OpenClaw package.
 - Deploy: coalesce pending skills.sh syncs per ref before they enter the production deployment queue, while preserving active sync cleanup and queued manual deploys.
+
+- Dependencies: align brace-expansion and fast-uri overrides with their patched lockfile versions so dependency resolution cannot restore the vulnerable pins.
 
 - Workers: reserve Skill Card capacity by lease slot to avoid global queue contention, continue after partial batches, and release undelivered leases when input hydration fails.
 

@@ -57,6 +57,12 @@ export const PluginManifestSummarySchema = type({
     }).array(),
     mcpServers: type({
         name: "string",
+        url: "string?",
+        "transport?": '"streamable-http"|"sse"|"stdio"',
+        "auth?": '"oauth"|"api-key"|"none"',
+        scope: "string?",
+        setup: "string?",
+        endpointRedacted: "boolean?",
     }).array(),
     bundledSkills: type({
         name: "string",
@@ -178,6 +184,21 @@ export const PackageSkillSpectorAnalysisSchema = type({
     summary: "string?",
     error: "string?",
     checkedAt: "number",
+});
+export const PackageEndorAnalysisSchema = type({
+    status: '"completed"',
+    checkedAt: "number",
+    reachableFunctionCount: "number.integer >= 0",
+    findings: type({
+        severity: type("string").atMostLength(64),
+        summary: type("string").atMostLength(2000),
+    })
+        .array()
+        .atMostLength(50),
+}).or({
+    status: '"skipped"|"failed"',
+    checkedAt: "number",
+    reason: type("string").atMostLength(2000),
 });
 export const PackageAigFindingSchema = type({
     ruleId: "string",
@@ -474,6 +495,7 @@ export const ApiV1PackageVersionResponseSchema = type({
         version: "string",
         createdAt: "number",
         changelog: "string",
+        icon: "string|null?",
         distTags: "string[]?",
         files: "unknown",
         compatibility: PackageCompatibilitySchema.or("null").optional(),
@@ -485,11 +507,33 @@ export const ApiV1PackageVersionResponseSchema = type({
         sha256hash: "string|null?",
         vtAnalysis: PackageVtAnalysisSchema.or("null").optional(),
         skillSpectorAnalysis: PackageSkillSpectorAnalysisSchema.or("null").optional(),
+        endorAnalysis: PackageEndorAnalysisSchema.or("null").optional(),
         aigAnalysis: PackageAigAnalysisSchema.or("null").optional(),
         llmAnalysis: PackageLlmAnalysisSchema.or("null").optional(),
         staticScan: PackageStaticScanSchema.or("null").optional(),
     }).or("null"),
 });
+export const ApiV1PackageVersionPublicationResponseSchema = type({
+    name: "string",
+    version: "string",
+    state: '"published"|"absent"',
+})
+    .or({ name: "string", version: "string", state: '"pending"', stage: '"staging"' })
+    .or({
+    name: "string",
+    version: "string",
+    state: '"pending"',
+    stage: '"checks"|"finalization"',
+    attemptId: "string",
+})
+    .or({
+    name: "string",
+    version: "string",
+    state: '"failed"',
+    "attemptId?": "string",
+    recoverable: "boolean",
+})
+    .onUndeclaredKey("reject");
 export const ApiV1PackageArtifactResponseSchema = type({
     package: type({
         name: "string",
@@ -536,6 +580,7 @@ export const ApiV1PackageSecurityResponseSchema = type({
         npmShasum: "string?",
         npmTarballName: "string?",
         createdAt: "number",
+        endorAnalysis: PackageEndorAnalysisSchema.or("null").optional(),
     }),
     trust: type({
         scanStatus: '"clean"|"suspicious"|"malicious"|"pending"|"not-run"',

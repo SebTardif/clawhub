@@ -316,6 +316,27 @@ describe("Header", () => {
     expect(screen.queryByText("About")).toBeNull();
   });
 
+  it("routes desktop, overflow, and mobile support links to official OpenClaw support", () => {
+    render(<Header />);
+
+    const topNav = screen.getByRole("navigation", { name: "Primary navigation" });
+    const desktopSupport = topNav.querySelector(
+      '.navbar-calm-rail-link-secondary[href="https://community.openclaw.ai/"]',
+    );
+    const overflowSupport = topNav.querySelector(
+      '.navbar-calm-more-link[href="https://community.openclaw.ai/"]',
+    );
+    expect(desktopSupport?.textContent).toBe("Support");
+    expect(overflowSupport?.textContent).toBe("Support");
+
+    fireEvent.click(screen.getByRole("button", { name: "Open menu" }));
+
+    const mobileMenu = screen.getByRole("dialog");
+    expect(within(mobileMenu).getByRole("link", { name: "Support" }).getAttribute("href")).toBe(
+      "https://community.openclaw.ai/",
+    );
+  });
+
   it("renders theme mode controls as a compact row between Settings and Sign out", () => {
     authStatusMock.mockReturnValue({
       isAuthenticated: true,
@@ -475,7 +496,7 @@ describe("Header", () => {
     expect(scrollIntoViewMock).toHaveBeenLastCalledWith({ block: "nearest" });
   });
 
-  it("shows skills, plugins, and creators together in grouped typeahead sections", () => {
+  it("shows plugins before skills and creators in grouped typeahead sections", () => {
     navigateMock.mockReset();
 
     render(<Header />);
@@ -488,6 +509,11 @@ describe("Header", () => {
     const skillGroup = within(typeahead).getByRole("group", { name: "Skills" });
     const pluginGroup = within(typeahead).getByRole("group", { name: "Plugins" });
     const creatorGroup = within(typeahead).getByRole("group", { name: "Creators" });
+    expect(within(typeahead).getAllByRole("group")).toEqual([
+      pluginGroup,
+      skillGroup,
+      creatorGroup,
+    ]);
     expect(screen.getByText("Weather Skill")).toBeTruthy();
     expect(screen.getByText("Weather Plugin")).toBeTruthy();
     expect(screen.getByText("Local Creator")).toBeTruthy();
@@ -512,7 +538,9 @@ describe("Header", () => {
     expect(input.getAttribute("aria-expanded")).toBe("true");
     const activeDescendant = input.getAttribute("aria-activedescendant");
     expect(activeDescendant).toBeTruthy();
-    expect(document.getElementById(activeDescendant ?? "")).toBeTruthy();
+    expect(document.getElementById(activeDescendant ?? "")?.textContent).toContain(
+      "Weather Plugin",
+    );
     expect(within(typeahead).queryByText("Publishers")).toBeNull();
     expect(within(typeahead).queryByText('See user results for "weather"')).toBeNull();
     expect(within(typeahead).getByText('See creator results for "weather"')).toBeTruthy();
@@ -522,7 +550,7 @@ describe("Header", () => {
 
     expect(navigateMock).toHaveBeenCalledWith({
       to: "/search",
-      search: { q: "weather", type: "skills" },
+      search: { q: "weather", type: "plugins" },
     });
   });
 
@@ -749,7 +777,7 @@ describe("Header", () => {
       .map((element) => element.textContent?.trim())
       .filter((label): label is string => Boolean(label));
 
-    expect(labels).toEqual(["Home", "Skills", "Plugins", "Official", "Docs"]);
+    expect(labels).toEqual(["Home", "Skills", "Plugins", "Official", "Docs", "Support"]);
   });
 
   it("links profile and bookmarks from the signed-in avatar menu", () => {

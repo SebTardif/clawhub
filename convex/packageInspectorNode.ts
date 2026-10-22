@@ -4,7 +4,10 @@ import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { v } from "convex/values";
+import rootPackageJson from "../package.json";
 import { internalAction } from "./_generated/server";
+import { prepareOpenClawInspectorTarget } from "./lib/openClawInspectorTarget";
+import { pluginApiRetirement } from "./lib/pluginApiRetirements";
 
 type InspectorFinding = {
   id?: string;
@@ -14,6 +17,9 @@ type InspectorFinding = {
   issueClass?: string;
   compatStatus?: string;
   deprecated?: boolean;
+  deprecatedApi?: string;
+  replacement?: string;
+  removeAfter?: string;
   message: string;
   evidence?: string[];
   authorRemediation?: InspectorAuthorRemediation;
@@ -43,6 +49,7 @@ type InspectorReport = {
 
 const AUTHOR_REMEDIATION_DOCS_BASE = "https://docs.openclaw.ai/clawhub/plugin-validation-fixes";
 const PACKAGE_INSPECTOR_TEMP_PREFIX = "clawhub-plugin-inspector-";
+const OPENCLAW_TARGET_CACHE_DIR = "clawhub-plugin-inspector-openclaw";
 const SERVERLESS_TEMP_DIR = "/tmp";
 const TEMP_DIR_FALLBACK_ERROR_CODES = new Set(["EACCES", "ENOENT", "ENOTDIR", "EPERM", "EROFS"]);
 
@@ -113,6 +120,9 @@ const findingValidator = v.object({
   issueClass: v.optional(v.string()),
   compatStatus: v.optional(v.string()),
   deprecated: v.optional(v.boolean()),
+  deprecatedApi: v.optional(v.string()),
+  replacement: v.optional(v.string()),
+  removeAfter: v.optional(v.string()),
   message: v.string(),
   evidence: v.optional(v.array(v.string())),
   authorRemediation: v.optional(
@@ -130,23 +140,10 @@ const inspectorMetadataValidator = v.object({
   targetOpenClawVersion: v.optional(v.string()),
 });
 
-export async function preparePublishInspectorOpenClawTarget<ResolvedTarget, PreparedTarget>(
-  root: string,
-  targets: {
-    resolveVersion: (requestedVersion: string) => Promise<ResolvedTarget>;
-    prepare: (
-      resolvedTarget: ResolvedTarget,
-      options: { cacheDir: string },
-    ) => Promise<PreparedTarget>;
-  },
-) {
-  const resolvedTarget = await targets.resolveVersion("latest");
-  return await targets.prepare(resolvedTarget, {
-    // The dependency defaults to os.homedir(), which can be unusable in serverless runtimes.
-    cacheDir: path.join(root, ".plugin-inspector-cache"),
-  });
-}
-
+// The publish gate needs only compatibility findings. An artifact SDK inventory
+// builds a TypeScript program over every packed file, including bundled
+// node_modules, and peaks far above the 512 MiB Node action limit for large
+// channel plugins. The daily Package Inspector scan owns artifact inventories.
 export function buildPublishInspectorRunCheckOptions(
   root: string,
   generatedAt: string,
@@ -175,18 +172,37 @@ export async function createPackageInspectorWorkspace(
   try {
     return await createTempDir(path.join(preferredTempDir, PACKAGE_INSPECTOR_TEMP_PREFIX));
   } catch (error) {
-    const code =
-      typeof error === "object" && error !== null && "code" in error ? error.code : undefined;
-    if (
-      process.platform === "win32" ||
-      path.resolve(preferredTempDir) === SERVERLESS_TEMP_DIR ||
-      typeof code !== "string" ||
-      !TEMP_DIR_FALLBACK_ERROR_CODES.has(code)
-    ) {
-      throw error;
-    }
+    if (!canUseServerlessTempFallback(preferredTempDir, error)) throw error;
     return await createTempDir(path.join(SERVERLESS_TEMP_DIR, PACKAGE_INSPECTOR_TEMP_PREFIX));
   }
+}
+
+// The prepared OpenClaw target outlives each inspection so warm Node actions reuse it.
+export async function resolveOpenClawTargetCacheRoot(
+  preferredTempDir = tmpdir(),
+  makeDir: (dir: string) => Promise<unknown> = (dir) => mkdir(dir, { recursive: true }),
+) {
+  const preferred = path.join(preferredTempDir, OPENCLAW_TARGET_CACHE_DIR);
+  try {
+    await makeDir(preferred);
+    return preferred;
+  } catch (error) {
+    if (!canUseServerlessTempFallback(preferredTempDir, error)) throw error;
+    const fallback = path.join(SERVERLESS_TEMP_DIR, OPENCLAW_TARGET_CACHE_DIR);
+    await makeDir(fallback);
+    return fallback;
+  }
+}
+
+function canUseServerlessTempFallback(preferredTempDir: string, error: unknown) {
+  const code =
+    typeof error === "object" && error !== null && "code" in error ? error.code : undefined;
+  return (
+    process.platform !== "win32" &&
+    path.resolve(preferredTempDir) !== SERVERLESS_TEMP_DIR &&
+    typeof code === "string" &&
+    TEMP_DIR_FALLBACK_ERROR_CODES.has(code)
+  );
 }
 
 export const runPackageInspectorForPublishInternal = internalAction({
@@ -249,11 +265,14 @@ export const runPackageInspectorForPublishInternal = internalAction({
       }
       await writeSyntheticInspectorConfigIfNeeded(root, args.files, args.packageName);
 
-      const { openClawTargets, pluginRoot } = await import("@openclaw/plugin-inspector");
+      const { openClawTargets, pluginRoot, reports } = await import("@openclaw/plugin-inspector");
       enterStage("OpenClaw target preparation");
-      const targetOpenClaw = await preparePublishInspectorOpenClawTarget(
-        workspaceRoot,
-        openClawTargets,
+      const targetOpenClaw = await prepareOpenClawInspectorTarget(
+        await resolveOpenClawTargetCacheRoot(),
+        {
+          readTargetSurface: (options) => reports.readOpenClawTargetSurface(options),
+          eligibilityVersion: (version) => openClawTargets.eligibilityVersion(version),
+        },
       );
       const runCheckOptions = buildPublishInspectorRunCheckOptions(
         root,
@@ -412,6 +431,9 @@ function normalizeFinding(value: unknown, defaultLevel: string): InspectorFindin
     issueClass: stringValue(value.issueClass),
     compatStatus: stringValue(value.compatStatus),
     deprecated: typeof value.deprecated === "boolean" ? value.deprecated : undefined,
+    deprecatedApi: stringValue(value.deprecatedApi),
+    replacement: stringValue(value.replacement),
+    removeAfter: stringValue(value.removeAfter),
     message,
     evidence: Array.isArray(value.evidence)
       ? value.evidence.map((entry) => String(entry)).slice(0, 12)
@@ -434,7 +456,7 @@ function normalizeAuthorRemediation(value: unknown): InspectorAuthorRemediation 
 }
 
 function hasAuthorRemediation(finding: InspectorFinding) {
-  return Boolean(finding.authorRemediation?.summary);
+  return Boolean(finding.authorRemediation?.summary || pluginApiRetirement(finding));
 }
 
 function legacyAuthorRemediation(code: string): InspectorAuthorRemediation | undefined {
@@ -460,7 +482,10 @@ function stringValue(value: unknown) {
 }
 
 function getBundledInspectorVersion() {
-  return stringValue(process.env.CLAWHUB_PLUGIN_INSPECTOR_VERSION);
+  return (
+    stringValue(process.env.CLAWHUB_PLUGIN_INSPECTOR_VERSION) ??
+    rootPackageJson.dependencies["@openclaw/plugin-inspector"]
+  );
 }
 
 function extractTargetOpenClawVersion(targetOpenClaw: unknown) {

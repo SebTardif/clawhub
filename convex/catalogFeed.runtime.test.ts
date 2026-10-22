@@ -1,6 +1,7 @@
 /// <reference types="vite/client" />
 /* @vitest-environment edge-runtime */
 import { register as registerRateLimiter } from "@convex-dev/rate-limiter/test";
+import { CATALOG_FEED_ID } from "clawhub-schema";
 import { convexTest } from "convex-test";
 import { afterEach, describe, expect, it, vi } from "vitest";
 
@@ -19,10 +20,24 @@ describe("experimental Claw feed runtime", () => {
     vi.unstubAllEnvs();
   });
 
-  it("stores and serves the exact publication only while the gate is enabled", async () => {
-    vi.stubEnv("CLAWHUB_EXPERIMENTAL_CLAWS", "1");
+  it("stores and serves the exact publication by default", async () => {
     const t = convexTest(schema, modules);
     registerRateLimiter(t);
+    const publisherId = await t.run(async (ctx) => {
+      const createdPublisherId = await ctx.db.insert("publishers", {
+        kind: "org",
+        handle: "openclaw",
+        displayName: "OpenClaw",
+        createdAt: 1,
+        updatedAt: 1,
+      });
+      await ctx.db.insert("officialPublishers", {
+        publisherId: createdPublisherId,
+        createdAt: 1,
+        updatedAt: 1,
+      });
+      return createdPublisherId;
+    });
     const stored = await t.mutation(internal.catalogFeed.storeClawPublication, {
       generatedAt: "2026-07-24T00:00:00.000Z",
       expiresAt: "2026-07-25T00:00:00.000Z",
@@ -72,9 +87,114 @@ describe("experimental Claw feed runtime", () => {
     expect(enabled.headers.get("surrogate-control")).toBeNull();
     expect(await enabled.text()).toBe(publication?.payload);
 
-    vi.stubEnv("CLAWHUB_EXPERIMENTAL_CLAWS", "0");
-    const disabled = await t.fetch("/api/v1/feeds/claws");
-    expect(disabled.status).toBe(404);
-    expect(disabled.headers.get("cache-control")).toBe("no-store");
+    await t.run(async (ctx) => {
+      await ctx.db.patch(publisherId, { deactivatedAt: 123 });
+    });
+    expect(
+      await t.query(internal.catalogFeed.getLatestPublication, {
+        feedId: "clawhub-official-claws",
+      }),
+    ).toBeNull();
+    const revoked = await t.fetch("/api/v1/feeds/claws");
+    expect(revoked.status).toBe(503);
+    expect(revoked.headers.get("cache-control")).toBe("no-store");
+  });
+
+  it("does not serve a pre-policy snapshot before publishing a restricted replacement", async () => {
+    const t = convexTest(schema, modules);
+    registerRateLimiter(t);
+    await t.run(async (ctx) => {
+      await ctx.db.insert("catalogFeedPublications", {
+        feedId: "clawhub-official-claws",
+        sequence: 1,
+        generatedAt: "2026-09-30T00:00:00.000Z",
+        expiresAt: "2026-10-01T00:00:00.000Z",
+        payload: '{"entries":[{"id":"@other/legacy"}]}',
+        payloadSha256: "a".repeat(64),
+        publishedAt: 1,
+      });
+    });
+
+    const stale = await t.fetch("/api/v1/feeds/claws", {
+      headers: { "If-None-Match": `"sha256:${"a".repeat(64)}"` },
+    });
+    expect(stale.status).toBe(503);
+    expect(await stale.text()).not.toContain("@other/legacy");
+
+    const replacement = await t.mutation(internal.catalogFeed.storeClawPublication, {
+      generatedAt: "2026-10-01T00:00:00.000Z",
+      expiresAt: "2026-10-02T00:00:00.000Z",
+      entries: [],
+    });
+    expect(replacement).toMatchObject({ sequence: 2, entryCount: 0 });
+    const current = await t.fetch("/api/v1/feeds/claws");
+    expect(current.status).toBe(200);
+    expect(await current.text()).not.toContain("@other/legacy");
+  });
+});
+
+describe("catalog feed pagination runtime", () => {
+  it("publishes every official plugin when the catalog spans multiple pages", async () => {
+    const t = convexTest(schema, modules);
+    registerRateLimiter(t);
+    const packageNames: string[] = [];
+    await t.run(async (ctx) => {
+      const ownerUserId = await ctx.db.insert("users", { handle: "feed-publisher" });
+      const publisherId = await ctx.db.insert("publishers", {
+        kind: "org",
+        handle: "feed-publisher",
+        displayName: "Feed Publisher",
+        createdAt: 1,
+        updatedAt: 1,
+      });
+      await ctx.db.insert("officialPublishers", { publisherId, createdAt: 1, updatedAt: 1 });
+
+      for (let index = 0; index < 101; index += 1) {
+        const name = `@feed-publisher/plugin-${index.toString().padStart(3, "0")}`;
+        packageNames.push(name);
+        const packageId = await ctx.db.insert("packages", {
+          name,
+          normalizedName: name,
+          displayName: `Plugin ${index}`,
+          ownerUserId,
+          ownerPublisherId: publisherId,
+          family: "code-plugin",
+          channel: "official",
+          isOfficial: true,
+          tags: {},
+          stats: { downloads: index, installs: 0, stars: 0, versions: 1 },
+          createdAt: index + 1,
+          updatedAt: index + 1,
+        });
+        const releaseId = await ctx.db.insert("packageReleases", {
+          packageId,
+          version: "1.0.0",
+          publicationStatus: "published",
+          changelog: "Fixture",
+          distTags: ["latest"],
+          files: [],
+          integritySha256: "a".repeat(64),
+          sha256hash: "a".repeat(64),
+          verification: { tier: "source-linked", scope: "artifact-only", scanStatus: "clean" },
+          createdBy: ownerUserId,
+          createdAt: index + 1,
+        });
+        await ctx.db.patch(packageId, {
+          latestReleaseId: releaseId,
+          tags: { latest: releaseId },
+        });
+      }
+    });
+
+    const results = await t.action(internal.catalogFeed.publish, {
+      expiresAt: "2099-01-01T00:00:00.000Z",
+    });
+    expect(results[0]).toMatchObject({ feedId: CATALOG_FEED_ID, entryCount: 101 });
+
+    const publication = await t.query(internal.catalogFeed.getLatestPublication, {
+      feedId: CATALOG_FEED_ID,
+    });
+    const payload = JSON.parse(publication?.payload ?? "{}");
+    expect(payload.entries.map((entry: { id: string }) => entry.id)).toEqual(packageNames);
   });
 });

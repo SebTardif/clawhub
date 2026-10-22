@@ -35,7 +35,8 @@ exactly:
 - child repository, workflow, run, attempt, ref, full ref, and head SHA
 - candidate repository and SHA
 - tooling ref, full ref, and SHA
-- `authorizationRoute`: `automated-awaited` or `automated-detached`
+- `authorizationRoute`: `automated-awaited`, `automated-detached`, or
+  `automated-sealed`
 - non-empty `packages`: exact `{name, version, inventoryDigest}` transactions
 
 The parent receipt is bounded at 64 KiB of UTF-8 JSON, matching the backend,
@@ -106,16 +107,22 @@ visibility are separate boundaries:
 - submission:
   - `automated-awaited`: parent must be active
   - `automated-detached`: parent may be active or completed successfully
+  - `automated-sealed`: parent must be active and the exact immutable release
+    milestone must cover the package transaction
   - `explicit-recovery`: parent may be active, successful, or failed
 - public finalization:
-  - both automated routes require the exact parent attempt to be completed
-    successfully
+  - `automated-awaited` and `automated-detached` require the exact parent
+    attempt to be completed successfully
+  - `automated-sealed` requires the exact immutable release milestone receipt
+    and permits the exact parent attempt to finish successfully or fail
   - explicit recovery requires the exact parent attempt to be completed
     successfully or failed with the protected recovery evidence
 
-Cancelled parents are never authorized. Unknown routes, states, conclusions,
-fields, and versions fail closed. An active parent can authorize only a
-non-public staged release.
+Cancelled parents are never authorized by the awaited, detached, or recovery
+routes. Unknown routes, states, conclusions, fields, and versions fail closed.
+An active parent can authorize only a non-public staged release. The sealed
+milestone preserves exact transactions through terminal parent failure without
+making cancellation or an active parent sufficient for public promotion.
 
 ## Server Authorization
 
@@ -176,13 +183,66 @@ authorization.
 The package source recorded by the registry comes from
 `candidateRepository`/`candidateSha`, not the tooling workflow SHA.
 
+## Retries of a staged version
+
+A staged publish settles an existing attempt for the exact artifact (same actor,
+owner, version, and file or ClawPack fingerprint) before storage scans, the Node
+Plugin Inspector, and classification run again, so a retry costs a lookup, not a
+full re-inspection. A finalized attempt with a published release returns the
+published result. A live attempt returns its pending status and attempt ID, but
+for GitHub Actions only to the same workflow run and attempt: finalization is
+authorized by that run's parent, so another run must not report the release as
+its own. A failed attempt names its ID and reason and, for OpenClaw release
+attempts, the `clawhub package recover` command. Other artifacts and actors for
+the version still get `Version … already exists`.
+
+## Publication state
+
+`GET /api/v1/packages/{name}/versions/{version}/publication` is a public read in the
+`read` rate-limit bucket, with optional bearer-token visibility identical to the
+version endpoint. The planner job has no `id-token: write`; OIDC trusted-publisher
+authorization binds one workflow file and a one-shot mint transaction, and local
+operator tooling has no OIDC. Publication discovery must not require a publish
+credential or consume a mint transaction.
+
+The query reads only the exact `(packageId, version)` release through
+`by_package_version` and its bound `publishAttemptId`. No release means `absent`,
+even if orphaned attempt audit rows remain. Pending releases expose `staging`
+without an attempt, `checks` for `pending_checks`, and `finalization` for
+`ready_to_finalize`, `finalizing`, or transiently `finalized` attempts. Failed
+attempts use the recovery owner's shared static eligibility; actual recovery
+additionally checks current actor authority, claims, and storage. Blocked releases
+and blocked/expired attempts fold into `failed` plus `recoverable: false`, so no
+scanner verdict leaks.
+
+Exposure is limited to the requested name/version and state, stage, attempt ID,
+and advisory recoverability for already-visible packages. Attempt IDs are not
+capabilities: attempt details still require the original actor or publish token,
+and recovery requires a user API token with current publisher membership. Hidden
+published versions keep today's response. A published release whose metadata the
+sibling version route returns stays `published`, including moderated releases;
+publication state does not override download restrictions. Deleted published
+versions retain `404 Version not found`; invisible packages and skills retain
+`404 Package not found`.
+
+Residual risk is early disclosure of an upcoming version number and failed
+staging for visible packages, bounded to rate-limited exact-version lookups.
+Responses are closed objects and never expose error text, scanner checks or
+verdicts, actor/owner/publisher IDs, token IDs, GitHub run IDs, idempotency keys,
+artifact digests, or storage IDs. Legacy servers' `404` or version JSON without a
+`state` require a legacy version probe; unknown states and malformed recognized
+shapes fail closed.
+
 ## Terminal outcomes
 
-An automated-route attempt whose exact parent attempt completed without success
-is terminal: the attempt becomes `failed`, the release remains non-public, and
-finalization never retries it. In particular, a failed bot parent reports
+An awaited or detached automated-route attempt whose exact parent attempt
+completed without success is terminal: the attempt becomes `failed`, the
+release remains non-public, and finalization never retries it. In particular, a
+failed bot parent reports
 `OpenClaw release parent terminal state completed/failure is not authorized by automated-awaited`,
-not a missing recovery artifact. Cancellation is terminal on both routes.
+not a missing recovery artifact. The sealed route is bound to an earlier
+immutable milestone and remains authorized after later parent failure.
+Cancellation remains terminal on every route.
 
 ## Operator discard
 

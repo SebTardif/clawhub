@@ -5,6 +5,7 @@ import type { MutationCtx, QueryCtx } from "./_generated/server";
 import { action, internalAction, internalMutation, internalQuery } from "./functions";
 import { reusableAigAnalysis } from "./lib/aigAnalysis";
 import { manualPackageRecovery } from "./lib/packagePublishRecovery";
+import { sdkUsageReportStorageId } from "./lib/packageSdkUsageStorage";
 import { finalizeSkillPublishAttempt } from "./lib/skillPublish";
 import { requestPublishAttemptDispatch } from "./publishAttemptDispatch";
 
@@ -408,6 +409,8 @@ export const findExistingPublishAttemptForArtifactInternal = internalQuery({
           releaseId: match.packageReleaseId,
           artifactFingerprint: match.artifactFingerprint,
           result: match.result,
+          error: match.status === "failed" ? publishAttemptStatusError(match) : undefined,
+          githubActionsRun: packageAttemptGitHubActionsRun(match),
         };
       }
     }
@@ -445,6 +448,14 @@ export const createPackagePublishAttemptInternal = internalMutation({
   handler: async (ctx, args) => {
     const existing = await findReusablePublishAttemptByIdempotencyKey(ctx, args.idempotencyKey);
     if (existing) {
+      const unusedInventoryId = sdkUsageReportStorageId(args.packageFollowup);
+      if (
+        unusedInventoryId &&
+        unusedInventoryId !== sdkUsageReportStorageId(existing.packageFollowup)
+      ) {
+        await ctx.storage.delete(unusedInventoryId);
+      }
+
       if (existing.status === "pending_checks") {
         await requestPublishAttemptDispatch(ctx, existing._id);
       }
@@ -558,6 +569,20 @@ function compactPublishAttemptCheck(check: {
   };
 }
 
+function packageAttemptGitHubActionsRun(attempt: Doc<"publishAttempts">) {
+  const audit = (attempt.packageFollowup as { githubActionsAudit?: unknown } | undefined)
+    ?.githubActionsAudit as
+    | { repository?: unknown; runId?: unknown; runAttempt?: unknown }
+    | undefined;
+  return typeof audit?.runId === "string" && typeof audit.runAttempt === "string"
+    ? {
+        repository: typeof audit.repository === "string" ? audit.repository : undefined,
+        runId: audit.runId,
+        runAttempt: audit.runAttempt,
+      }
+    : undefined;
+}
+
 function publishAttemptStatusError(attempt: Doc<"publishAttempts">) {
   if (attempt.finalizationLastError) return attempt.finalizationLastError;
   if (attempt.checkClaimLastError) return attempt.checkClaimLastError;
@@ -575,9 +600,12 @@ function getSecretBlockedStorageIds(attempt: {
   files: Array<{ storageId: Id<"_storage"> }>;
   clawpackStorageId?: Id<"_storage">;
   packageInsertArgs?: unknown;
+  packageFollowup?: unknown;
 }) {
   const storageIds = new Set<Id<"_storage">>(attempt.files.map((file) => file.storageId));
   if (attempt.clawpackStorageId) storageIds.add(attempt.clawpackStorageId);
+  const inventoryId = sdkUsageReportStorageId(attempt.packageFollowup);
+  if (inventoryId) storageIds.add(inventoryId);
   const packageInsertArgs = attempt.packageInsertArgs;
   if (packageInsertArgs && typeof packageInsertArgs === "object") {
     const clawpackStorageId = (packageInsertArgs as { clawpackStorageId?: unknown })
@@ -695,43 +723,6 @@ async function deleteSecretBlockedPendingPackageArtifact(
     await ctx.db.delete(attempt.packageId);
   }
 }
-
-export const recordSkillPublishAttemptChecksPassedInternal = internalMutation({
-  args: {
-    attemptId: v.id("publishAttempts"),
-    trufflehogSummary: v.optional(v.string()),
-    clawscanSummary: v.optional(v.string()),
-  },
-  handler: async (ctx, args) => {
-    const attempt = await requireSkillPublishAttempt(ctx, args.attemptId);
-    if (attempt.status === "finalized") {
-      return { attemptId: attempt._id, status: attempt.status, result: attempt.result };
-    }
-    if (attempt.status !== "pending_checks" && attempt.status !== "ready_to_finalize") {
-      throw new ConvexError(`Publish attempt is ${attempt.status}, not pending checks.`);
-    }
-
-    const now = Date.now();
-    await ctx.db.patch(attempt._id, {
-      status: "ready_to_finalize",
-      checks: {
-        trufflehog: {
-          status: "clean",
-          checkedAt: now,
-          summary: args.trufflehogSummary,
-        },
-        clawscan: {
-          status: "clean",
-          checkedAt: now,
-          summary: args.clawscanSummary,
-        },
-      },
-      updatedAt: now,
-    });
-
-    return { attemptId: attempt._id, status: "ready_to_finalize" as const, result: undefined };
-  },
-});
 
 export const completePendingPublishAttemptChecksInternal = internalMutation({
   args: {
@@ -1360,6 +1351,10 @@ export const recordPackagePublishAttemptFinalizedInternal = internalMutation({
     ) {
       throw new ConvexError("Publish attempt finalization claim is not active.");
     }
+
+    const inventoryId = sdkUsageReportStorageId(attempt.packageFollowup);
+    if (inventoryId && (await ctx.db.system.get(inventoryId)))
+      await ctx.storage.delete(inventoryId);
 
     await ctx.db.patch(attempt._id, {
       status: "finalized",

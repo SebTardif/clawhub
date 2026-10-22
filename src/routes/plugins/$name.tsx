@@ -29,6 +29,10 @@ import {
 import { useEffect, useMemo, useState, type ReactNode } from "react";
 import { toast } from "sonner";
 import { api } from "../../../convex/_generated/api";
+import {
+  pluginApiRetirement,
+  type PluginApiRetirement,
+} from "../../../convex/lib/pluginApiRetirements";
 import { CatalogMetadataEditor } from "../../components/CatalogMetadataEditor";
 import {
   DetailHero,
@@ -45,6 +49,7 @@ import { InlineMarkdownSummary } from "../../components/InlineMarkdownSummary";
 import { InstallCopyButton } from "../../components/InstallCopyButton";
 import { Container } from "../../components/layout/Container";
 import { MarkdownPreview } from "../../components/MarkdownPreview";
+import { PluginApiRetirementNotice } from "../../components/PluginApiRetirementNotice";
 import {
   PLUGIN_VERSIONS_PAGE_SIZE,
   PluginVersionsPanel,
@@ -118,7 +123,7 @@ type PluginDetailTab =
   | "mcpServers"
   | "skills";
 
-type PluginInspectorFinding = {
+type PluginInspectorFinding = Partial<PluginApiRetirement> & {
   packageName: string;
   version: string;
   findingKind?: "warning" | "error";
@@ -126,6 +131,7 @@ type PluginInspectorFinding = {
   severity?: string;
   level?: string;
   issueClass?: string;
+  deprecated?: boolean;
   message: string;
   evidence?: string[];
   authorRemediation?: {
@@ -139,6 +145,7 @@ type PluginInspectorFinding = {
 };
 
 type PluginInspectorValidationSummary = {
+  apiRetirements?: PluginApiRetirement[];
   findingCount: number;
   errorCount: number;
   warningCount: number;
@@ -191,11 +198,18 @@ export async function loadPluginDetail(requestedName: string): Promise<PluginDet
   }
 
   try {
+    let releaseVersion = detail.package.latestVersion;
+    let cursor: string | undefined;
+    // Beta-only packages have published releases but no stable/latest pointer.
+    while (!releaseVersion) {
+      const releases = await fetchPackageVersions(resolvedName, { limit: 1, cursor });
+      releaseVersion = releases.items[0]?.version;
+      if (releaseVersion || !releases.nextCursor) break;
+      cursor = releases.nextCursor;
+    }
     const [version, readme] = await Promise.all([
-      detail.package.latestVersion
-        ? fetchPackageVersion(resolvedName, detail.package.latestVersion)
-        : Promise.resolve(null),
-      fetchPackageReadme(resolvedName),
+      releaseVersion ? fetchPackageVersion(resolvedName, releaseVersion) : Promise.resolve(null),
+      releaseVersion ? fetchPackageReadme(resolvedName, releaseVersion) : Promise.resolve(null),
     ]);
 
     return { detail, version, versions: undefined, readme, rateLimited: null };
@@ -389,6 +403,7 @@ function PluginDetailTabs({
         className={`skill-readme-preview${
           isReadmeLong && !isReadmeExpanded ? " is-collapsed" : ""
         }`}
+        data-analytics-public-detail=""
       >
         <MarkdownPreview assetBaseUrl={readmeAssetBaseUrl}>{readme}</MarkdownPreview>
       </div>
@@ -1096,7 +1111,9 @@ function PluginDetailPageContent({ name, loaderData }: PluginDetailPageProps) {
     manageContext ? { name: manageContext.package.name, limit: 100 } : "skip",
   ) as PluginInspectorFinding[] | undefined;
   const authorInspectorFindings = Array.isArray(inspectorFindings)
-    ? inspectorFindings.filter((finding) => finding.authorRemediation?.summary)
+    ? inspectorFindings.filter(
+        (finding) => finding.authorRemediation?.summary && !pluginApiRetirement(finding),
+      )
     : undefined;
   const displayInspectorFindings =
     authorInspectorFindings && shouldShowDevValidationFindingMocks()
@@ -1194,12 +1211,32 @@ function PluginDetailPageContent({ name, loaderData }: PluginDetailPageProps) {
   const isDownloadBlocked =
     pkg.scanStatus === "malicious" || latestRelease?.verification?.scanStatus === "malicious";
   const skillInstallOwner = owner?.handle ?? pkg.ownerHandle ?? "owner";
-  const installSnippet =
-    pkg.family === "code-plugin"
-      ? `openclaw plugins install clawhub:${pkg.name}`
-      : pkg.family === "bundle-plugin"
-        ? `openclaw plugins install clawhub:${pkg.name}`
-        : `openclaw skills install @${skillInstallOwner.replace(/^@+/, "")}/${pkg.name}`;
+  // A tag keeps unscoped package names from matching bundled plugin shortcuts.
+  const pluginInstallTarget = pkg.name.includes("/") ? pkg.name : `${pkg.name}@latest`;
+  const installCommands =
+    pkg.family === "code-plugin" || pkg.family === "bundle-plugin"
+      ? [
+          {
+            label: "Current stable OpenClaw · through 2026.10.4",
+            command: `openclaw plugins install clawhub:${pkg.name}`,
+            copyLabel: "Copy current stable plugin install command",
+            note: null,
+          },
+          {
+            label: "Updated OpenClaw · main/dev",
+            command: `openclaw plugins install ${pluginInstallTarget}`,
+            copyLabel: "Copy updated plugin install command",
+            note: "Requires a build with ClawHub-default support.",
+          },
+        ]
+      : [
+          {
+            label: null,
+            command: `openclaw skills install @${skillInstallOwner.replace(/^@+/, "")}/${pkg.name}`,
+            copyLabel: "Copy skill install command",
+            note: null,
+          },
+        ];
 
   const compatibility = latestRelease?.compatibility ?? pkg.compatibility;
   const pluginManifestSummary = latestRelease?.pluginManifestSummary ?? null;
@@ -1476,7 +1513,13 @@ function PluginDetailPageContent({ name, loaderData }: PluginDetailPageProps) {
           .replace(/^https?:\/\//, "")
           .replace(/\/$/, "");
         return (
-          <a href={href} target="_blank" rel="noopener noreferrer" className="plugin-external-link">
+          <a
+            href={href}
+            target="_blank"
+            rel="noopener noreferrer"
+            className="plugin-external-link"
+            data-analytics-public-detail=""
+          >
             <GitHubIcon />
             {display}
           </a>
@@ -1716,6 +1759,7 @@ function PluginDetailPageContent({ name, loaderData }: PluginDetailPageProps) {
                   className={`section-subtitle skill-summary-line${
                     hasSummaryToggle && !isSummaryExpanded ? " line-clamp-2" : ""
                   }`}
+                  data-analytics-public-detail=""
                 >
                   <InlineMarkdownSummary>{headerSummary}</InlineMarkdownSummary>
                 </p>
@@ -1731,7 +1775,9 @@ function PluginDetailPageContent({ name, loaderData }: PluginDetailPageProps) {
                 ) : null}
               </div>
               {pluginHeroCreator ? (
-                <div className="skill-hero-creator">{pluginHeroCreator}</div>
+                <div className="skill-hero-creator" data-analytics-public-detail="">
+                  {pluginHeroCreator}
+                </div>
               ) : null}
 
               {rateLimited?.scope === "metadata" ? (
@@ -1794,29 +1840,42 @@ function PluginDetailPageContent({ name, loaderData }: PluginDetailPageProps) {
               {validationPanel}
               <div className="plugin-install-stack detail-mobile-install">
                 {incompatibilityAlert}
+                <PluginApiRetirementNotice
+                  id="api-updates"
+                  retirements={validationSummary?.apiRetirements ?? []}
+                />
                 <Card className="skill-install-command-card">
                   <CardHeader className="detail-hero-summary-row plugin-install-card-header">
                     <CardTitle className="skill-install-panel-title">Install</CardTitle>
                   </CardHeader>
-                  <CardContent>
-                    <div className="skill-install-command-wrap">
-                      <div className="skill-install-command-shell skill-install-command-shell-cli">
-                        <span className="skill-install-command-prompt" aria-hidden="true">
-                          $
-                        </span>
-                        <pre className="skill-install-command">
-                          <OpenClawCliInstallCommand command={installSnippet} />
-                        </pre>
-                        <InstallCopyButton
-                          text={installSnippet}
-                          ariaLabel="Copy plugin install command"
-                          showLabel={false}
-                          variant="ghost"
-                          size="icon-sm"
-                          className="skill-install-command-inline-button"
-                        />
+                  <CardContent className="gap-5">
+                    {installCommands.map(({ label, command, copyLabel, note }) => (
+                      <div
+                        className="skill-install-command-wrap gap-2"
+                        key={command}
+                        role="group"
+                        aria-label={label ?? undefined}
+                      >
+                        {label ? <p className="skill-install-panel-copy">{label}</p> : null}
+                        <div className="skill-install-command-shell skill-install-command-shell-cli">
+                          <span className="skill-install-command-prompt" aria-hidden="true">
+                            $
+                          </span>
+                          <pre className="skill-install-command">
+                            <OpenClawCliInstallCommand command={command} />
+                          </pre>
+                          <InstallCopyButton
+                            text={command}
+                            ariaLabel={copyLabel}
+                            showLabel={false}
+                            variant="ghost"
+                            size="icon-sm"
+                            className="skill-install-command-inline-button"
+                          />
+                        </div>
+                        {note ? <p className="skill-install-panel-copy">{note}</p> : null}
                       </div>
-                    </div>
+                    ))}
                   </CardContent>
                 </Card>
               </div>

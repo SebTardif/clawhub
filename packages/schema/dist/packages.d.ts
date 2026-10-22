@@ -55,6 +55,12 @@ export declare const PluginManifestSummarySchema: import("arktype/internal/varia
     }[];
     mcpServers: {
         name: string;
+        url?: string | undefined;
+        transport?: "sse" | "stdio" | "streamable-http" | undefined;
+        auth?: "api-key" | "none" | "oauth" | undefined;
+        scope?: string | undefined;
+        setup?: string | undefined;
+        endpointRedacted?: boolean | undefined;
     }[];
     bundledSkills: {
         name: string;
@@ -200,6 +206,20 @@ export declare const PackageSkillSpectorAnalysisSchema: import("arktype/internal
     checkedAt: number;
 }, {}>;
 export type PackageSkillSpectorAnalysis = (typeof PackageSkillSpectorAnalysisSchema)[inferred];
+export declare const PackageEndorAnalysisSchema: import("arktype/internal/variants/object.ts").ObjectType<{
+    status: "completed";
+    checkedAt: number;
+    reachableFunctionCount: number;
+    findings: {
+        severity: string;
+        summary: string;
+    }[];
+} | {
+    status: "failed" | "skipped";
+    checkedAt: number;
+    reason: string;
+}, {}>;
+export type PackageEndorAnalysis = (typeof PackageEndorAnalysisSchema)[inferred];
 export declare const PackageAigFindingSchema: import("arktype/internal/variants/object.ts").ObjectType<{
     ruleId: string;
     level: string;
@@ -724,6 +744,12 @@ export declare const ApiV1PackageResponseSchema: import("arktype/internal/varian
             }[];
             mcpServers: {
                 name: string;
+                url?: string | undefined;
+                transport?: "sse" | "stdio" | "streamable-http" | undefined;
+                auth?: "api-key" | "none" | "oauth" | undefined;
+                scope?: string | undefined;
+                setup?: string | undefined;
+                endpointRedacted?: boolean | undefined;
             }[];
             bundledSkills: {
                 name: string;
@@ -799,6 +825,7 @@ export declare const ApiV1PackageVersionResponseSchema: import("arktype/internal
         version: string;
         createdAt: number;
         changelog: string;
+        icon?: string | null | undefined;
         distTags?: string[] | undefined;
         files: unknown;
         compatibility?: {
@@ -836,6 +863,12 @@ export declare const ApiV1PackageVersionResponseSchema: import("arktype/internal
             }[];
             mcpServers: {
                 name: string;
+                url?: string | undefined;
+                transport?: "sse" | "stdio" | "streamable-http" | undefined;
+                auth?: "api-key" | "none" | "oauth" | undefined;
+                scope?: string | undefined;
+                setup?: string | undefined;
+                endpointRedacted?: boolean | undefined;
             }[];
             bundledSkills: {
                 name: string;
@@ -908,6 +941,19 @@ export declare const ApiV1PackageVersionResponseSchema: import("arktype/internal
             error?: string | undefined;
             checkedAt: number;
         } | null | undefined;
+        endorAnalysis?: {
+            status: "completed";
+            checkedAt: number;
+            reachableFunctionCount: number;
+            findings: {
+                severity: string;
+                summary: string;
+            }[];
+        } | {
+            status: "failed" | "skipped";
+            checkedAt: number;
+            reason: string;
+        } | null | undefined;
         aigAnalysis?: {
             status: string;
             issueCount: number;
@@ -963,6 +1009,29 @@ export declare const ApiV1PackageVersionResponseSchema: import("arktype/internal
     } | null;
 }, {}>;
 export type ApiV1PackageVersionResponse = (typeof ApiV1PackageVersionResponseSchema)[inferred];
+export declare const ApiV1PackageVersionPublicationResponseSchema: import("arktype/internal/variants/object.ts").ObjectType<{
+    name: string;
+    version: string;
+    state: "absent" | "published";
+} | {
+    name: string;
+    version: string;
+    state: "pending";
+    stage: "staging";
+} | {
+    name: string;
+    version: string;
+    state: "pending";
+    stage: "checks" | "finalization";
+    attemptId: string;
+} | {
+    name: string;
+    version: string;
+    state: "failed";
+    attemptId?: string | undefined;
+    recoverable: boolean;
+}, {}>;
+export type ApiV1PackageVersionPublicationResponse = (typeof ApiV1PackageVersionPublicationResponseSchema)[inferred];
 export declare const ApiV1PackageArtifactResponseSchema: import("arktype/internal/variants/object.ts").ObjectType<{
     package: {
         name: string;
@@ -1009,6 +1078,19 @@ export declare const ApiV1PackageSecurityResponseSchema: import("arktype/interna
         npmShasum?: string | undefined;
         npmTarballName?: string | undefined;
         createdAt: number;
+        endorAnalysis?: {
+            status: "completed";
+            checkedAt: number;
+            reachableFunctionCount: number;
+            findings: {
+                severity: string;
+                summary: string;
+            }[];
+        } | {
+            status: "failed" | "skipped";
+            checkedAt: number;
+            reason: string;
+        } | null | undefined;
     };
     trust: {
         scanStatus: "clean" | "malicious" | "not-run" | "pending" | "suspicious";
@@ -1072,6 +1154,12 @@ export declare const ApiV1PluginDetailResponseSchema: import("arktype/internal/v
             }[];
             mcpServers: {
                 name: string;
+                url?: string | undefined;
+                transport?: "sse" | "stdio" | "streamable-http" | undefined;
+                auth?: "api-key" | "none" | "oauth" | undefined;
+                scope?: string | undefined;
+                setup?: string | undefined;
+                endpointRedacted?: boolean | undefined;
             }[];
             bundledSkills: {
                 name: string;
@@ -1138,6 +1226,7 @@ export declare const ApiV1PluginDetailResponseSchema: import("arktype/internal/v
         version: string;
         createdAt: number;
         changelog: string;
+        icon?: string | null | undefined;
         distTags?: string[] | undefined;
         files: unknown;
         compatibility?: {
@@ -1175,6 +1264,12 @@ export declare const ApiV1PluginDetailResponseSchema: import("arktype/internal/v
             }[];
             mcpServers: {
                 name: string;
+                url?: string | undefined;
+                transport?: "sse" | "stdio" | "streamable-http" | undefined;
+                auth?: "api-key" | "none" | "oauth" | undefined;
+                scope?: string | undefined;
+                setup?: string | undefined;
+                endpointRedacted?: boolean | undefined;
             }[];
             bundledSkills: {
                 name: string;
@@ -1246,6 +1341,19 @@ export declare const ApiV1PluginDetailResponseSchema: import("arktype/internal/v
             summary?: string | undefined;
             error?: string | undefined;
             checkedAt: number;
+        } | null | undefined;
+        endorAnalysis?: {
+            status: "completed";
+            checkedAt: number;
+            reachableFunctionCount: number;
+            findings: {
+                severity: string;
+                summary: string;
+            }[];
+        } | {
+            status: "failed" | "skipped";
+            checkedAt: number;
+            reason: string;
         } | null | undefined;
         aigAnalysis?: {
             status: string;
@@ -1319,6 +1427,19 @@ export declare const ApiV1PluginDetailResponseSchema: import("arktype/internal/v
             npmShasum?: string | undefined;
             npmTarballName?: string | undefined;
             createdAt: number;
+            endorAnalysis?: {
+                status: "completed";
+                checkedAt: number;
+                reachableFunctionCount: number;
+                findings: {
+                    severity: string;
+                    summary: string;
+                }[];
+            } | {
+                status: "failed" | "skipped";
+                checkedAt: number;
+                reason: string;
+            } | null | undefined;
         };
         trust: {
             scanStatus: "clean" | "malicious" | "not-run" | "pending" | "suspicious";

@@ -95,6 +95,88 @@ ignored for compatibility, but recognized query parameters with invalid values r
 
 ## Public endpoints (no auth)
 
+### Plugin SDK usage
+
+These endpoints report static SDK references in the latest eligible public release
+of each code or bundle plugin. Private, deleted, unpublished, and moderation-blocked
+releases are excluded. An import or call site is evidence of a dependency, not proof
+that the code executed. Type dependencies also matter when changing the SDK.
+
+All three endpoints accept `limit` (integer 1–100, default 50) and an opaque `cursor`.
+Follow `nextCursor` until it is `null`, including after an empty page. Counts describe
+only their page, never the whole catalog. Pages are live reads, not a frozen snapshot;
+deduplicate by package and release and retry if releases change during traversal.
+
+Usage lookup and coverage also accept `releasedSince`: an inclusive Unix timestamp
+in milliseconds. This selects plugins whose **latest eligible public release** was
+uploaded at or after that instant, using its immutable `createdAt` timestamp.
+Public approval may happen later. Listing edits and rescan times do not change
+release age.
+Use the same cutoff on both endpoints so consumer counts and coverage describe the
+same population. Responses echo `releasedSince` (`null` when unfiltered), and the
+returned `coverageUrl` preserves it. Keep the cutoff unchanged while paging.
+For a calendar-month window, calculate the UTC cutoff once before querying and
+state that exact instant in the answer.
+
+#### `GET /api/v1/sdk-usage?key=api-member%3Aapi.registerTool`
+
+`key` is required and uses one of these canonical forms:
+
+| Kind              | Example                                                        |
+| ----------------- | -------------------------------------------------------------- |
+| SDK module        | `sdk-module:openclaw/plugin-sdk/core`                          |
+| SDK export        | `sdk-export:openclaw/plugin-sdk/core#definePluginEntry`        |
+| Plugin API member | `api-member:api.registerTool`                                  |
+| Runtime member    | `runtime-member:runtime.channel.reply.dispatchReplyFromConfig` |
+| Hook              | `hook:hook.before_agent_start`                                 |
+| Manifest contract | `manifest-contract:manifest.contracts.tools:example_tool`      |
+
+Returns `{ key, items, nextCursor, counts, coverage, coverageUrl }`. Each item identifies
+the package, version, release, and `releaseCreatedAt` (Unix milliseconds), followed
+by the usage entry and scan metadata.
+`counts` contains `{ scope: "page", distinctPlugins }`. `coverage` is the first coverage
+page (up to 100 packages); follow its cursor at `coverageUrl`.
+
+Usage entries contain `key`, `kind`, `identity`, `classification` (`runtime`, `type`,
+`mixed`, or `declarative`), `referenceKinds`, `deprecationCodes`, and source `evidence`.
+Each evidence item has `path`, `line`, `snippet`, and optionally `note`. ClawHub retains
+up to three examples per identity; `evidenceCount` records the supplied total.
+Filter on a nonempty `deprecationCodes` array for deprecated usages. Existing author
+warnings and remediation remain available through the existing validation UI.
+
+#### `GET /api/v1/sdk-usage/coverage`
+
+Returns `{ scope: "page", counts, unresolvedReferences, items, nextCursor }`.
+`counts` includes `eligible`, `complete`, `partial`, `failed`, `missing`, and `incompatible`.
+Each roster item contains `packageName`, `version`, `releaseId`, `releaseCreatedAt`,
+`status`, and `unknownCount`.
+This lets clients reconcile which plugins were actually inspected, including plugins
+with no observed SDK usage.
+Coverage examines each package's current release, so historical releases do not add
+pages. If a deployment invalidates a cursor, restart from the first page.
+
+#### `GET /api/v1/sdk-usage/plugin?package=example-plugin`
+
+`package` is required. Returns `{ packageName, version, releaseId, releaseCreatedAt, scan, items, nextCursor }`.
+Missing or ineligible public plugins return `404`. A plugin without a current usable
+inventory returns empty `items` and an explicit `missing`, `failed`, or `incompatible`
+scan status. Inventories come from the daily Package Inspector scan, not from
+publication, so a newly published release reports `missing` until that scan inspects
+it. A successfully inspected plugin with no references returns `complete` and empty
+`items`.
+
+Scan metadata includes `inputKind` (`artifact` for eligible inventories), the inventory schema/analysis versions, Inspector version,
+target OpenClaw version, artifact hash, completion time, coverage counters, entry and
+unknown counts, and bounded unknown examples. Partial inventories expose the references
+that were resolved and preserve unresolved cases. Older or failed scans cannot make a
+new release appear covered.
+
+**Interpreting zero results:** check the canonical key and finish both usage and coverage
+traversals. Missing, failed, partial, incompatible, or unresolved analysis makes the
+answer incomplete. Even complete coverage means only “no observed references in this
+public latest-release corpus”; it does not authorize removal or establish that private,
+unpublished, or dynamically selected uses do not exist.
+
 ### `GET /api/v1/search`
 
 Query params:
@@ -742,7 +824,7 @@ Use each category's description to choose the main reason someone installs the
 plugin. New plugin releases may declare exactly one category in
 `openclaw.plugin.json`, for example `"categories": ["developer-tools"]`. When the
 declaration is absent, ClawHub generates one category from bounded manifest,
-package, and documentation evidence using `gpt-5.6-luna` by default. Operators can
+package, and documentation evidence using `gpt-6-luna` by default. Operators can
 override this with `OPENAI_PLUGIN_CATEGORY_MODEL`; the skill-summary model setting
 does not affect plugin classification.
 
@@ -928,6 +1010,47 @@ Notes:
 - `version.vtAnalysis`, `version.llmAnalysis`, and `version.staticScan` are
   included when scan data exists.
 - Private packages return `404` unless the caller can read the owning publisher.
+
+### `GET /api/v1/packages/{name}/versions/{version}/publication`
+
+Returns publication state for an exact package version. This is a public read
+endpoint in the `read` rate-limit bucket. An optional bearer token affects
+package visibility exactly as on the version endpoint. Encode scoped names as
+`%40openclaw%2Fdiscord`; the `/@openclaw/discord/versions/...` path form also works.
+
+The response is a closed object with `name`, `version`, and one of these shapes:
+
+```json
+{ "name": "@openclaw/discord", "version": "2026.9.2", "state": "published" }
+{ "name": "@openclaw/discord", "version": "2026.9.2", "state": "absent" }
+{ "name": "@openclaw/discord", "version": "2026.9.2", "state": "pending", "stage": "staging" }
+{ "name": "@openclaw/discord", "version": "2026.9.2", "state": "pending", "stage": "checks", "attemptId": "..." }
+{ "name": "@openclaw/discord", "version": "2026.9.2", "state": "pending", "stage": "finalization", "attemptId": "..." }
+{ "name": "@openclaw/discord", "version": "2026.9.2", "state": "failed", "attemptId": "...", "recoverable": true }
+```
+
+An unknown version returns `200` with `absent`. Pending releases without a bound
+attempt return `staging`; checks and finalization include the bound attempt ID.
+Blocked or expired attempts, and blocked releases, return `failed` with
+`recoverable: false`. Failed responses omit `attemptId` only when no attempt row
+is bound. `recoverable` is advisory static recovery eligibility: it checks
+artifact/token bindings, package family, and moderation, but does not check the
+caller's publisher membership, active claims, or stored bytes. Recovery revalidates
+all of these and requires a current publisher's user API token.
+
+Invisible or soft-deleted packages and skill names return `404 Package not found`.
+Published releases follow the existing version endpoint's visibility: hidden
+published versions return `404 Version not found`, while moderated releases whose
+metadata remains readable return `published`. Publication state does not imply
+download permission. Error text, scanner results, identities, token IDs, GitHub
+run IDs, idempotency keys, artifact digests, and storage IDs are never returned.
+Attempt IDs grant no access to attempt details or recovery.
+
+Older servers may serve ordinary version JSON for this path. Clients should use
+a recognized, valid `state` response; on `404`, or `200` without `state`, fall back
+to `GET /api/v1/packages/{name}/versions/{version}` (`200` means published, `404`
+means not published). A `200` with an unknown state or malformed recognized shape
+must fail closed. Other non-2xx responses retain normal error handling and retries.
 
 ### `GET /api/v1/packages/{name}/versions/{version}/security`
 
@@ -1552,7 +1675,9 @@ token. Pending is not published; fresh security checks and current authorization
 must pass before the retained release becomes public.
 
 Invalid bodies return `400`, invalid credentials `401`, undisclosed or missing
-attempts `404`, and conflicting or ineligible recovery state `409`.
+attempts `404`, and conflicting or ineligible recovery state `409`. A `409` with
+`Retry-After` means the sealed attempt is still active and may be retried after
+the indicated delay; other `409` responses are terminal for that request.
 
 ### `DELETE /api/v1/skills/{slug}` / `POST /api/v1/skills/{slug}/undelete`
 

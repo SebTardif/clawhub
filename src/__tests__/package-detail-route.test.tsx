@@ -253,6 +253,51 @@ describe("plugin detail route", () => {
     vi.unstubAllGlobals();
   });
 
+  it.each([
+    { family: "code-plugin", name: "demo-plugin", target: "demo-plugin@latest" },
+    { family: "code-plugin", name: "discord", target: "discord@latest" },
+    { family: "code-plugin", name: "@composio/composio", target: "@composio/composio" },
+    { family: "code-plugin", name: "owner/plugin", target: "owner/plugin" },
+    { family: "bundle-plugin", name: "demo-bundle", target: "demo-bundle@latest" },
+  ] as const)(
+    "shows and copies stable and updated OpenClaw commands for $name",
+    async ({ family, name, target }) => {
+      const writeText = vi.fn().mockResolvedValue(undefined);
+      vi.stubGlobal("navigator", { clipboard: { writeText } });
+      loaderDataMock.detail.package = { ...loaderDataMock.detail.package!, family, name };
+      const route = await loadRoute();
+      const Component = route.__config.component as ComponentType;
+
+      render(<Component />);
+
+      const stable = screen.getByRole("group", {
+        name: "Current stable OpenClaw · through 2026.10.4",
+      });
+      const updated = screen.getByRole("group", { name: "Updated OpenClaw · main/dev" });
+      expect(stable.querySelector(".skill-install-command")?.textContent).toBe(
+        `openclaw plugins install clawhub:${name}`,
+      );
+      expect(updated.querySelector(".skill-install-command")?.textContent).toBe(
+        `openclaw plugins install ${target}`,
+      );
+      expect(
+        within(updated).getByText("Requires a build with ClawHub-default support."),
+      ).toBeTruthy();
+      fireEvent.click(
+        within(stable).getByRole("button", { name: "Copy current stable plugin install command" }),
+      );
+      await waitFor(() =>
+        expect(writeText).toHaveBeenCalledWith(`openclaw plugins install clawhub:${name}`),
+      );
+      fireEvent.click(
+        within(updated).getByRole("button", { name: "Copy updated plugin install command" }),
+      );
+      await waitFor(() =>
+        expect(writeText).toHaveBeenCalledWith(`openclaw plugins install ${target}`),
+      );
+    },
+  );
+
   it("uses mobile About and Stats tabs below 901px", async () => {
     setViewportWidth(488);
     loaderDataMock = {
@@ -1745,8 +1790,10 @@ describe("plugin detail route", () => {
     expect(screen.getByText("ClawPack")).toBeTruthy();
     expect(screen.getByText("demo-plugin-1.0.0.tgz")).toBeTruthy();
     expect(screen.getByText("sha512-demo")).toBeTruthy();
-    expect(screen.getByText("openclaw plugins install")).toBeTruthy();
-    expect(screen.getByText("clawhub:demo-plugin")).toBeTruthy();
+    expect(screen.getAllByText("openclaw plugins install")).toHaveLength(2);
+    expect(
+      screen.getByText("demo-plugin@latest", { selector: ".skill-install-command-target" }),
+    ).toBeTruthy();
     expect(screen.getByRole("link", { name: /Download/i }).getAttribute("href")).toBe(
       "/api/v1/packages/demo-plugin/versions/1.0.0/artifact/download",
     );
@@ -1808,7 +1855,7 @@ describe("plugin detail route", () => {
     );
   });
 
-  it("shows a public incompatibility alert without exposing validation outputs", async () => {
+  it("keeps public incompatibility alerts alongside API updates without exposing validation outputs", async () => {
     useAuthStatusMock.mockReturnValue({
       isAuthenticated: false,
       isLoading: false,
@@ -1822,6 +1869,13 @@ describe("plugin detail route", () => {
           errorCount: 1,
           warningCount: 0,
           incompatibleAfterOpenClawVersion: "0.9.0",
+          apiRetirements: [
+            {
+              deprecatedApi: "readAcpSessionEntry",
+              replacement: "readAcpSessionEntryAsync",
+              removeAfter: "2026-12-31",
+            },
+          ],
         };
       }
       return null;
@@ -1867,6 +1921,7 @@ describe("plugin detail route", () => {
     expect(
       screen.getByText("This plugin is incompatible with OpenClaw versions greater than 0.9.0."),
     ).toBeTruthy();
+    expect(screen.getByRole("region", { name: "OpenClaw API updates" })).toBeTruthy();
     expect(screen.queryByRole("tab", { name: /Validation/ })).toBeNull();
     expect(screen.queryByText("missing-expected-seam")).toBeNull();
   });
@@ -2084,6 +2139,65 @@ describe("plugin detail route", () => {
     expect(screen.getByText(/Try again in about 15 seconds/i)).toBeTruthy();
   });
 
+  it.each([false, true])(
+    "renders a beta-only plugin's README (filtered first page: %s)",
+    async (filteredFirstPage) => {
+      const release = "0.1.0-beta.1";
+      const readme = "# Beta plugin setup instructions";
+      const route = await loadRoute();
+      vi.mocked(fetchPackageDetail).mockResolvedValueOnce(loaderDataMock.detail);
+      if (filteredFirstPage) {
+        vi.mocked(fetchPackageVersions).mockResolvedValueOnce({ items: [], nextCursor: "next" });
+      }
+      vi.mocked(fetchPackageVersions).mockResolvedValueOnce({
+        items: [{ version: release, createdAt: 1, changelog: "Initial beta", distTags: ["beta"] }],
+        nextCursor: null,
+      });
+      vi.mocked(fetchPackageVersion).mockResolvedValueOnce({
+        package: null,
+        version: { version: release, createdAt: 1, changelog: "Initial beta", files: [] },
+      });
+      vi.mocked(fetchPackageReadme).mockImplementation(async (_name, version) =>
+        version === release ? readme : null,
+      );
+
+      loaderDataMock = await route.__config.loader!({ params: { name: "demo-plugin" } });
+      const Component = route.__config.component as ComponentType;
+      render(<Component />);
+
+      expect(screen.getByText(readme)).toBeTruthy();
+      expect(screen.queryByText("No README available")).toBeNull();
+      expect(loaderDataMock.detail.package?.latestVersion).toBeNull();
+      expect(loaderDataMock.version?.version?.version).toBe(release);
+    },
+  );
+
+  it("keeps an empty plugin page when no published release exists", async () => {
+    const route = await loadRoute();
+    vi.mocked(fetchPackageDetail).mockResolvedValueOnce(loaderDataMock.detail);
+    vi.mocked(fetchPackageReadme).mockResolvedValueOnce(null);
+
+    const result = await route.__config.loader!({ params: { name: "demo-plugin" } });
+
+    expect(result.version).toBeNull();
+    expect(result.readme).toBeNull();
+    expect(fetchPackageVersion).not.toHaveBeenCalled();
+    expect(fetchPackageReadme).not.toHaveBeenCalled();
+  });
+
+  it("keeps plugin details when fallback release discovery is rate limited", async () => {
+    const route = await loadRoute();
+    vi.mocked(fetchPackageDetail).mockResolvedValueOnce(loaderDataMock.detail);
+    vi.mocked(fetchPackageReadme).mockResolvedValueOnce(null);
+    vi.mocked(fetchPackageVersions).mockRejectedValueOnce({ status: 429, retryAfterSeconds: 11 });
+
+    const result = await route.__config.loader!({ params: { name: "demo-plugin" } });
+
+    expect(result.detail.package?.name).toBe("demo-plugin");
+    expect(result.readme).toBeNull();
+    expect(result.rateLimited).toEqual({ scope: "metadata", retryAfterSeconds: 11 });
+  });
+
   it("downgrades rate-limited README/version fetches into partial detail data", async () => {
     const route = await loadRoute();
     const loader = route.__config.loader as ({
@@ -2218,7 +2332,7 @@ describe("plugin detail route", () => {
 
     expect(fetchPackageDetailMock).toHaveBeenCalledTimes(1);
     expect(fetchPackageDetailMock).toHaveBeenCalledWith("@openclaw/matrix");
-    expect(fetchPackageReadmeMock).toHaveBeenCalledWith("@openclaw/matrix");
+    expect(fetchPackageReadmeMock).toHaveBeenCalledWith("@openclaw/matrix", "2026.3.22");
     expect(fetchPackageVersionMock).toHaveBeenCalledWith("@openclaw/matrix", "2026.3.22");
     expect(fetchPackageVersions).not.toHaveBeenCalled();
   });
@@ -2260,7 +2374,10 @@ describe("plugin detail route", () => {
 
     expect(fetchPackageDetailMock).toHaveBeenCalledTimes(1);
     expect(fetchPackageDetailMock).toHaveBeenCalledWith("@openclaw/anthropic-provider");
-    expect(fetchPackageReadmeMock).toHaveBeenCalledWith("@openclaw/anthropic-provider");
+    expect(fetchPackageReadmeMock).toHaveBeenCalledWith(
+      "@openclaw/anthropic-provider",
+      "2026.3.22",
+    );
     expect(fetchPackageVersionMock).toHaveBeenCalledWith(
       "@openclaw/anthropic-provider",
       "2026.3.22",

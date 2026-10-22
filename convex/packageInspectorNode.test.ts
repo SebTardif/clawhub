@@ -1,12 +1,12 @@
 /* @vitest-environment node */
 
 import path from "node:path";
-import { afterEach, describe, expect, it, vi } from "vitest";
+import { afterEach, describe, expect, it } from "vitest";
 import {
   buildPublishInspectorRunCheckOptions,
   createPackageInspectorWorkspace,
   normalizeInspectorReportForPublish,
-  preparePublishInspectorOpenClawTarget,
+  resolveOpenClawTargetCacheRoot,
 } from "./packageInspectorNode";
 
 const originalPlatform = process.platform;
@@ -16,6 +16,47 @@ afterEach(() => {
 });
 
 describe("package inspector publish normalization", () => {
+  it("preserves structured retirement metadata without requiring separate prose remediation", () => {
+    const retirement = {
+      deprecatedApi: "readAcpSessionEntry",
+      replacement: "readAcpSessionEntryAsync",
+      removeAfter: "2026-12-31",
+    };
+    const result = normalizeInspectorReportForPublish({
+      status: "pass",
+      issues: [
+        {
+          code: "sdk-deprecated-api",
+          level: "warning",
+          issueClass: "deprecation-warning",
+          deprecated: true,
+          message: "An OpenClaw API has a scheduled retirement.",
+          ...retirement,
+        },
+      ],
+    });
+    expect(result.warnings).toEqual([expect.objectContaining(retirement)]);
+    expect(result.breakages).toEqual([]);
+  });
+  it("leaves SDK inventories to the Package Inspector scan", () => {
+    // Inspector 0.4.x always reports an inventory. Without the artifact target
+    // it covers only root source files, so publish must not persist it.
+    const result = normalizeInspectorReportForPublish({
+      issues: [],
+      sdkUsage: {
+        schemaVersion: 1,
+        analysisVersion: "1",
+        inputKind: "source",
+        status: "complete",
+        entries: [],
+        unknowns: [],
+        coverage: { filesDiscovered: 106, filesAnalyzed: 2, filesExcluded: 104 },
+      },
+    });
+    expect(result).toMatchObject({ status: "pass", warnings: [], breakages: [] });
+    expect(result).not.toHaveProperty("sdkUsage");
+  });
+
   it("falls back to /tmp when the configured temp directory is unavailable", async () => {
     Object.defineProperty(process, "platform", { value: "linux" });
     const attemptedPrefixes: string[] = [];
@@ -61,22 +102,25 @@ describe("package inspector publish normalization", () => {
     );
   });
 
-  it("prepares latest stable OpenClaw with a cache outside the inspected package", async () => {
-    const resolvedTarget = { version: "2026.7.0" };
-    const preparedTarget = { status: "ok", version: "2026.7.0" };
-    const resolveVersion = vi.fn(async () => resolvedTarget);
-    const prepare = vi.fn(async () => preparedTarget);
+  it("keeps the OpenClaw target cache outside per-inspection workspaces", async () => {
+    Object.defineProperty(process, "platform", { value: "linux" });
+    const madeDirs: string[] = [];
+    const makeDir = async (dir: string) => {
+      madeDirs.push(dir);
+      if (madeDirs.length === 1) {
+        throw Object.assign(new Error("configured temp directory is unavailable"), {
+          code: "EROFS",
+        });
+      }
+    };
 
-    await expect(
-      preparePublishInspectorOpenClawTarget("/tmp/plugin", { resolveVersion, prepare }),
-    ).resolves.toBe(preparedTarget);
-    expect(resolveVersion).toHaveBeenCalledWith("latest");
-    expect(prepare).toHaveBeenCalledWith(resolvedTarget, {
-      cacheDir: path.join("/tmp/plugin", ".plugin-inspector-cache"),
-    });
-    expect(path.join("/tmp/plugin", ".plugin-inspector-cache")).not.toContain(
-      path.join("/tmp/plugin", "package") + path.sep,
+    await expect(resolveOpenClawTargetCacheRoot("/home/sbx_user1051", makeDir)).resolves.toBe(
+      path.join("/tmp", "clawhub-plugin-inspector-openclaw"),
     );
+    expect(madeDirs).toEqual([
+      path.join("/home/sbx_user1051", "clawhub-plugin-inspector-openclaw"),
+      path.join("/tmp", "clawhub-plugin-inspector-openclaw"),
+    ]);
   });
 
   it("uses the prepared OpenClaw target for publish-time inspection", () => {
@@ -95,6 +139,20 @@ describe("package inspector publish normalization", () => {
         authorFacing: true,
       }),
     );
+  });
+
+  it("does not request an artifact SDK inventory inside the publish action", () => {
+    // An artifact inventory type-checks every packed file, including bundled
+    // node_modules, and exceeded the 512 MiB Node action limit for large plugins.
+    const options = buildPublishInspectorRunCheckOptions(
+      "/tmp/plugin",
+      "2026-07-30T00:00:00.000Z",
+      {
+        status: "ok",
+      },
+    );
+    expect(options).not.toHaveProperty("sdkUsageTargetPath");
+    expect(options).not.toHaveProperty("sdkUsageInputKind");
   });
 
   it("keeps legacy author-facing hard findings without remediation metadata", () => {
