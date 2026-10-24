@@ -359,6 +359,43 @@ describe("skill stat events", () => {
     expect(scheduler.runAfter).not.toHaveBeenCalled();
   });
 
+  it("finishes the checkpoint when the resumed page is empty", async () => {
+    const committedCreationTime = 1_700_000_000_000;
+    const runQuery = vi
+      .fn()
+      .mockResolvedValueOnce({
+        cursorCreationTime: 10,
+        paginationCursor: "page-2",
+        paginationLowerBound: 10,
+        pendingCreationTime: committedCreationTime,
+      })
+      .mockResolvedValueOnce({
+        events: [],
+        continueCursor: null,
+        rangeLowerBound: 10,
+      });
+    const runMutation = vi.fn(async () => ({ skillsUpdated: 0 }));
+    const scheduler = { runAfter: vi.fn() };
+
+    await expect(
+      processSkillStatEventsActionHandler({ runQuery, runMutation, scheduler }, {}),
+    ).resolves.toEqual({
+      processed: 0,
+      skillsUpdated: 0,
+      exhausted: true,
+    });
+
+    expect(runMutation).toHaveBeenCalledWith(apiRefs.applyAggregatedStatsAndUpdateCursor, {
+      skillDeltas: [],
+      newCursor: committedCreationTime,
+      clearPaginationCursor: true,
+    });
+    expect(runMutation).toHaveBeenCalledWith(apiRefs.markHourlyAggregationCompletedInternal, {
+      cursorCreationTime: committedCreationTime,
+    });
+    expect(scheduler.runAfter).not.toHaveBeenCalled();
+  });
+
   it.each(["star", "unstar", "comment", "uncomment"] as const)(
     "marks historical %s events processed without patching skill stats",
     async (kind) => {

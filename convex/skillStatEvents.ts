@@ -1149,6 +1149,7 @@ export const getStatEventAggregationCursor = internalQuery({
       cursorCreationTime: cursor?.cursorCreationTime ?? null,
       paginationCursor: cursor?.paginationCursor ?? null,
       paginationLowerBound: cursor?.paginationLowerBound ?? null,
+      pendingCreationTime: cursor?.pendingCreationTime ?? null,
     };
   },
 });
@@ -1179,6 +1180,7 @@ export const applyAggregatedStatsAndUpdateCursor = internalMutation({
     newCursor: v.optional(v.number()),
     paginationCursor: v.optional(v.string()),
     paginationLowerBound: v.optional(v.number()),
+    pendingCreationTime: v.optional(v.number()),
     clearPaginationCursor: v.optional(v.boolean()),
   },
   handler: async (ctx, args) => {
@@ -1272,6 +1274,9 @@ export const applyAggregatedStatsAndUpdateCursor = internalMutation({
         ...(args.paginationLowerBound !== undefined
           ? { paginationLowerBound: args.paginationLowerBound }
           : {}),
+        ...(args.pendingCreationTime !== undefined
+          ? { pendingCreationTime: args.pendingCreationTime }
+          : {}),
       });
     } else {
       await ctx.db.insert("skillStatUpdateCursors", {
@@ -1281,6 +1286,9 @@ export const applyAggregatedStatsAndUpdateCursor = internalMutation({
         ...(args.paginationCursor !== undefined ? { paginationCursor: args.paginationCursor } : {}),
         ...(args.paginationLowerBound !== undefined
           ? { paginationLowerBound: args.paginationLowerBound }
+          : {}),
+        ...(args.pendingCreationTime !== undefined
+          ? { pendingCreationTime: args.pendingCreationTime }
           : {}),
       });
     }
@@ -1418,8 +1426,24 @@ export const processSkillStatEventsAction = internalAction({
       resumeCursor = batch.continueCursor;
     }
 
-    // If we have nothing to process, we're done
+    // If we have nothing to process, we're done. An empty page after a saved
+    // pagination cursor is the end of that range: promote the creation time
+    // already committed with the previous page and drop the cursor. Leaving
+    // it open caps pruning at the old watermark forever.
     if (aggregatedBySkill.size === 0 || maxCreationTime === undefined) {
+      const finishedCreationTime = cursorState.pendingCreationTime ?? persistedWatermark;
+      if (cursorState.paginationCursor && finishedCreationTime !== undefined) {
+        console.log("[STAT-AGG] Empty terminal page, finishing checkpoint");
+        await ctx.runMutation(internal.skillStatEvents.applyAggregatedStatsAndUpdateCursor, {
+          skillDeltas: [],
+          newCursor: finishedCreationTime,
+          clearPaginationCursor: true,
+        });
+        await ctx.runMutation(internal.skillHourlyStats.markAggregationCompletedInternal, {
+          cursorCreationTime: finishedCreationTime,
+        });
+        return { processed: 0, skillsUpdated: 0, exhausted: true };
+      }
       console.log("[STAT-AGG] No events to process, done");
       await ctx.runMutation(internal.skillHourlyStats.markAggregationCompletedInternal, {
         cursorCreationTime: persistedWatermark,
@@ -1447,6 +1471,7 @@ export const processSkillStatEventsAction = internalAction({
             ...(persistedWatermark !== undefined ? { newCursor: persistedWatermark } : {}),
             ...(resumeCursor ? { paginationCursor: resumeCursor } : {}),
             ...(rangeLowerBound !== undefined ? { paginationLowerBound: rangeLowerBound } : {}),
+            pendingCreationTime: Math.max(maxCreationTime, cursorState.pendingCreationTime ?? 0),
           }),
     });
 
