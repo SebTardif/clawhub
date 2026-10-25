@@ -53,6 +53,7 @@ const { verifyOpenClawPublishAuthorization } = await import("./lib/openClawPubli
 const { buildBundleFingerprint } = await import("./lib/skillCards");
 const { sha256Hex } = await import("./lib/clawpack");
 const { publishVersionForUser } = await import("./skills");
+const { contentDispositionAttachment } = await import("./httpApiV1/shared");
 const { __handlers } = await import("./httpApiV1");
 
 type ActionCtx = import("./_generated/server").ActionCtx;
@@ -15115,11 +15116,19 @@ describe("httpApiV1 handlers", () => {
         `https://example.com/api/v1/packages/demo-plugin/versions/${encodeURIComponent(injected)}/artifact/download`,
       ),
     );
-    expect(tarball.status).toBe(200);
-    expect(tarball.headers.get("Content-Disposition")).toBe(
-      `attachment; filename*=UTF-8''${encodeURIComponent(tarballName)}`,
+    expect(contentDispositionAttachment("demo-plugin-1.2.3.tgz")).toBe(
+      `attachment; filename="demo-plugin-1.2.3.tgz"; filename*=UTF-8''demo-plugin-1.2.3.tgz`,
     );
-    expect(tarball.headers.get("Content-Disposition")).not.toContain('filename="');
+    expect(tarball.status).toBe(200);
+    const tarballDisposition = tarball.headers.get("Content-Disposition") ?? "";
+    expect(tarballDisposition).toBe(contentDispositionAttachment(tarballName));
+    expect(tarballDisposition.match(/filename="([^"]+)"/)?.[1]).toBe(
+      "demo-plugin-1_filename_UTF-8_setup_jar_x.tgz",
+    );
+    expect(decodeURIComponent(tarballDisposition.split("filename*=UTF-8''")[1] ?? "")).toBe(
+      tarballName,
+    );
+    expect(tarballDisposition).not.toContain("setup.jar;");
 
     const zip = await __handlers.packagesGetRouterV1Handler(
       ctx,
@@ -15128,10 +15137,13 @@ describe("httpApiV1 handlers", () => {
       ),
     );
     expect(zip.status).toBe(200);
-    expect(zip.headers.get("Content-Disposition")).toBe(
-      `attachment; filename*=UTF-8''${encodeURIComponent(zipName)}`,
+    const zipDisposition = zip.headers.get("Content-Disposition") ?? "";
+    expect(zipDisposition).toBe(contentDispositionAttachment(zipName));
+    expect(zipDisposition.match(/filename="([^"]+)"/)?.[1]).toBe(
+      "demo-plugin-1_filename_UTF-8_setup_jar_x.zip",
     );
-    expect(zip.headers.get("Content-Disposition")).not.toContain('filename="');
+    expect(decodeURIComponent(zipDisposition.split("filename*=UTF-8''")[1] ?? "")).toBe(zipName);
+    expect(zipDisposition).not.toContain("setup.jar;");
   });
 
   it("package artifact endpoint exposes ClawPack resolver URLs", async () => {

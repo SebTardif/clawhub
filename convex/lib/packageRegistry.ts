@@ -441,19 +441,12 @@ export function normalizePublishFiles(files: PublishFile[]) {
   return normalized.map((file) => ({ ...file, path: file.path as string }));
 }
 
-const SAFE_PACKAGE_VERSION = /^[A-Za-z0-9._+-]+$/;
-
 export function assertPackageVersion(
   family: "code-plugin" | "bundle-plugin" | "skill" | "claw",
   version: string,
 ) {
   const trimmed = version.trim();
   if (!trimmed) throw new ConvexError("Version required");
-  if (!SAFE_PACKAGE_VERSION.test(trimmed)) {
-    throw new ConvexError(
-      "Package versions may only use letters, numbers, dots, underscores, plus, and hyphens",
-    );
-  }
   if ((family === "code-plugin" || family === "claw") && !semver.valid(trimmed)) {
     throw new ConvexError(
       family === "claw"

@@ -17,14 +17,12 @@ import {
 import { buildPackageInventoryDigest } from "./skills";
 
 describe("packageRegistry", () => {
-  it("rejects a bundle-plugin version that can break a download filename", () => {
-    expect(() =>
-      assertPackageVersion("bundle-plugin", `1"; filename*=UTF-8''setup.jar; x="`),
-    ).toThrow(/letters, numbers, dots, underscores, plus, and hyphens/);
-  });
-
-  it("keeps ordinary package versions", () => {
+  it("still accepts a publisher-defined bundle version", () => {
+    expect(assertPackageVersion("bundle-plugin", "2026.10 beta")).toBe("2026.10 beta");
     expect(assertPackageVersion("bundle-plugin", "1.2.3-beta.1")).toBe("1.2.3-beta.1");
+    expect(assertPackageVersion("bundle-plugin", `1"; filename*=UTF-8''setup.jar; x="`)).toBe(
+      `1"; filename*=UTF-8''setup.jar; x="`,
+    );
     expect(assertPackageVersion("code-plugin", "1.2.3")).toBe("1.2.3");
     expect(assertPackageVersion("claw", "1.2.3+build.4")).toBe("1.2.3+build.4");
   });
