@@ -22,8 +22,13 @@ const DEFAULT_PUBLIC_SITE_URL = "https://clawhub.ai";
 const SAFE_TEXT_FILE_CSP =
   "default-src 'none'; base-uri 'none'; form-action 'none'; frame-ancestors 'none'";
 
+export function contentDispositionAttachment(filename: string) {
+  const leaf = filename.split(/[/\\]/).pop()?.trim() || "download";
+  return `attachment; filename*=UTF-8''${encodeURIComponent(leaf)}`;
+}
+
 function attachmentDisposition(path: string) {
-  return `attachment; filename*=UTF-8''${encodeURIComponent(path.split("/").at(-1) || "download")}`;
+  return contentDispositionAttachment(path);
 }
 
 type SafeFileResponseParams = {

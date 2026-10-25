@@ -7,6 +7,7 @@ import {
   ensurePluginNameMatchesPackage,
   extractBundlePluginArtifacts,
   extractCodePluginArtifacts,
+  assertPackageVersion,
   normalizePackageName,
   normalizePublishFiles,
   summarizePackageForSearch,
@@ -16,6 +17,18 @@ import {
 import { buildPackageInventoryDigest } from "./skills";
 
 describe("packageRegistry", () => {
+  it("rejects a bundle-plugin version that can break a download filename", () => {
+    expect(() =>
+      assertPackageVersion("bundle-plugin", `1"; filename*=UTF-8''setup.jar; x="`),
+    ).toThrow(/letters, numbers, dots, underscores, plus, and hyphens/);
+  });
+
+  it("keeps ordinary package versions", () => {
+    expect(assertPackageVersion("bundle-plugin", "1.2.3-beta.1")).toBe("1.2.3-beta.1");
+    expect(assertPackageVersion("code-plugin", "1.2.3")).toBe("1.2.3");
+    expect(assertPackageVersion("claw", "1.2.3+build.4")).toBe("1.2.3+build.4");
+  });
+
   it.each([
     "../escape",
     "scope/name",
