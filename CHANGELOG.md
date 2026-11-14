@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+- CLI: list skill files in stable path order before publish, so the uploaded file list no longer follows the local filesystem's directory order.
+
 ## 0.26.0 - 2026-11-12
 
 - Templates: accept native agent settings, including `agent.tools`, and top-level `skills` and `plugins` dependencies in `CLAW.md`. Dependencies can reference exact ClawHub versions or bundled package directories. This fixes the stable CLI rejecting the supported Template format before upload (#4551). Publish an already-built `.tgz`; successful publication does not establish compatibility with a particular OpenClaw consumer release.
